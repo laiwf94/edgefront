@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod cache_control;
+pub mod cluster;
 pub mod collapse;
 pub mod config;
 pub mod headers;

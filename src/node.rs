@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::admin::Admin;
+use crate::cluster::Cluster;
 use crate::config::{Config, Secrets, parse_base_url};
 use crate::origin::{self, Origin, OriginPool};
 use crate::proxy::{Proxy, SystemClock};
@@ -71,7 +72,32 @@ pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
         drain: Duration::from_millis(t.shutdown_ms),
     };
     let (stop, rx) = watch::channel(false);
-    let admin = Arc::new(Admin::new(proxy.clone(), secrets.admin_token.as_deref()));
+    let mut background = vec![pool.spawn_health_checks()];
+    let cluster = match &secrets.cluster_secret {
+        Some(key) => {
+            let mut peers = Vec::new();
+            for p in &config.peers {
+                peers.push((p.name.clone(), parse_base_url(&p.url)?));
+            }
+            let client = origin::client(Duration::from_millis(t.connect_ms));
+            let (cluster, tasks) = Cluster::start(
+                &config.node_id,
+                key.clone(),
+                &peers,
+                proxy.clone(),
+                client,
+                config.gossip_settings(),
+            );
+            background.extend(tasks);
+            Some(cluster)
+        }
+        None => None,
+    };
+    let admin = Arc::new(Admin::new(
+        proxy.clone(),
+        secrets.admin_token.as_deref(),
+        cluster,
+    ));
     let servers = vec![
         tokio::spawn(serve(
             proxy_listener,
@@ -81,7 +107,6 @@ pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
         )),
         tokio::spawn(serve(admin_listener, admin, limits, stopped(rx))),
     ];
-    let background = vec![pool.spawn_health_checks()];
     tracing::info!(node = %config.node_id, listen = %proxy_addr, admin = %admin_addr, origins = config.origins.len(), "cachet started");
     Ok(Node {
         proxy_addr,

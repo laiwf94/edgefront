@@ -13,6 +13,7 @@ use http::uri::{Authority, PathAndQuery};
 use serde::Deserialize;
 
 use crate::cache_control::is_tchar;
+use crate::cluster::GossipSettings;
 use crate::origin::HealthSettings;
 use crate::proxy::ProxySettings;
 use crate::store::{CacheSettings, DiskSettings};
@@ -36,6 +37,29 @@ pub struct Config {
     pub limits: LimitConfig,
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub gossip: GossipConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GossipConfig {
+    /// How long a purge is retried and accepted by peers.
+    pub max_age_secs: u64,
+    pub retry_max_ms: u64,
+    pub request_timeout_ms: u64,
+    pub queue: usize,
+}
+
+impl Default for GossipConfig {
+    fn default() -> Self {
+        GossipConfig {
+            max_age_secs: 600,
+            retry_max_ms: 5000,
+            request_timeout_ms: 2000,
+            queue: 1024,
+        }
+    }
 }
 
 fn default_listen() -> SocketAddr {
@@ -287,6 +311,13 @@ impl Config {
         if [t.connect_ms, t.response_ms, t.body_ms, t.client_header_ms].contains(&0) {
             return Err("timeouts must be positive".into());
         }
+        let g = &self.gossip;
+        if g.max_age_secs < 10 || g.retry_max_ms == 0 || g.request_timeout_ms == 0 || g.queue == 0 {
+            return Err(
+                "gossip.max_age_secs must be at least 10 and the other gossip settings positive"
+                    .into(),
+            );
+        }
         let l = &self.limits;
         if l.max_uri_bytes < 64 || l.max_header_bytes < 8192 {
             return Err(
@@ -334,6 +365,17 @@ impl Config {
             timeout: Duration::from_millis(h.timeout_ms),
             rise: h.rise,
             fall: h.fall,
+        }
+    }
+
+    pub fn gossip_settings(&self) -> GossipSettings {
+        let g = &self.gossip;
+        GossipSettings {
+            max_age: Duration::from_secs(g.max_age_secs),
+            retry_max: Duration::from_millis(g.retry_max_ms),
+            request_timeout: Duration::from_millis(g.request_timeout_ms),
+            queue: g.queue,
+            ..GossipSettings::default()
         }
     }
 
@@ -407,6 +449,7 @@ mod tests {
         assert_eq!(c.cache_settings().disk.unwrap().queue, 1024);
         assert_eq!(c.health_settings().path, "/up");
         assert_eq!(c.timeouts.response_ms, 10_000);
+        assert_eq!(c.gossip_settings().max_age, Duration::from_secs(600));
         let secret = Secrets {
             admin_token: None,
             cluster_secret: Some(vec![7; 32]),
@@ -456,6 +499,7 @@ mod tests {
                 "unique",
             ),
             ("unknown = 1", "unknown field"),
+            ("[gossip]\nmax_age_secs = 1", "gossip"),
         ];
         for (extra, want) in cases {
             let err = with(extra).unwrap_err();

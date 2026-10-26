@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 bytes = "=1.12.1"
+hmac = "=0.13.0"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"

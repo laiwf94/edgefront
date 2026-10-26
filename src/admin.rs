@@ -14,6 +14,7 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use sha2::{Digest, Sha256};
 
+use crate::cluster::{Cluster, PEER_PATH};
 use crate::proxy::Proxy;
 use crate::purge::{self, MAX_PURGE_BODY};
 use crate::respond::{Body, full, text};
@@ -22,6 +23,7 @@ use crate::server::Handler;
 pub struct Admin {
     proxy: Arc<Proxy>,
     token: Option<[u8; 32]>,
+    cluster: Option<Arc<Cluster>>,
 }
 
 /// Compares two byte strings without a data-dependent early exit. Hashing
@@ -85,10 +87,11 @@ pub(crate) async fn read_body(body: Incoming, limit: usize) -> Result<Bytes, Ref
 }
 
 impl Admin {
-    pub fn new(proxy: Arc<Proxy>, token: Option<&str>) -> Self {
+    pub fn new(proxy: Arc<Proxy>, token: Option<&str>, cluster: Option<Arc<Cluster>>) -> Self {
         Admin {
             proxy,
             token: token.map(|t| Sha256::digest(t.as_bytes()).into()),
+            cluster,
         }
     }
 
@@ -125,16 +128,23 @@ impl Admin {
             Ok(t) => t,
             Err(e) => return problem(StatusCode::BAD_REQUEST, &e),
         };
-        let removed = self.proxy.cache.purge(&targets).await;
+        let (removed, id) = match &self.cluster {
+            Some(cluster) => {
+                let (removed, id) = cluster.purge_local(&targets).await;
+                (removed, Some(id))
+            }
+            None => (self.proxy.cache.purge(&targets).await, None),
+        };
         let m = &self.proxy.metrics;
         m.purges_local.fetch_add(1, Ordering::Relaxed);
         m.purged_objects
             .fetch_add(removed as u64, Ordering::Relaxed);
-        tracing::info!(peer = %peer, targets = targets.len(), removed, "purge");
-        json(
-            StatusCode::OK,
-            &serde_json::json!({ "removed": removed, "targets": targets.len() }),
-        )
+        tracing::info!(peer = %peer, id = id.as_deref().unwrap_or(""), targets = targets.len(), removed, "purge");
+        let mut body = serde_json::json!({ "removed": removed, "targets": targets.len() });
+        if let Some(id) = id {
+            body["id"] = id.into();
+        }
+        json(StatusCode::OK, &body)
     }
 }
 
@@ -153,6 +163,10 @@ impl Handler for Admin {
                 resp
             }
             (&Method::POST, "/purge") => self.purge(req, peer).await,
+            (_, PEER_PATH) => match &self.cluster {
+                Some(cluster) => cluster.receive(req, peer).await,
+                None => problem(StatusCode::NOT_FOUND, "this node is not in a cluster"),
+            },
             (_, "/healthz" | "/metrics" | "/purge") => {
                 problem(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
             }
