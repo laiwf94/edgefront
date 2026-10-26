@@ -40,6 +40,7 @@ struct Shard {
     main: VecDeque<(Key, u64)>,
     ghost: VecDeque<u64>,
     ghost_set: HashSet<u64>,
+    tags: HashMap<Arc<str>, HashSet<Key>>,
     small_bytes: usize,
     main_bytes: usize,
     main_count: usize,
@@ -85,6 +86,7 @@ impl MemoryStore {
                     main: VecDeque::new(),
                     ghost: VecDeque::new(),
                     ghost_set: HashSet::new(),
+                    tags: HashMap::new(),
                     small_bytes: 0,
                     main_bytes: 0,
                     main_count: 0,
@@ -147,9 +149,36 @@ impl MemoryStore {
     pub fn remove(&self, key: &str) -> Option<Arc<Entry>> {
         let (_, shard) = self.locate(key);
         let mut shard = write(shard);
-        let slot = shard.map.remove(key)?;
-        shard.account_removed(&slot);
+        let (key, slot) = shard.map.remove_entry(key)?;
+        shard.account_removed(&key, &slot);
         Some(slot.entry)
+    }
+
+    /// Removes every entry carrying surrogate key `tag`.
+    pub fn purge_tag(&self, tag: &str) -> Vec<(Key, Arc<Entry>)> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let mut shard = write(shard);
+            let Some(keys) = shard.tags.remove(tag) else {
+                continue;
+            };
+            for key in keys {
+                if let Some((key, slot)) = shard.map.remove_entry(&key) {
+                    shard.account_removed(&key, &slot);
+                    out.push((key, slot.entry));
+                }
+            }
+        }
+        out
+    }
+
+    /// Number of distinct surrogate keys indexed.
+    pub fn tag_count(&self) -> usize {
+        let mut tags = HashSet::new();
+        for shard in &self.shards {
+            tags.extend(read(shard).tags.keys().cloned());
+        }
+        tags.len()
     }
 
     /// Bytes currently charged across all shards.
@@ -188,13 +217,15 @@ impl Shard {
     fn put(&mut self, key: Key, entry: Arc<Entry>, size: usize, hash: u64) {
         if let Some(slot) = self.map.get_mut(&key) {
             let old = slot.size;
-            slot.entry = entry;
+            let old_entry = std::mem::replace(&mut slot.entry, entry.clone());
             slot.size = size;
             let queue = slot.queue;
             match queue {
                 Queue::Small => self.small_bytes = self.small_bytes - old + size,
                 Queue::Main => self.main_bytes = self.main_bytes - old + size,
             }
+            self.unindex(&key, &old_entry);
+            self.index(&key, &entry);
             return;
         }
         let generation = self.next_generation;
@@ -216,10 +247,29 @@ impl Shard {
             queue,
             generation,
         };
+        self.index(&key, &slot.entry);
         self.map.insert(key, slot);
     }
 
-    fn account_removed(&mut self, slot: &Slot) {
+    fn index(&mut self, key: &Key, entry: &Entry) {
+        for tag in entry.tags() {
+            self.tags.entry(tag).or_default().insert(key.clone());
+        }
+    }
+
+    fn unindex(&mut self, key: &Key, entry: &Entry) {
+        for tag in entry.tags() {
+            if let Some(keys) = self.tags.get_mut(&tag) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.tags.remove(&tag);
+                }
+            }
+        }
+    }
+
+    fn account_removed(&mut self, key: &Key, slot: &Slot) {
+        self.unindex(key, &slot.entry);
         match slot.queue {
             Queue::Small => self.small_bytes -= slot.size,
             Queue::Main => {
@@ -279,7 +329,7 @@ impl Shard {
                 continue;
             }
             let slot = self.map.remove(&key).expect("pop_live returns live keys");
-            self.account_removed(&slot);
+            self.account_removed(&key, &slot);
             self.remember(hasher.hash_one(&*key));
             return Some((key, slot.entry));
         }
@@ -298,7 +348,7 @@ impl Shard {
                 continue;
             }
             let slot = self.map.remove(&key).expect("pop_live returns live keys");
-            self.account_removed(&slot);
+            self.account_removed(&key, &slot);
             return Some((key, slot.entry));
         }
         None

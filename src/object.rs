@@ -43,6 +43,8 @@ pub struct CachedObject {
     pub freshness: Freshness,
     pub cc: CacheControl,
     pub etag: Option<EntityTag>,
+    /// Surrogate keys this response can be purged by.
+    pub tags: Vec<Arc<str>>,
     vary: VaryValues,
 }
 
@@ -83,6 +85,7 @@ impl CachedObject {
             status,
             cc: CacheControl::from_headers(&headers),
             etag: EntityTag::from_header(&headers),
+            tags: surrogate_keys(&headers),
             headers,
             body,
             freshness,
@@ -110,6 +113,32 @@ impl CachedObject {
             .sum();
         OBJECT_OVERHEAD + headers + self.body.len()
     }
+}
+
+/// The response header carrying surrogate keys, space separated.
+pub const SURROGATE_KEY: HeaderName = HeaderName::from_static("surrogate-key");
+pub const MAX_TAGS: usize = 64;
+pub const MAX_TAG_LEN: usize = 128;
+
+/// Reads surrogate keys from a response. Keys are visible ASCII without
+/// spaces; overlong keys are dropped and at most `MAX_TAGS` are kept.
+pub fn surrogate_keys(headers: &HeaderMap) -> Vec<Arc<str>> {
+    let mut tags: Vec<Arc<str>> = Vec::new();
+    for line in headers.get_all(SURROGATE_KEY) {
+        let Ok(text) = line.to_str() else { continue };
+        for tag in text.split_ascii_whitespace() {
+            if tag.len() <= MAX_TAG_LEN && valid_tag(tag) && !tags.iter().any(|t| &**t == tag) {
+                tags.push(tag.into());
+            }
+        }
+    }
+    tags.truncate(MAX_TAGS);
+    tags
+}
+
+/// Whether `tag` is usable as a surrogate key.
+pub fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty() && tag.len() <= MAX_TAG_LEN && tag.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// Combines the field lines of `name` and normalises whitespace around
@@ -168,6 +197,17 @@ impl Entry {
     pub fn size(&self) -> usize {
         self.variants.iter().map(|v| v.size()).sum()
     }
+
+    /// Surrogate keys of every variant, without duplicates.
+    pub fn tags(&self) -> Vec<Arc<str>> {
+        let mut tags: Vec<Arc<str>> = Vec::new();
+        for tag in self.variants.iter().flat_map(|v| v.tags.iter()) {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+        tags
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +247,31 @@ pub(crate) mod tests {
             freshness,
             &map(req),
         ))
+    }
+
+    #[test]
+    fn surrogate_keys_from_headers() {
+        let h = map(&[
+            ("surrogate-key", "product-1  home\tproduct-1"),
+            ("surrogate-key", "news"),
+        ]);
+        let tags: Vec<_> = surrogate_keys(&h).iter().map(|t| t.to_string()).collect();
+        assert_eq!(tags, ["product-1", "home", "news"]);
+        let long = "x".repeat(MAX_TAG_LEN + 1);
+        assert!(surrogate_keys(&map(&[("surrogate-key", &long)])).is_empty());
+        let many: Vec<String> = (0..100).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            surrogate_keys(&map(&[("surrogate-key", &many.join(" "))])).len(),
+            MAX_TAGS
+        );
+        let mut h = HeaderMap::new();
+        h.insert(
+            SURROGATE_KEY,
+            http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+        );
+        assert!(surrogate_keys(&h).is_empty());
+        assert!(!valid_tag(""));
+        assert!(!valid_tag("a b"));
     }
 
     #[test]
@@ -300,6 +365,20 @@ pub(crate) mod tests {
         );
         assert!(e.find(&map(&[("accept-encoding", "zstd")])).is_none());
         assert_eq!(e.size(), gz.size() + br.size());
+        assert!(e.tags().is_empty());
+        let a = object(
+            &[("surrogate-key", "x y"), ("vary", "q")],
+            &[("q", "0")],
+            "a",
+        );
+        let b = object(
+            &[("surrogate-key", "y z"), ("vary", "q")],
+            &[("q", "1")],
+            "b",
+        );
+        let e = Entry::single(a).with_variant(b, &map(&[("q", "1")]), 8);
+        let tags: Vec<_> = e.tags().iter().map(|t| t.to_string()).collect();
+        assert_eq!(tags, ["x", "y", "z"]);
     }
 
     #[test]
