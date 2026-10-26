@@ -8,6 +8,8 @@ description = "An HTTP caching reverse proxy for the edge."
 publish = false
 
 [dependencies]
+http = "=1.5.0"
+httpdate = "=1.0.3"
 
 [lints.rust]
 unsafe_code = "forbid"
