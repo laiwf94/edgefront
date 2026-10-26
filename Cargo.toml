@@ -8,6 +8,7 @@ description = "An HTTP caching reverse proxy for the edge."
 publish = false
 
 [dependencies]
+bytes = "=1.12.1"
 http = "=1.5.0"
 httpdate = "=1.0.3"
 
