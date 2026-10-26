@@ -4,6 +4,7 @@ pub mod cache_control;
 pub mod collapse;
 pub mod headers;
 pub mod object;
+pub mod origin;
 pub mod policy;
 pub mod purge;
 pub mod range;

@@ -12,8 +12,11 @@ bytes = "=1.12.1"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"
+hyper = { version = "=1.12.0", features = ["http1", "server", "client"] }
+hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "tokio", "server", "server-graceful"] }
 sha2 = "=0.11.0"
-tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "fs"] }
+tracing = "=0.1.44"
+tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "fs", "io-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
