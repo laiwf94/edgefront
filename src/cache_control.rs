@@ -52,8 +52,14 @@ impl CacheControl {
         // makes the response stale rather than being ignored.
         let lifetime = || arg.map_or(Some(0), |a| Some(parse_delta(a).unwrap_or(0)));
         let optional = || arg.and_then(parse_delta);
-        let lower = name.to_ascii_lowercase();
-        match lower.as_slice() {
+        // Lower-case into a stack buffer; no known directive is longer.
+        let mut buf = [0u8; 24];
+        let Some(lower) = buf.get_mut(..name.len()) else {
+            return;
+        };
+        lower.copy_from_slice(name);
+        lower.make_ascii_lowercase();
+        match &*lower {
             b"max-age" => set_once(&mut self.max_age, lifetime()),
             b"s-maxage" => set_once(&mut self.s_maxage, lifetime()),
             b"max-stale" => match arg {
@@ -292,6 +298,8 @@ mod tests {
 
     #[test]
     fn unknown_directives_are_ignored() {
+        let c = cc("a-very-long-extension-directive-name=1, max-age=2");
+        assert_eq!(c.max_age, Some(2));
         let c = cc("community=\"UCI\", foo, bar=1, max-age=1");
         assert_eq!(c.max_age, Some(1));
     }

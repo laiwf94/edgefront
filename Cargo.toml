@@ -23,6 +23,13 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "fmt", "json", "env-filter", "ansi"] }
 tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "fs", "io-util"] }
 
+[dev-dependencies]
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+
+[[bench]]
+name = "hit_path"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 
