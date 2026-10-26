@@ -1,0 +1,8 @@
+/target
+/fuzz/target
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seed-*
+/fuzz/artifacts
+/fuzz/coverage
+*.profraw
+lcov.info

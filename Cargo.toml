@@ -1,0 +1,17 @@
+[package]
+name = "cachet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "An HTTP caching reverse proxy for the edge."
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
