@@ -1,0 +1,20 @@
+node_id = "edge-a"
+listen = "0.0.0.0:8080"
+# Reachable by the peer inside the compose network; the host publishes it
+# on 127.0.0.1 only.
+admin_listen = "0.0.0.0:9090"
+
+[[origins]]
+name = "origin"
+url = "http://origin:9100"
+
+[cache]
+memory_bytes = 134217728
+
+[cache.disk]
+path = "/var/cache/cachet"
+max_bytes = 1073741824
+
+[[peers]]
+name = "edge-b"
+url = "http://edge-b:9090"

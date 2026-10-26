@@ -1,0 +1,44 @@
+# Two cachet nodes in front of the example origin, purges shared between
+# them. Set CACHET_ADMIN_TOKEN and CACHET_CLUSTER_SECRET (32+ bytes) first:
+#
+#   CACHET_ADMIN_TOKEN=... CACHET_CLUSTER_SECRET=... docker compose up --build
+#
+# Proxies: localhost:8081 and :8082. Admin APIs: localhost:9091 and :9092.
+name: cachet-demo
+
+x-edge: &edge
+  build:
+    context: ../..
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  environment:
+    CACHET_ADMIN_TOKEN: ${CACHET_ADMIN_TOKEN:?set CACHET_ADMIN_TOKEN}
+    CACHET_CLUSTER_SECRET: ${CACHET_CLUSTER_SECRET:?set CACHET_CLUSTER_SECRET}
+  depends_on: [origin]
+
+services:
+  origin:
+    build:
+      context: ../..
+      target: origin
+    read_only: true
+    cap_drop: [ALL]
+
+  edge-a:
+    <<: *edge
+    ports: ["127.0.0.1:8081:8080", "127.0.0.1:9091:9090"]
+    volumes:
+      - ./edge-a.toml:/etc/cachet/cachet.toml:ro
+      - edge-a-cache:/var/cache/cachet
+
+  edge-b:
+    <<: *edge
+    ports: ["127.0.0.1:8082:8080", "127.0.0.1:9092:9090"]
+    volumes:
+      - ./edge-b.toml:/etc/cachet/cachet.toml:ro
+      - edge-b-cache:/var/cache/cachet
+
+volumes:
+  edge-a-cache:
+  edge-b-cache:
