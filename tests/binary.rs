@@ -119,3 +119,16 @@ async fn exits_when_it_cannot_start() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stdout).contains("cannot listen"));
 }
+
+#[test]
+fn shipped_configs_are_valid() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    for path in [
+        "examples/cachet.toml",
+        "examples/compose/edge-a.toml",
+        "examples/compose/edge-b.toml",
+    ] {
+        let text = std::fs::read_to_string(format!("{root}/{path}")).unwrap();
+        cachet::config::Config::parse(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
+    }
+}
