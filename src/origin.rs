@@ -128,7 +128,7 @@ impl Origin {
             self.failures.store(0, Ordering::Relaxed);
             let n = self.successes.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= rise && !self.healthy.swap(true, Ordering::Relaxed) {
-                tracing::warn!(origin = %self.name, "origin is healthy again");
+                tracing::info!(origin = %self.name, "origin is healthy again");
             }
         } else {
             self.successes.store(0, Ordering::Relaxed);
