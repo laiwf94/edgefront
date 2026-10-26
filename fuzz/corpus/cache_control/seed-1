@@ -1,0 +1,2 @@
+max-age=60, s-maxage=30, stale-while-revalidate=10
+public, no-cache="set-cookie"

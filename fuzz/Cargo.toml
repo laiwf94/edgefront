@@ -1,0 +1,63 @@
+[package]
+name = "cachet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+http = "=1.5.0"
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.154"
+sha2 = "=0.11.0"
+
+[dependencies.cachet]
+path = ".."
+
+# Keep the fuzz crate out of the main package.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "cache_control"
+path = "fuzz_targets/cache_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "entity_tags"
+path = "fuzz_targets/entity_tags.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "range"
+path = "fuzz_targets/range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_date"
+path = "fuzz_targets/http_date.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "disk_record"
+path = "fuzz_targets/disk_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "purge_messages"
+path = "fuzz_targets/purge_messages.rs"
+test = false
+doc = false
+bench = false
