@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # The same three steps as `make check`.
+      - name: Format
+        run: make fmt
+      - name: Clippy
+        run: make lint
+      - name: Tests with coverage (lines >= 90%)
+        run: make cov
+      - name: Benchmarks compile
+        run: cargo bench --no-run
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Build on the declared rust-version
+        run: cargo check --locked --all-targets
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: cargo audit
+      - name: Audit the fuzz crate
+        run: cargo audit --file fuzz/Cargo.lock
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl binary and defaults to its own
+      # target, where the sanitizers cannot link; name the gnu target.
+      - name: Fuzz each target for 30 seconds
+        run: |
+          for target in cache_control entity_tags range http_date disk_record purge_messages; do
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=30
+          done
+
+  thread-sanitizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - name: Concurrency tests under ThreadSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: halt_on_error=1
+        run: >
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
+          --lib --test proxy --test revalidation --test failure --test cluster
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Live demo against the release binary
+        run: examples/demo.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t cachet .
+      - name: Runs as non-root
+        run: |
+          test "$(docker image inspect cachet --format '{{.Config.User}}')" = "nonroot:nonroot"
+          docker run --rm cachet --version
