@@ -3,6 +3,8 @@
 pub mod cache_control;
 pub mod collapse;
 pub mod headers;
+pub mod ids;
+pub mod metrics;
 pub mod object;
 pub mod origin;
 pub mod policy;
