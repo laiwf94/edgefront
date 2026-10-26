@@ -12,9 +12,7 @@ bytes = "=1.12.1"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"
-
-[dev-dependencies]
-tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "fs"] }
 
 [lints.rust]
 unsafe_code = "forbid"
