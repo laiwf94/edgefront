@@ -161,6 +161,7 @@ pub struct TestOrigin {
     seen: Arc<Mutex<Vec<Seen>>>,
     delay: Arc<Mutex<Duration>>,
     handler: Arc<Mutex<Handler>>,
+    clock: Arc<Mutex<Option<Arc<TestClock>>>>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -193,6 +194,7 @@ impl TestOrigin {
             seen: Arc::new(Mutex::new(Vec::new())),
             delay: Arc::new(Mutex::new(Duration::ZERO)),
             handler: Arc::new(Mutex::new(h)),
+            clock: Arc::new(Mutex::new(None)),
             task: Mutex::new(None),
         };
         origin.serve(listener);
@@ -200,50 +202,24 @@ impl TestOrigin {
     }
 
     fn serve(&self, listener: TcpListener) {
-        let (hits, seen, delay, handler) = (
-            self.hits.clone(),
-            self.seen.clone(),
-            self.delay.clone(),
-            self.handler.clone(),
-        );
+        let state = Served {
+            hits: self.hits.clone(),
+            seen: self.seen.clone(),
+            delay: self.delay.clone(),
+            handler: self.handler.clone(),
+            clock: self.clock.clone(),
+        };
         let task = tokio::spawn(async move {
             let mut conns = JoinSet::new();
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (hits, seen, delay, handler) =
-                    (hits.clone(), seen.clone(), delay.clone(), handler.clone());
+                let state = state.clone();
                 conns.spawn(async move {
                     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let (hits, seen, delay, handler) =
-                            (hits.clone(), seen.clone(), delay.clone(), handler.clone());
-                        async move {
-                            let (parts, body) = req.into_parts();
-                            let body = body
-                                .collect()
-                                .await
-                                .map(|c| c.to_bytes())
-                                .unwrap_or_default();
-                            // Health probes are not counted as hits.
-                            if parts.uri.path() != "/healthz" {
-                                hits.fetch_add(1, Ordering::SeqCst);
-                                seen.lock().unwrap().push(Seen {
-                                    method: parts.method.clone(),
-                                    uri: parts.uri.clone(),
-                                    headers: parts.headers.clone(),
-                                    body: body.clone(),
-                                });
-                            }
-                            let d = *delay.lock().unwrap();
-                            if !d.is_zero() && parts.uri.path() != "/healthz" {
-                                tokio::time::sleep(d).await;
-                            }
-                            let h = handler.lock().unwrap().clone();
-                            let resp = h(&parts, &body);
-                            let chunked = resp.headers().contains_key("x-test-chunked");
-                            Ok::<_, Infallible>(resp.map(|b| Chunked { inner: b, chunked }))
-                        }
+                        let state = state.clone();
+                        async move { Ok::<_, Infallible>(state.answer(req).await) }
                     });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), svc)
@@ -295,12 +271,64 @@ impl TestOrigin {
         *self.delay.lock().unwrap() = d;
     }
 
+    /// Dates responses from `clock`, so the origin and proxy agree on time.
+    pub fn use_clock(&self, clock: &Arc<TestClock>) {
+        *self.clock.lock().unwrap() = Some(clock.clone());
+    }
+
     pub fn set_handler(&self, h: Handler) {
         *self.handler.lock().unwrap() = h;
     }
 
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+#[derive(Clone)]
+struct Served {
+    hits: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<Seen>>>,
+    delay: Arc<Mutex<Duration>>,
+    handler: Arc<Mutex<Handler>>,
+    clock: Arc<Mutex<Option<Arc<TestClock>>>>,
+}
+
+impl Served {
+    async fn answer(&self, req: hyper::Request<hyper::body::Incoming>) -> Response<Chunked> {
+        let (parts, body) = req.into_parts();
+        let body = body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        // Health probes are not counted as hits and are never delayed.
+        let probe = parts.uri.path() == "/healthz";
+        if !probe {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(Seen {
+                method: parts.method.clone(),
+                uri: parts.uri.clone(),
+                headers: parts.headers.clone(),
+                body: body.clone(),
+            });
+            let d = *self.delay.lock().unwrap();
+            if !d.is_zero() {
+                tokio::time::sleep(d).await;
+            }
+        }
+        let h = self.handler.lock().unwrap().clone();
+        let mut resp = h(&parts, &body);
+        let clock = self.clock.lock().unwrap().clone();
+        if let Some(clock) = clock
+            && !resp.headers().contains_key("date")
+        {
+            use cachet::proxy::Clock;
+            resp.headers_mut()
+                .insert("date", cachet::headers::http_date(clock.now()));
+        }
+        let chunked = resp.headers().contains_key("x-test-chunked");
+        resp.map(|b| Chunked { inner: b, chunked })
     }
 }
 

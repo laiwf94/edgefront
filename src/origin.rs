@@ -72,6 +72,17 @@ pub enum OriginError {
     RequestBody,
 }
 
+impl OriginError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OriginError::Connect => "connect",
+            OriginError::Timeout => "timeout",
+            OriginError::Protocol => "protocol",
+            OriginError::RequestBody => "body-too-large",
+        }
+    }
+}
+
 /// Whether a client error came from the request body length limit.
 fn body_limit_hit(e: &(dyn std::error::Error + 'static)) -> bool {
     let mut cause = Some(e);
@@ -192,7 +203,12 @@ impl OriginPool {
     ) -> Result<(Response<Incoming>, Arc<Origin>), OriginError> {
         let retryable = out.body.is_none();
         let mut last = OriginError::Connect;
-        for origin in self.candidates() {
+        let mut candidates = self.candidates();
+        let mut retried = false;
+        let mut i = 0;
+        while i < candidates.len() {
+            let origin = candidates[i].clone();
+            i += 1;
             let mut req = Request::new(out.body.take().unwrap_or_else(empty));
             *req.method_mut() = out.method.clone();
             *req.uri_mut() = Self::uri(&origin, &out.path);
@@ -218,6 +234,12 @@ impl OriginPool {
             last = err;
             if !retryable {
                 break;
+            }
+            // A pooled connection the origin already closed fails this way;
+            // one retry on the same origin gets a fresh connection.
+            if err == OriginError::Protocol && !retried {
+                retried = true;
+                candidates.insert(i, origin);
             }
         }
         Err(last)

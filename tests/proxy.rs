@@ -436,7 +436,7 @@ async fn request_directives() {
         h.get("/a", &[("cache-control", "no-cache")])
             .await
             .cache_status()
-            .contains("fwd=miss")
+            .contains("fwd=request")
     );
     assert_eq!(o.hits(), 4);
 }
@@ -454,7 +454,7 @@ async fn max_stale_serves_a_stale_copy() {
         got.cache_status()
     );
     let got = h.get("/a", &[]).await;
-    assert!(got.cache_status().contains("fwd=miss"));
+    assert!(got.cache_status().contains("fwd=stale"));
     assert_eq!(o.hits(), 2);
 }
 

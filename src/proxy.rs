@@ -71,6 +71,8 @@ pub(crate) enum Fetched {
     Shared {
         obj: Arc<CachedObject>,
         stored: bool,
+        /// Refreshed by a 304 rather than a full response.
+        revalidated: bool,
     },
     /// A response only the leader may use: not storable (it may be
     /// personal), or too large to buffer.
@@ -289,56 +291,104 @@ impl Proxy {
     ) -> Answer {
         let (parts, _) = req.into_parts();
         let now = self.clock.now();
+        let mut fetch = FetchRequest {
+            key: key.clone(),
+            path: path_of(&parts.uri),
+            headers: parts.headers.clone(),
+            outbound: self.outbound_headers(&parts.headers, id, client, true),
+            req_cc,
+            stored: None,
+        };
         if let Some(obj) = self.cache.lookup(&key, &parts.headers).await {
-            match policy::decide(&obj.freshness, &obj.cc, &req_cc, now) {
+            let ttl = obj.freshness.ttl_secs(now);
+            match policy::decide(&obj.freshness, &obj.cc, &fetch.req_cc, now) {
                 Use::Fresh => {
                     return Answer {
                         response: self.serve(&obj, &Method::GET, &parts.headers),
                         outcome: Outcome::Hit,
-                        status: format!("hit; ttl={}", obj.freshness.ttl_secs(now)),
+                        status: format!("hit; ttl={ttl}"),
                     };
                 }
                 Use::StaleAccepted => {
                     return Answer {
                         response: self.serve(&obj, &Method::GET, &parts.headers),
                         outcome: Outcome::Stale,
-                        status: format!(
-                            "hit; ttl={}; detail=max-stale",
-                            obj.freshness.ttl_secs(now)
-                        ),
+                        status: format!("hit; ttl={ttl}; detail=max-stale"),
                     };
                 }
-                Use::StaleWhileRevalidate | Use::Revalidate => {}
+                Use::StaleWhileRevalidate => {
+                    let mut refresh = fetch.clone();
+                    refresh.stored = Some(obj.clone());
+                    self.refresh_in_background(refresh);
+                    return Answer {
+                        response: self.serve(&obj, &Method::GET, &parts.headers),
+                        outcome: Outcome::Stale,
+                        status: format!("hit; ttl={ttl}; detail=stale-while-revalidate"),
+                    };
+                }
+                Use::Revalidate => fetch.stored = Some(obj),
             }
         }
-        if req_cc.only_if_cached {
+        if fetch.req_cc.only_if_cached {
             return error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "not in cache\n",
                 "fwd=miss; detail=only-if-cached",
             );
         }
-        let fetch = FetchRequest {
-            key: key.clone(),
-            path: path_of(&parts.uri),
-            headers: parts.headers.clone(),
-            outbound: self.outbound_headers(&parts.headers, id, client, true),
-            req_cc,
-        };
         let proxy = self.clone();
-        let fetch_for_flight = fetch.clone();
+        let flight = fetch.clone();
         let (result, role) = self
             .collapser
-            .run(
-                key,
-                move || async move { proxy.fetch(fetch_for_flight).await },
-            )
+            .run(key, move || async move { proxy.fetch(flight).await })
             .await;
         let fetched = result.unwrap_or(Fetched::Failed(OriginError::Protocol));
         if role == Role::Follower {
             self.metrics.collapsed.fetch_add(1, Ordering::Relaxed);
         }
         self.answer_fetch(fetched, role, &fetch).await
+    }
+
+    /// Starts a collapsed refresh that nobody waits for.
+    fn refresh_in_background(self: &Arc<Self>, fetch: FetchRequest) {
+        let proxy = self.clone();
+        let key = fetch.key.clone();
+        if self
+            .collapser
+            .spawn(key, move || async move { proxy.fetch(fetch).await })
+        {
+            self.metrics
+                .background_refreshes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Why this request went forward: no stored copy, a stale one, or a
+    /// fresh one the request's own directives would not accept.
+    fn forward_reason(&self, fetch: &FetchRequest) -> &'static str {
+        match &fetch.stored {
+            None => "fwd=miss",
+            Some(obj) if obj.freshness.is_fresh(self.clock.now()) => "fwd=request",
+            Some(_) => "fwd=stale",
+        }
+    }
+
+    /// Serves the stored copy in place of an origin failure when
+    /// stale-if-error allows it (RFC 5861 section 4).
+    fn stale_on_error(&self, fetch: &FetchRequest, origin_status: &str) -> Option<Answer> {
+        let obj = fetch.stored.as_ref()?;
+        let now = self.clock.now();
+        if !policy::stale_if_error_allows(&obj.freshness, &obj.cc, &fetch.req_cc, now) {
+            return None;
+        }
+        Some(Answer {
+            response: self.serve(obj, &Method::GET, &fetch.headers),
+            outcome: Outcome::StaleIfError,
+            status: format!(
+                "hit; ttl={}; fwd=stale; {origin_status}; detail=stale-if-error",
+                obj.freshness.ttl_secs(now)
+            ),
+        })
     }
 
     /// Turns a fetch result into this request's answer. Followers that
@@ -354,16 +404,40 @@ impl Proxy {
         } else {
             ""
         };
+        let fwd = self.forward_reason(fetch);
+        let failure = match &fetched {
+            Fetched::Failed(e) => Some(format!("detail-origin={}", e.as_str())),
+            Fetched::Shared { obj, .. } if is_error_status(obj.status) => {
+                Some(format!("fwd-status={}", obj.status.as_u16()))
+            }
+            Fetched::Single { status, .. } if is_error_status(*status) => {
+                Some(format!("fwd-status={}", status.as_u16()))
+            }
+            _ => None,
+        };
+        if let Some(origin_status) = failure
+            && let Some(answer) = self.stale_on_error(fetch, &origin_status)
+        {
+            return answer;
+        }
         match fetched {
-            Fetched::Shared { obj, stored } if obj.matches(&fetch.headers) => {
+            Fetched::Shared {
+                obj,
+                stored,
+                revalidated,
+            } if obj.matches(&fetch.headers) => {
                 let now = self.clock.now();
                 let stored = if stored { "; stored" } else { "" };
+                let (outcome, fwd_status) = if revalidated {
+                    (Outcome::Revalidated, 304)
+                } else {
+                    (Outcome::Miss, obj.status.as_u16())
+                };
                 Answer {
                     response: self.serve(&obj, &Method::GET, &fetch.headers),
-                    outcome: Outcome::Miss,
+                    outcome,
                     status: format!(
-                        "fwd=miss; fwd-status={}{stored}{collapsed}; ttl={}",
-                        obj.status.as_u16(),
+                        "{fwd}; fwd-status={fwd_status}{stored}{collapsed}; ttl={}",
                         obj.freshness.ttl_secs(now)
                     ),
                 }
@@ -377,12 +451,12 @@ impl Proxy {
                     Some(response) => Answer {
                         response,
                         outcome: Outcome::Miss,
-                        status: format!("fwd=miss; fwd-status={}", status.as_u16()),
+                        status: format!("{fwd}; fwd-status={}", status.as_u16()),
                     },
                     None => self.fetch_alone(fetch).await,
                 }
             }
-            Fetched::Failed(e) => origin_error(e, &format!("fwd=miss{collapsed}")),
+            Fetched::Failed(e) => origin_error(e, &format!("{fwd}{collapsed}")),
             // A follower cannot use a response meant for one client, or a
             // variant that does not match its own request.
             Fetched::Shared { .. } | Fetched::Single { .. } => self.fetch_alone(fetch).await,
@@ -395,14 +469,21 @@ impl Proxy {
         Box::pin(self.answer_fetch(fetched, Role::Leader, fetch)).await
     }
 
-    /// Sends one request to the origin and stores the response if allowed.
+    /// Sends one request to the origin, conditional when a stored copy
+    /// exists, and stores the response if allowed.
     async fn fetch(self: Arc<Self>, fetch: FetchRequest) -> Fetched {
         let epoch = self.cache.epoch();
         let request_time = self.clock.now();
+        let mut headers = fetch.outbound.clone();
+        if let Some(stored) = &fetch.stored {
+            for (name, value) in policy::conditional_headers(&stored.headers) {
+                headers.insert(name, value);
+            }
+        }
         let out = Outbound {
             method: Method::GET,
             path: fetch.path.clone(),
-            headers: fetch.outbound.clone(),
+            headers,
             body: None,
         };
         let (resp, _origin) = match self.pool.send(out).await {
@@ -412,6 +493,41 @@ impl Proxy {
         let response_time = self.clock.now();
         let (mut parts, body) = resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
+        if parts.status == StatusCode::NOT_MODIFIED
+            && let Some(stored) = &fetch.stored
+        {
+            if !policy::not_modified_matches(&stored.headers, &parts.headers) {
+                // The 304 is about some other representation; start over.
+                let mut fresh = fetch.clone();
+                fresh.stored = None;
+                return Box::pin(self.fetch(fresh)).await;
+            }
+            let headers = policy::merge_not_modified(&stored.headers, &parts.headers);
+            let cc = CacheControl::from_headers(&headers);
+            let freshness = Freshness::compute(
+                stored.status,
+                &headers,
+                &cc,
+                request_time,
+                response_time,
+                self.settings.heuristic_max,
+            );
+            let obj = Arc::new(CachedObject::with_vary(
+                stored.status,
+                headers,
+                stored.body.clone(),
+                freshness,
+                stored.vary().clone(),
+            ));
+            let stored = self
+                .cache
+                .store(fetch.key.clone(), obj.clone(), &fetch.headers, epoch);
+            return Fetched::Shared {
+                obj,
+                stored,
+                revalidated: true,
+            };
+        }
         let resp_cc = CacheControl::from_headers(&parts.headers);
         let exchange = Exchange {
             method: &Method::GET,
@@ -476,7 +592,11 @@ impl Proxy {
         let stored = self
             .cache
             .store(fetch.key.clone(), obj.clone(), &fetch.headers, epoch);
-        Fetched::Shared { obj, stored }
+        Fetched::Shared {
+            obj,
+            stored,
+            revalidated: false,
+        }
     }
 
     fn single(&self, mut parts: http::response::Parts, body: Body) -> Fetched {
@@ -563,6 +683,13 @@ struct FetchRequest {
     /// Headers to send to the origin.
     outbound: HeaderMap,
     req_cc: CacheControl,
+    /// The stored copy being revalidated, if any.
+    stored: Option<Arc<CachedObject>>,
+}
+
+/// Origin statuses that count as errors for stale-if-error (RFC 5861 section 4).
+fn is_error_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 500 | 502 | 503 | 504)
 }
 
 fn path_of(uri: &Uri) -> PathAndQuery {
