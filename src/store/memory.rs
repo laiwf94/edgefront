@@ -200,6 +200,11 @@ impl MemoryStore {
         self.len() == 0
     }
 
+    /// The largest entry this store accepts.
+    pub fn max_object_bytes(&self) -> usize {
+        self.max_object
+    }
+
     pub fn capacity(&self) -> usize {
         self.shards.iter().map(|s| read(s).capacity).sum()
     }

@@ -18,6 +18,132 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::task::{JoinHandle, JoinSet};
 
+/// Wall clock with an adjustable offset, so tests can age cached objects
+/// without sleeping while origin Date headers stay realistic.
+#[derive(Default)]
+pub struct TestClock {
+    offset: Mutex<Duration>,
+}
+
+impl TestClock {
+    pub fn advance(&self, d: Duration) {
+        *self.offset.lock().unwrap() += d;
+    }
+}
+
+impl cachet::proxy::Clock for TestClock {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now() + *self.offset.lock().unwrap()
+    }
+}
+
+pub struct Harness {
+    pub proxy: Arc<cachet::proxy::Proxy>,
+    pub clock: Arc<TestClock>,
+}
+
+/// A proxy in front of `origins`, with settings adjusted by `tweak`.
+pub fn harness(
+    origins: &[SocketAddr],
+    tweak: impl FnOnce(&mut cachet::store::CacheSettings, &mut cachet::proxy::ProxySettings),
+) -> Harness {
+    use cachet::origin::{HealthSettings, Origin, OriginPool, client};
+    let mut cache = cachet::store::CacheSettings {
+        memory_bytes: 64 << 20,
+        shards: 4,
+        ..Default::default()
+    };
+    let mut settings = cachet::proxy::ProxySettings {
+        node_id: "test-node".into(),
+        ..Default::default()
+    };
+    tweak(&mut cache, &mut settings);
+    let origins = origins
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            Arc::new(Origin::new(
+                &format!("origin{i}"),
+                a.to_string().parse().unwrap(),
+            ))
+        })
+        .collect();
+    let pool = Arc::new(OriginPool::new(
+        origins,
+        client(Duration::from_millis(500)),
+        Duration::from_secs(2),
+        HealthSettings::default(),
+    ));
+    let clock = Arc::new(TestClock::default());
+    let proxy = cachet::proxy::Proxy::new(
+        cachet::store::Cache::new(&cache).unwrap(),
+        pool,
+        settings,
+        clock.clone(),
+    );
+    Harness { proxy, clock }
+}
+
+/// A response as the client saw it.
+#[derive(Debug)]
+pub struct Got {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+impl Got {
+    pub fn cache_status(&self) -> &str {
+        self.headers
+            .get("cache-status")
+            .map_or("", |v| v.to_str().unwrap())
+    }
+
+    pub fn header(&self, name: &str) -> &str {
+        self.headers.get(name).map_or("", |v| v.to_str().unwrap())
+    }
+}
+
+impl Harness {
+    pub async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &'static str,
+    ) -> Got {
+        let mut b = http::Request::builder().method(method).uri(path);
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+            b = b.header("host", "example.com");
+        }
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req = b
+            .body(Full::new(Bytes::from_static(body.as_bytes())))
+            .unwrap();
+        let resp = self
+            .proxy
+            .handle(req, "192.0.2.1:5000".parse().unwrap())
+            .await;
+        let (parts, body) = resp.into_parts();
+        let body = body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        Got {
+            status: parts.status,
+            headers: parts.headers,
+            body,
+        }
+    }
+
+    pub async fn get(&self, path: &str, headers: &[(&str, &str)]) -> Got {
+        self.send("GET", path, headers, "").await
+    }
+}
+
 pub type Handler = Arc<dyn Fn(&Parts, &Bytes) -> Response<Full<Bytes>> + Send + Sync>;
 
 /// What the origin saw.
@@ -114,7 +240,9 @@ impl TestOrigin {
                                 tokio::time::sleep(d).await;
                             }
                             let h = handler.lock().unwrap().clone();
-                            Ok::<_, Infallible>(h(&parts, &body))
+                            let resp = h(&parts, &body);
+                            let chunked = resp.headers().contains_key("x-test-chunked");
+                            Ok::<_, Infallible>(resp.map(|b| Chunked { inner: b, chunked }))
                         }
                     });
                     let _ = http1::Builder::new()
@@ -176,6 +304,36 @@ impl TestOrigin {
     }
 }
 
+/// A body that hides its length when asked, so hyper sends it chunked.
+struct Chunked {
+    inner: Full<Bytes>,
+    chunked: bool,
+}
+
+impl hyper::body::Body for Chunked {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.chunked {
+            hyper::body::SizeHint::default()
+        } else {
+            self.inner.size_hint()
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        !self.chunked && self.inner.is_end_stream()
+    }
+}
+
 impl Drop for TestOrigin {
     fn drop(&mut self) {
         self.stop();
@@ -209,6 +367,23 @@ pub async fn garbage_server() -> (SocketAddr, JoinHandle<()>) {
         while let Ok((mut s, _)) = listener.accept().await {
             let _ = s.write_all(b"this is not http\r\n\r\n").await;
             let _ = s.shutdown().await;
+        }
+    });
+    (addr, task)
+}
+
+/// A server that sends cacheable response headers, then stalls mid-body.
+pub async fn stalled_body() -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut s, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\ncache-control: max-age=60\r\ncontent-length: 100\r\n\r\npartial";
+            let _ = s.write_all(head.as_bytes()).await;
+            held.push(s);
         }
     });
     (addr, task)

@@ -68,6 +68,20 @@ pub enum OriginError {
     Timeout,
     /// The connection broke or the response was malformed.
     Protocol,
+    /// The client's request body went over the limit while streaming.
+    RequestBody,
+}
+
+/// Whether a client error came from the request body length limit.
+fn body_limit_hit(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(e);
+    while let Some(c) = cause {
+        if c.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        cause = c.source();
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -192,6 +206,7 @@ impl OriginPool {
                     return Ok((resp, origin));
                 }
                 Ok(Err(e)) if e.is_connect() => OriginError::Connect,
+                Ok(Err(e)) if body_limit_hit(&e) => return Err(OriginError::RequestBody),
                 Ok(Err(_)) => OriginError::Protocol,
                 Err(_) => OriginError::Timeout,
             };

@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod object;
 pub mod origin;
 pub mod policy;
+pub mod proxy;
 pub mod purge;
 pub mod range;
 pub mod respond;
