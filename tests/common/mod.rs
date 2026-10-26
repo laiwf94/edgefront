@@ -417,6 +417,21 @@ pub async fn stalled_body() -> (SocketAddr, JoinHandle<()>) {
     (addr, task)
 }
 
+/// Polls an async check until it is true or a few seconds pass.
+pub async fn eventually_async<F, Fut>(what: &str, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..300 {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
 /// Polls `f` until it is true or a few seconds pass.
 pub async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     for _ in 0..300 {
@@ -436,7 +451,26 @@ pub async fn http(
     headers: &[(&str, &str)],
     body: &'static str,
 ) -> Got {
-    let client = cachet::origin::client(Duration::from_secs(2));
+    http_on(
+        &cachet::origin::client(Duration::from_secs(2)),
+        method,
+        addr,
+        path,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// Like `http`, on a client the caller keeps, so connections are reused.
+pub async fn http_on(
+    client: &cachet::origin::Client,
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &'static str,
+) -> Got {
     let mut b = http::Request::builder()
         .method(method)
         .uri(format!("http://{addr}{path}"));
@@ -602,4 +636,29 @@ pub fn binary_config(node_id: &str, origin: SocketAddr, extra: &str) -> String {
         "node_id = \"{node_id}\"\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n\
          [[origins]]\nname = \"primary\"\nurl = \"http://{origin}\"\n{extra}"
     )
+}
+
+/// A server that answers every request with the given raw bytes, then
+/// closes the connection.
+pub async fn raw_server(response: &'static [u8]) -> (SocketAddr, JoinHandle<()>) {
+    raw_sequence(vec![response]).await
+}
+
+/// Like `raw_server`, answering the n-th connection with the n-th
+/// response and repeating the last one.
+pub async fn raw_sequence(responses: Vec<&'static [u8]>) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut n = 0;
+        while let Ok((mut s, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut s, &mut buf).await;
+            let response = responses[n.min(responses.len() - 1)];
+            n += 1;
+            let _ = s.write_all(response).await;
+            let _ = s.shutdown().await;
+        }
+    });
+    (addr, task)
 }
