@@ -287,12 +287,15 @@ impl Shard {
     fn evict_to_capacity(&mut self, hasher: &RandomState, out: &mut Vec<(Key, Arc<Entry>)>) {
         while self.small_bytes + self.main_bytes > self.capacity {
             let small_share = self.capacity * SMALL_PERCENT / 100;
+            // When every object in the small queue was read, they all move
+            // to the main queue and the small queue yields nothing; the
+            // main queue must then give up a victim instead.
             let evicted = if (self.small_bytes >= small_share && !self.small.is_empty())
                 || self.main.is_empty()
             {
-                self.evict_small(hasher)
+                self.evict_small(hasher).or_else(|| self.evict_main())
             } else {
-                self.evict_main()
+                self.evict_main().or_else(|| self.evict_small(hasher))
             };
             match evicted {
                 Some(e) => out.push(e),
@@ -468,6 +471,22 @@ mod tests {
                 store.get(&format!("k{}", i / 2));
             }
         }
+    }
+
+    #[test]
+    fn budget_holds_when_every_small_object_was_read() {
+        let one = entry(1_000).size();
+        let store = MemoryStore::new(10 * one, 1, 4 * one);
+        for i in 0..10 {
+            store.insert(key(&format!("k{i}")), entry(1_000));
+            store.get(&format!("k{i}"));
+        }
+        // Growing an entry in place adds bytes without adding an unread
+        // object, so the small queue has nothing it may evict.
+        let out = store.insert(key("k9"), entry(3_000));
+        assert!(out.stored);
+        assert!(!out.evicted.is_empty());
+        assert!(store.bytes() <= store.capacity());
     }
 
     #[test]
