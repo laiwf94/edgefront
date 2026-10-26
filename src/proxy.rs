@@ -540,6 +540,14 @@ impl Proxy {
         };
         if let Err(reason) = policy::storable(&exchange, self.settings.heuristic_max) {
             self.metrics.not_stored(reason);
+            // The origin answered in full but no longer lets this be
+            // stored. Drop the old copy too, or stale-if-error could keep
+            // serving what the origin has since made private.
+            if fetch.stored.is_some() && !is_error_status(parts.status) {
+                self.cache
+                    .purge(&[PurgeTarget::Key(fetch.key.clone())])
+                    .await;
+            }
             return self.single(parts, body.map_err(Into::into).boxed());
         }
         let limit = self.cache.memory().max_object_bytes();

@@ -322,3 +322,20 @@ async fn concurrent_revalidations_collapse() {
     }
     assert_eq!(o.hits(), 2);
 }
+
+#[tokio::test]
+async fn a_response_that_becomes_private_drops_the_stored_copy() {
+    let (o, _) = versioned("max-age=10, stale-if-error=600").await;
+    let h = harness(&[o.addr], |_, _| {});
+    o.use_clock(&h.clock);
+    h.get("/doc", &[]).await;
+    o.set_handler(handler(|_, _| {
+        reply(200, &[("cache-control", "private")], "personal now")
+    }));
+    h.clock.advance(15 * SECOND);
+    assert_eq!(h.get("/doc", &[]).await.body, "personal now");
+    // With the origin failing, the old shared copy must not come back.
+    o.set_handler(handler(|_, _| reply(503, &[], "down")));
+    assert_eq!(h.get("/doc", &[]).await.status, 503);
+    assert!(h.proxy.cache.memory().is_empty());
+}
