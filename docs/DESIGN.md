@@ -1,14 +1,14 @@
 # cachet design notes
 
-## Goals
+## What cachet is for
 
 cachet is a shared HTTP cache that sits in front of one or more origins, close to clients. It should follow the HTTP caching rules closely enough that an origin can control it entirely through standard headers, keep the origin's load flat when popular objects expire, keep serving when the origin is slow or down if the origin allows it, and let an operator remove content from every node with one request.
 
 It is a single binary with no external services. A node keeps its cache in memory with an optional disk tier, and nodes coordinate only to spread purges.
 
-Non-goals: TLS termination, HTTP/2 and HTTP/3, edge compute, cache key rewriting, and tiered caching between nodes. Each of these is real work that a production edge needs, and each would hide the parts this project is about.
+It does not terminate TLS, speak HTTP/2 or HTTP/3, run edge code, rewrite cache keys, or fetch from other nodes before the origin. Each of these is real work that a production edge needs, and each would hide the parts this project is about.
 
-## Request path
+## Following one request
 
 A request is handled in `proxy.rs`. GET and HEAD go through the cache; every other method passes through to the origin. A request with `Cache-Control: no-store` also passes through.
 
@@ -18,7 +18,7 @@ Misses and validations go through the collapser. The origin request strips the c
 
 Every response carries `Cache-Status` (RFC 9211), for example `edge-a; fwd=stale; fwd-status=304; stored; ttl=60`, and an `x-request-id`. A caller's request id is kept only if it is short and plain, so clients cannot put arbitrary text into the logs.
 
-## HTTP caching rules
+## Which HTTP caching rules apply, and where cachet is stricter
 
 `policy.rs` implements the shared-cache parts of RFC 9111. A response is stored only if the method is GET, the status is one the cache understands, neither side sent `no-store` (unless `must-understand` applies), it is not `private`, `Vary` is not `*`, and it has explicit freshness, `public`, or a heuristically cacheable status. A request with `Authorization` is stored only with `public`, `s-maxage` or `must-revalidate` (section 3.5).
 
@@ -38,19 +38,19 @@ HEAD misses pass through to the origin without being stored. HEAD hits are answe
 
 Unsafe methods that succeed invalidate the target URL and same-host `Location` and `Content-Location` URLs (section 4.4). Only the local node is invalidated; each node sees its own writes.
 
-## Request collapsing
+## Many clients, one origin request
 
 `collapse.rs` is a single-flight map from cache key to an in-flight fetch. The first caller starts the fetch on its own task and every caller, including the first, waits on a watch channel for the result. Running the fetch on a separate task matters: if the first client disconnects, the fetch is not cancelled, the followers still get an answer, and the response still reaches the cache. A panic in the fetch drops the channel, which releases every waiter with an error, and a drop guard removes the key. The result is published before the key is removed, so a request arriving in that gap reads the result instead of starting a second fetch.
 
 Sharing is limited by what the response allows. A storable response is buffered and every waiter may use it. A response that may not be stored (for example `private` or carrying `Set-Cookie`) was produced for the first client's request, so only that client receives it; each follower then makes its own request. A follower whose Vary selecting headers do not match the shared response also fetches on its own. A test sends ten concurrent requests with different cookies to a `private` URL and checks that each client gets its own body.
 
-## Stale content (RFC 5861)
+## Serving stale content (RFC 5861)
 
 Inside the `stale-while-revalidate` window the stale copy is served at once and one collapsed background refresh starts; further requests during the refresh are served stale without starting more refreshes.
 
 When revalidation fails with a connection error, a timeout, a broken response, or a 500, 502, 503 or 504, the stale copy is served if the response's or the request's `stale-if-error` window covers its staleness. Other statuses, such as 404, are answers and are passed on. `must-revalidate`, `proxy-revalidate`, `s-maxage` and `no-cache` turn off every form of stale serving, as RFC 9111 section 4.2.4 requires.
 
-## Memory tier: S3-FIFO with a byte budget
+## Keeping the right objects in memory: S3-FIFO with a byte budget
 
 The memory tier (`store/memory.rs`) uses S3-FIFO from Yang et al. (SOSP 2023). New objects enter a small FIFO queue. When the small queue is over its share (ten percent of the bytes), its oldest object either moves to the main queue, if it was read since it was inserted, or is evicted and its key hash recorded in a ghost queue. An object whose key is in the ghost queue skips the small queue on its next insert. The main queue evicts its oldest object, giving it another round for each recorded read, with the count capped at three.
 
@@ -60,7 +60,7 @@ The paper counts objects; cachet counts bytes. Each object is charged its body, 
 
 The store is split into 16 shards by key hash, each with its own lock and an equal slice of the budget. An object larger than the per-object limit or than a shard is refused. Removal leaves stale queue entries behind, which eviction skips; a shard compacts its queues when stale entries outnumber live ones.
 
-## Disk tier
+## Surviving a restart: the disk tier
 
 The disk tier (`store/disk.rs`) is optional and write-through: every stored entry is queued for disk, and memory holds the hot subset. A memory eviction then costs nothing, and a restarted node comes back warm instead of sending every request to the origin at once. Writes go through a bounded queue (1,024 entries by default) to one thread. When the queue is full the write is skipped and counted, because the entry is still in memory and a cache may forget.
 
@@ -68,13 +68,13 @@ Each URL is one file named by a hash of its key, so keys never become paths. A r
 
 A test kills the real binary with SIGKILL, leaves a torn temporary file behind, stops the origin, restarts the binary and gets the object back as a hit from disk.
 
-## Purges
+## Removing content: surrogate keys and the purge log
 
 Origins tag responses with a `Surrogate-Key` header, a space-separated list of keys (a convention several CDNs use; there is no RFC). Each memory shard and the disk tier keep an index from tag to keys, updated on insert, replace, eviction and removal. `POST /purge` on the admin listener takes `{"tags": [...], "urls": [...]}` with up to 1,000 targets and a 64 KiB body, behind a bearer token. The token is compared through SHA-256 digests with no early exit, which also hides its length.
 
 A fetch that started before a purge can finish after it. Without care, it would put the purged response back. Each fetch records the purge log's epoch when it starts. After storing, the cache asks the log whether a purge since that epoch matches the key or any of its tags, and removes its own insert if so. A purge records itself in the log before it removes anything, so either the purge removes the insert or the check sees the purge. The log keeps the last 4,096 targets; if it no longer reaches back to a fetch's epoch the answer is a conservative yes. The disk writer applies the same check before and after each write.
 
-## Purge propagation
+## Getting a purge to every node
 
 `cluster.rs` spreads a purge to every node. The node that accepts a purge turns it into a message with a unique id, its node id, the time, and the targets, serialises it to JSON and signs those exact bytes with HMAC-SHA256 (RFC 2104) under a key shared by the cluster. The key is never sent. A receiver checks the signature over the raw body before parsing anything, then refuses messages older than the window (600 seconds by default) or more than 60 seconds in the future, and remembers ids for the window, so a captured message cannot be replayed. A new message is applied and then relayed, as the same signed bytes, to the receiver's peers other than the origin and the sender. This is the flooding form of the epidemic broadcast in Demers et al. (1987): each node forwards a message once, ids stop loops, and a purge still reaches a node that the first node cannot reach directly. A test with three nodes in a line checks that.
 
@@ -82,19 +82,19 @@ Each peer has its own queue (1,024 messages) and one delivery task, so a slow or
 
 With N nodes a purge costs O(N²) messages. That is fine for tens of nodes and wrong for thousands, where a tree or a fan-out service would be needed.
 
-## Origins
+## Choosing an origin
 
 `origin.rs` keeps an ordered list of origins. Requests go to the first healthy one. Requests without a body move to the next origin on a connection error, a timeout before response headers, or a broken response. A broken response on a pooled connection is retried once on the same origin first, since that is how a connection the origin already closed fails. If every origin is marked down, they are still tried in order: health data lags behind recovery, and failing closed would turn a brief blip into a full outage.
 
 Health comes from active probes (`GET /healthz` every 2 seconds by default) and from connection failures and timeouts in real traffic, which share the same counters. An origin is marked down after three consecutive failures and back up after two consecutive successes. A broken response does not count against health.
 
-## Limits and abuse
+## Input limits and secrets
 
 Clients get 10 seconds to send their request head, which may be at most 64 KiB; larger heads get 431. Request targets over 8 KiB get 414. Request bodies over 10 MiB get 413, checked against Content-Length before reading and enforced while streaming otherwise. A request whose `Via` names this node gets 508. Origin bodies are buffered only up to the per-object limit (8 MiB); the declared length is checked before reading, and a body that turns out larger streams through to the one client that asked, uncached, without buffering the rest. Only the first 64 surrogate keys of a response are kept, keys over 128 bytes are dropped, and a URL keeps at most eight Vary variants, so an origin varying on something like User-Agent cannot fill the cache with one URL.
 
 The admin listener binds to localhost by default. Without `CACHET_ADMIN_TOKEN` the purge API is off. Without `CACHET_CLUSTER_SECRET` (at least 32 bytes) the peer endpoint is off, and a config with peers refuses to start. Secrets come only from the environment and are redacted from `Debug` output.
 
-## Failure modes
+## What happens when things fail
 
 | Situation | What happens |
 |---|---|
@@ -112,7 +112,7 @@ The admin listener binds to localhost by default. Without `CACHET_ADMIN_TOKEN` t
 | Purge races a fetch | The fetched response is not kept. |
 | Shutdown | Stops accepting, waits up to 10 s for open requests, flushes the disk queue. Queued purge deliveries are lost. |
 
-## Trade-offs and known limits
+## What it does not do well
 
 HTTP/1.1 only, plain HTTP to origins and peers. Peer messages are signed, not encrypted; purge targets are not secret, but deployments that care should put the admin listener on a private network.
 
@@ -126,13 +126,13 @@ Age depends on the origin's `Date`, so clock skew between origin and cache shift
 
 The startup scan reads every record header, which takes time proportional to the number of objects on disk.
 
-## Dependencies
+## Why these dependencies
 
 tokio, hyper and hyper-util provide the runtime, HTTP/1.1 server and pooled client; http, http-body-util and bytes are their shared types. httpdate parses the three HTTP date formats. sha2 and hmac provide the record checksums and message signatures; writing either by hand would be a mistake. serde, serde_json and toml read the config and the purge and peer messages. tracing and tracing-subscriber give JSON logs. criterion is a dev-dependency for benchmarks. Metrics, the Prometheus text format, request ids, the disk record format, request collapsing and the S3-FIFO store are written here because each is small.
 
 Direct dependencies are pinned to exact versions published at least two weeks before they were added, and the lockfiles pin transitive crates to releases at least as old. One exception: cargo audit reported RUSTSEC-2026-0385 against ctutils 0.4.3, a transitive dependency of sha2 and hmac, so both lockfiles use ctutils 0.4.4, the first fixed release, published four days before it was taken.
 
-## References
+## Sources
 
 RFC 9110, HTTP Semantics. R. Fielding, M. Nottingham, J. Reschke, 2022.
 

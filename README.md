@@ -4,7 +4,7 @@ cachet is an HTTP caching reverse proxy for the edge, written in Rust. It follow
 
 It is a single binary: an S3-FIFO memory cache with a byte budget, an optional crash-safe disk tier, health-checked origins with failover, signed purge propagation between nodes, Prometheus metrics and JSON logs. The design, its trade-offs and the papers and RFCs behind it are in [docs/DESIGN.md](docs/DESIGN.md).
 
-## Quick start
+## Running it
 
 You need Rust 1.88 or newer.
 
@@ -27,7 +27,7 @@ cd examples/compose
 CACHET_ADMIN_TOKEN=change-me CACHET_CLUSTER_SECRET=$(openssl rand -hex 32) docker compose up --build
 ```
 
-## Example
+## Reading a response
 
 Every response says what the cache did in a `Cache-Status` header (RFC 9211):
 
@@ -69,7 +69,7 @@ The admin listener also serves `/healthz` and `/metrics`.
    ok: both nodes fetched the object again after one purge request
 ```
 
-## Behaviour under failure
+## When the origin, a node or a peer fails
 
 When an origin refuses connections or times out, the request moves to the next configured origin, and after three consecutive failures the origin is skipped until health checks see it recover. If the origin fails or returns 500, 502, 503 or 504 and a stale copy is within its `stale-if-error` window, the stale copy is served; otherwise the client gets 502 or 504. Inside the `stale-while-revalidate` window, clients get the stale copy at once while one background request refreshes it.
 
@@ -81,7 +81,7 @@ A purge is signed and sent to every peer. Peers check the signature before parsi
 
 Malformed requests get 400, oversized heads 431, long targets 414, oversized bodies 413, and request loops 508. Malformed origin responses become 502 and are never stored.
 
-## Benchmarks
+## How fast the hit path is
 
 On an Apple Silicon laptop (16 cores) that was also running other work (load average around 70), so read these as lower bounds. Reproduce with `cargo bench` and `examples/load.sh`.
 
@@ -104,11 +104,11 @@ End to end with [oha](https://github.com/hatoo/oha), 64 connections for 10 secon
 
 Hits through cachet run at about the rate of the in-memory origin serving the same bytes, which suggests the load generator and the loopback stack set the limit here rather than the cache. In the collapsing run, 250 clients requested a cold URL that takes 300 ms at the same moment; the origin saw one request, and `cachet_collapsed_requests_total` counted 249 waiters.
 
-## Limits
+## Where it stops
 
-HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are buffered in memory up to the per-object limit (8 MiB by default); larger responses stream through uncached. Only single byte ranges are served. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#trade-offs-and-known-limits) for the full list.
+HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are buffered in memory up to the per-object limit (8 MiB by default); larger responses stream through uncached. Only single byte ranges are served. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#what-it-does-not-do-well) for the full list.
 
-## Development
+## Checking a change
 
 `make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests with at least 90% line coverage through cargo-llvm-cov. `make audit` runs cargo deny and cargo audit, `make fuzz` runs the six cargo-fuzz targets (nightly), and `make tsan` runs the concurrency tests under ThreadSanitizer (nightly with rust-src). CI runs all of these, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
 
