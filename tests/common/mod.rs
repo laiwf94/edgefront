@@ -427,3 +427,179 @@ pub async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     }
     panic!("timed out waiting for {what}");
 }
+
+/// Sends a request over TCP, as a real client would.
+pub async fn http(
+    method: &str,
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &'static str,
+) -> Got {
+    let client = cachet::origin::client(Duration::from_secs(2));
+    let mut b = http::Request::builder()
+        .method(method)
+        .uri(format!("http://{addr}{path}"));
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        b = b.header("host", "example.com");
+    }
+    for (k, v) in headers {
+        b = b.header(*k, *v);
+    }
+    let req = b.body(cachet::respond::full(body)).unwrap();
+    let resp = client.request(req).await.expect("request failed");
+    let (parts, body) = resp.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|c| c.to_bytes())
+        .unwrap_or_default();
+    Got {
+        status: parts.status,
+        headers: parts.headers,
+        body,
+    }
+}
+
+/// A node config on ephemeral localhost ports in front of `origins`.
+pub fn node_config(node_id: &str, origins: &[SocketAddr], extra: &str) -> cachet::config::Config {
+    let mut text = format!(
+        "node_id = \"{node_id}\"\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n\
+         [health]\ninterval_ms = 50\ntimeout_ms = 200\n\
+         [timeouts]\nconnect_ms = 200\nresponse_ms = 2000\nshutdown_ms = 2000\n"
+    );
+    for (i, o) in origins.iter().enumerate() {
+        text.push_str(&format!(
+            "[[origins]]\nname = \"origin{i}\"\nurl = \"http://{o}\"\n"
+        ));
+    }
+    text.push_str(extra);
+    cachet::config::Config::parse(&text).unwrap()
+}
+
+pub const TOKEN: &str = "test-admin-token";
+
+pub fn secrets() -> cachet::config::Secrets {
+    cachet::config::Secrets {
+        admin_token: Some(TOKEN.into()),
+        cluster_secret: Some(b"0123456789abcdef0123456789abcdef".to_vec()),
+    }
+}
+
+/// The real cachet binary, started with a config file.
+pub struct Binary {
+    pub child: std::process::Child,
+    pub proxy_addr: SocketAddr,
+    pub admin_addr: SocketAddr,
+    pub lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl Binary {
+    /// Writes `config` to `dir`, starts the binary, and waits for its
+    /// "cachet started" log line to learn the bound addresses.
+    pub fn start(dir: &std::path::Path, config: &str, env: &[(&str, &str)]) -> Binary {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("cachet.toml");
+        std::fs::write(&path, config).unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_cachet"));
+        cmd.arg("--config")
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+        cmd.env_remove("CACHET_ADMIN_TOKEN")
+            .env_remove("CACHET_CLUSTER_SECRET");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = loop {
+            let line = lines
+                .recv_timeout(Duration::from_secs(10))
+                .expect("binary did not start");
+            if line.contains("cachet started") {
+                break line;
+            }
+        };
+        let v: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let field = |name: &str| v["fields"][name].as_str().unwrap().parse().unwrap();
+        Binary {
+            child,
+            proxy_addr: field("listen"),
+            admin_addr: field("admin"),
+            lines,
+        }
+    }
+
+    /// Sends a signal by name through kill(1).
+    pub fn signal(&self, name: &str) {
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{name}"))
+            .arg(self.child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Waits for the process to exit and returns its status.
+    pub fn wait(&mut self) -> std::process::ExitStatus {
+        for _ in 0..500 {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("binary did not exit");
+    }
+
+    /// Log lines printed so far.
+    pub fn drain_lines(&self) -> Vec<String> {
+        self.lines.try_iter().collect()
+    }
+}
+
+impl Drop for Binary {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A scratch directory removed on drop.
+pub struct Scratch(pub std::path::PathBuf);
+
+impl Scratch {
+    pub fn new(name: &str) -> Scratch {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let p = std::env::temp_dir().join(format!("cachet-it-{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        Scratch(p)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Config text for the binary on ephemeral ports.
+pub fn binary_config(node_id: &str, origin: SocketAddr, extra: &str) -> String {
+    format!(
+        "node_id = \"{node_id}\"\nlisten = \"127.0.0.1:0\"\nadmin_listen = \"127.0.0.1:0\"\n\
+         [[origins]]\nname = \"primary\"\nurl = \"http://{origin}\"\n{extra}"
+    )
+}

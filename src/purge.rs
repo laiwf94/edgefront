@@ -8,7 +8,54 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use crate::object::Key;
+use http::{HeaderMap, Uri};
+use serde::Deserialize;
+
+use crate::object::{Key, primary_key, valid_tag};
+
+/// Largest purge request body accepted.
+pub const MAX_PURGE_BODY: usize = 64 * 1024;
+/// Most targets one purge request may name.
+pub const MAX_TARGETS: usize = 1000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PurgeRequest {
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    urls: Vec<String>,
+}
+
+/// Parses a purge request body: `{"tags": [...], "urls": [...]}`. URLs
+/// must be absolute so they name a host.
+pub fn parse_request(body: &[u8]) -> Result<Vec<PurgeTarget>, String> {
+    let req: PurgeRequest =
+        serde_json::from_slice(body).map_err(|e| format!("invalid purge request: {e}"))?;
+    if req.tags.len() + req.urls.len() > MAX_TARGETS {
+        return Err(format!("at most {MAX_TARGETS} tags and urls per request"));
+    }
+    if req.tags.is_empty() && req.urls.is_empty() {
+        return Err("name at least one tag or url".into());
+    }
+    let mut targets = Vec::with_capacity(req.tags.len() + req.urls.len());
+    for tag in req.tags {
+        if !valid_tag(&tag) {
+            return Err(format!("invalid tag {tag:?}"));
+        }
+        targets.push(PurgeTarget::Tag(tag.into()));
+    }
+    for url in req.urls {
+        let uri: Uri = url.parse().map_err(|_| format!("invalid url {url:?}"))?;
+        if uri.authority().is_none() {
+            return Err(format!("url {url:?} must be absolute"));
+        }
+        let key = primary_key(&uri, &HeaderMap::new())
+            .ok_or_else(|| format!("url {url:?} has no host"))?;
+        targets.push(PurgeTarget::Key(key));
+    }
+    Ok(targets)
+}
 
 /// What a purge removes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +141,40 @@ impl PurgeLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purge_requests() {
+        let t = parse_request(br#"{"tags": ["product-1"], "urls": ["http://Example.com/a?b=1"]}"#)
+            .unwrap();
+        assert_eq!(
+            t,
+            vec![
+                PurgeTarget::Tag("product-1".into()),
+                PurgeTarget::Key("example.com/a?b=1".into())
+            ]
+        );
+        let t = parse_request(br#"{"urls": ["http://example.com"]}"#).unwrap();
+        assert_eq!(t, vec![PurgeTarget::Key("example.com/".into())]);
+        for (body, want) in [
+            (&b"{}"[..], "at least one"),
+            (b"not json", "invalid purge request"),
+            (br#"{"tags": [""]}"#, "invalid tag"),
+            (br#"{"tags": ["a b"]}"#, "invalid tag"),
+            (br#"{"urls": ["/relative"]}"#, "absolute"),
+            (br#"{"urls": ["::"]}"#, "invalid url"),
+            (br#"{"keys": ["x"]}"#, "unknown field"),
+        ] {
+            let err = parse_request(body).unwrap_err();
+            assert!(err.contains(want), "{err}");
+        }
+        let many: Vec<String> = (0..=MAX_TARGETS).map(|i| format!("\"t{i}\"")).collect();
+        let body = format!("{{\"tags\": [{}]}}", many.join(","));
+        assert!(
+            parse_request(body.as_bytes())
+                .unwrap_err()
+                .contains("at most")
+        );
+    }
 
     fn tag(s: &str) -> PurgeTarget {
         PurgeTarget::Tag(s.into())
