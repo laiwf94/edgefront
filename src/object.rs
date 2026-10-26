@@ -32,7 +32,7 @@ pub fn primary_key(uri: &Uri, headers: &HeaderMap) -> Option<Key> {
 }
 
 /// The selecting header values a stored response was chosen by.
-type VaryValues = Vec<(HeaderName, Option<String>)>;
+pub type VaryValues = Vec<(HeaderName, Option<String>)>;
 
 /// A stored response.
 #[derive(Debug)]
