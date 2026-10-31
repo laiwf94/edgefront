@@ -1,4 +1,4 @@
-name: ci
+name: legacy-steer
 
 on:
   push:
@@ -11,11 +11,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: legacy/steer
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: legacy/steer/go.mod
       - name: Format
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: Vet

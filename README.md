@@ -1,4 +1,16 @@
-# cachet
+# edgefront
+
+A self-hosted application edge in one Rust binary. It brings three projects together and is being built into a single Cargo workspace:
+
+| Part | Started as | Today |
+|---|---|---|
+| Cache | cachet | An HTTP caching reverse proxy in Rust (this directory) |
+| Proxy | steer | A Go edge proxy and load balancer, under [legacy/steer](legacy/steer) until its Rust port passes differential tests |
+| Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer) until its Rust port passes differential tests |
+
+All three keep their full history. The plan for the next year, three tracks in parallel, is in [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap`.
+
+## Cache (formerly cachet)
 
 cachet is an HTTP caching reverse proxy for the edge, written in Rust. It follows the HTTP caching rules (RFC 9111) so origins control it with ordinary headers, sends one origin request when many clients miss at once, keeps serving stale content while the origin is slow or down when the origin allows it, and removes tagged content from every node with one purge request.
 

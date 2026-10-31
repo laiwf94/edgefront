@@ -1,4 +1,4 @@
-name: ci
+name: legacy-pacer
 
 on:
   push:
@@ -10,6 +10,9 @@ permissions:
 jobs:
   gate:
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: legacy/pacer
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -28,6 +31,9 @@ jobs:
 
   image:
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: legacy/pacer
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
