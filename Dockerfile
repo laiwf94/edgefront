@@ -3,6 +3,7 @@ FROM rust:1.99-slim-trixie AS build
 WORKDIR /src
 # Dependencies first, against stub sources, so source edits reuse the layer.
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN mkdir -p src benches examples \
     && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
     && echo 'fn main() {}' > benches/hit_path.rs \

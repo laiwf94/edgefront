@@ -1,0 +1,11 @@
+[package]
+name = "edgefront-limiter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Lock-free rate limiting primitives for edgefront, ported from libpacer."
+publish = false
+
+[lints]
+workspace = true

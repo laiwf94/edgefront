@@ -30,7 +30,15 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 name = "hit_path"
 harness = false
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace]
+members = ["crates/edgefront-limiter"]
+# Plain cargo commands at the root (the gate) cover every crate.
+default-members = [".", "crates/edgefront-limiter"]
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
 [profile.release]

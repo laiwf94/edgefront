@@ -11,14 +11,14 @@ fmt:
 	cargo fmt --check --manifest-path fuzz/Cargo.toml
 
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
 test:
-	cargo test
+	cargo test --workspace
 
 cov:
-	cargo llvm-cov --summary-only --fail-under-lines 90
+	cargo llvm-cov --workspace --summary-only --fail-under-lines 90
 
 audit:
 	cargo deny check
