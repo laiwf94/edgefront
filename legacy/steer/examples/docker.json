@@ -1,0 +1,22 @@
+{
+  "listen": ":8080",
+  "admin_listen": ":9901",
+  "routes": [
+    {"host": "*", "path_prefix": "/", "cluster": "web"}
+  ],
+  "clusters": [
+    {
+      "name": "web",
+      "policy": "least_loaded",
+      "endpoints": [
+        {"address": "host.docker.internal:19101", "priority": 0},
+        {"address": "host.docker.internal:19102", "priority": 0},
+        {"address": "host.docker.internal:19103", "priority": 1}
+      ],
+      "health_check": {"path": "/healthz", "interval": "1s", "timeout": "250ms"},
+      "outlier_detection": {"interval": "1s", "base_ejection_time": "10s", "max_ejection_percent": 50,
+                            "success_rate_minimum_hosts": 2, "success_rate_request_volume": 50},
+      "retry": {"per_try_timeout": "250ms"}
+    }
+  ]
+}

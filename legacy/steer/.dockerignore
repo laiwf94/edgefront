@@ -1,0 +1,4 @@
+.git
+examples/.run
+*.out
+*.test

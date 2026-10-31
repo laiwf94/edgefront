@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: Vet
+        run: go vet ./...
+      - name: Test (race, coverage)
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Coverage
+        run: go tool cover -func=coverage.out | tail -1
+      - name: Fuzz (short)
+        run: |
+          go test ./internal/config -run=^$ -fuzz=FuzzParse -fuzztime=20s
+          go test ./internal/route -run=^$ -fuzz=FuzzMatch -fuzztime=10s
+          go test ./internal/route -run=^$ -fuzz=FuzzCleanPath -fuzztime=10s
+          go test ./internal/proxy -run=^$ -fuzz=FuzzClientIP -fuzztime=10s
+          go test ./internal/reqid -run=^$ -fuzz=FuzzValid -fuzztime=10s
+          go test ./internal/fakeupstream -run=^$ -fuzz=FuzzParseSettings -fuzztime=10s
+          go test ./cmd/loadgen -run=^$ -fuzz=FuzzParseHeader -fuzztime=10s
+      - name: Vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...

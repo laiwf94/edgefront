@@ -1,0 +1,49 @@
+{
+  "listen": "127.0.0.1:18080",
+  "admin_listen": "127.0.0.1:19901",
+  "routes": [
+    {"host": "*", "path_prefix": "/", "cluster": "web"}
+  ],
+  "clusters": [
+    {
+      "name": "web",
+      "policy": "least_loaded",
+      "endpoints": [
+        {"address": "127.0.0.1:19101", "priority": 0},
+        {"address": "127.0.0.1:19102", "priority": 0},
+        {"address": "127.0.0.1:19103", "priority": 1}
+      ],
+      "connect_timeout": "250ms",
+      "timeout": "1s",
+      "max_requests": 1024,
+      "panic_threshold_percent": 50,
+      "health_check": {
+        "path": "/healthz",
+        "interval": "1s",
+        "jitter": "100ms",
+        "timeout": "250ms",
+        "healthy_threshold": 2,
+        "unhealthy_threshold": 2
+      },
+      "outlier_detection": {
+        "consecutive_gateway_failures": 5,
+        "interval": "1s",
+        "base_ejection_time": "10s",
+        "max_ejection_time": "120s",
+        "max_ejection_percent": 50,
+        "success_rate_minimum_hosts": 2,
+        "success_rate_request_volume": 50,
+        "success_rate_stdev_factor": 1.9
+      },
+      "retry": {
+        "max_retries": 2,
+        "retry_on": [502, 503, 504],
+        "per_try_timeout": "250ms",
+        "backoff_base": "10ms",
+        "backoff_max": "100ms",
+        "max_body_bytes": 65536,
+        "budget": {"ratio": 0.2, "min_per_second": 10, "window": "10s"}
+      }
+    }
+  ]
+}
