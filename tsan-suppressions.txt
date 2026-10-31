@@ -6,3 +6,4 @@
 # and 0 of 3 without one. Only the driver's own use of a new ScheduledIo is
 # listed here; a report in our code is still fatal.
 race:scheduled_io::ScheduledIo>::set_readiness
+race:scheduled_io::ScheduledIo>::wake
