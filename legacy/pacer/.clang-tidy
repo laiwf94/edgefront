@@ -1,0 +1,33 @@
+# Checks are on by family. The disabled ones below either fight normal C
+# idioms or duplicate a compiler warning we already treat as an error:
+#   easily-swappable-parameters: (now, cost) style signatures are the API.
+#   magic-numbers, identifier-length: noise for bit math and loop indices.
+#   cert-err33-c: flags every unchecked fprintf/snprintf to stderr.
+#   DeprecatedOrUnsafeBufferHandling: wants Annex K functions glibc lacks.
+#   function-cognitive-complexity: the parser and event loop are switch-heavy
+#     by nature; we keep functions short by review instead.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-*,
+  -cert-err33-c,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  concurrency-*,
+  misc-*,
+  -misc-include-cleaner,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -readability-uppercase-literal-suffix,
+  -readability-isolate-declaration,
+  -readability-avoid-unconditional-preprocessor-if
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(include|src|tests|bench|fuzz)/.*'
+CheckOptions:
+  # An explicit (void) cast is how we mark a result that is ignored on purpose.
+  bugprone-unused-return-value.AllowCastToVoid: true

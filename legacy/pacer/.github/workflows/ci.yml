@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Ubuntu 24.04 kernels randomise mmap with 32 bits, which the
+      # sanitizers in LLVM 18 cannot map their shadow memory around.
+      - name: Make room for the sanitizers
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Gate (format, lint, build, tests under ASan+UBSan and TSan, coverage)
+        run: scripts/dev.sh make check
+      - name: Fuzz each parser for 60 seconds
+        run: scripts/dev.sh make fuzz-smoke FUZZ_TIME=60
+      - name: Live demo
+        run: scripts/dev.sh examples/demo.sh
+      - name: Dependency audit
+        run: scripts/dev.sh scripts/audit.sh
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build and check the runtime image
+        run: scripts/docker-smoke.sh
