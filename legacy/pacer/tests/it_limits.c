@@ -92,6 +92,29 @@ TEST(limits_per_ip_concurrent_connections)
     finish();
 }
 
+TEST(limits_per_ip_slot_is_free_once_close_is_logged)
+{
+    uint16_t port = start("  per_ip_max_conns 1\n", 2);
+    size_t from = 0;
+    for (int i = 0; i < 200; i++) {
+        int fd = tcp_connect(port);
+        int ok = works(fd);
+        CHECK(ok);
+        if (!ok) {
+            close(fd);
+            break;
+        }
+        struct sockaddr_in local = {0};
+        socklen_t llen = sizeof local;
+        CHECK_EQ_INT(getsockname(fd, (struct sockaddr *)&local, &llen), 0);
+        char line[64];
+        snprintf(line, sizeof line, "peer=127.0.0.1:%u reason=done", ntohs(local.sin_port));
+        close(fd);
+        CHECK(proc_wait_log(&p, line, &from, 3000));
+    }
+    finish();
+}
+
 TEST(limits_per_ip_connection_rate_recovers)
 {
     uint16_t port = start("  per_ip_conn_rate 5/s burst 5\n", 1);

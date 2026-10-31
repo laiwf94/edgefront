@@ -415,6 +415,16 @@ void pd_conn_timer(struct pd_conn *c, uint64_t now)
 void pd_conn_close(struct pd_conn *c, const char *reason)
 {
     struct pd_worker *w = c->w;
+    pd_count(w, c->li, reason);
+    pd_heap_remove(&w->timers, &c->timer);
+    struct pd_listener *pl = &w->d->listeners[c->li];
+    if (c->held && pacer_table_release(pl->ip_conns, c->key, c->keylen) != PACER_OK) {
+        /* Holds are never evicted, so this would be a bookkeeping bug. */
+        pd_log_msg(PD_LOG_ERROR, "client table lost a hold");
+    }
+    atomic_fetch_sub_explicit(&pl->conns, 1, memory_order_relaxed);
+    /* Logged only after the slot is free: a reader of this line that
+     * reconnects at once must be admitted, on any worker. */
     struct pd_log_line l;
     pd_log_begin(&l, PD_LOG_INFO, "conn closed");
     pd_log_u64(&l, "conn", c->id);
@@ -425,15 +435,6 @@ void pd_conn_close(struct pd_conn *c, const char *reason)
     pd_log_u64(&l, "bytes_down", c->bytes[PD_DOWN]);
     pd_log_u64(&l, "ms", (pacer_now_ns() - c->start_ns) / 1000000);
     pd_log_end(&l);
-
-    pd_count(w, c->li, reason);
-    pd_heap_remove(&w->timers, &c->timer);
-    struct pd_listener *pl = &w->d->listeners[c->li];
-    if (c->held && pacer_table_release(pl->ip_conns, c->key, c->keylen) != PACER_OK) {
-        /* Holds are never evicted, so this would be a bookkeeping bug. */
-        pd_log_msg(PD_LOG_ERROR, "client table lost a hold");
-    }
-    atomic_fetch_sub_explicit(&pl->conns, 1, memory_order_relaxed);
     /* Closing a fd removes it from epoll. */
     (void)close(c->client.fd);
     if (c->upstream.fd >= 0) {
