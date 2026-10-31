@@ -85,7 +85,7 @@ jobs:
       - name: Concurrency tests under ThreadSanitizer
         env:
           RUSTFLAGS: -Zsanitizer=thread
-          TSAN_OPTIONS: halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:suppressions=${{ github.workspace }}/tsan-suppressions.txt
         run: >
           cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
           --lib --test proxy --test revalidation --test failure --test cluster

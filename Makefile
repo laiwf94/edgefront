@@ -33,6 +33,6 @@ fuzz:
 # rust-src; set TSAN_TARGET to the host triple.
 TSAN_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 tsan:
-	RUSTFLAGS=-Zsanitizer=thread TSAN_OPTIONS=halt_on_error=1 cargo +nightly test -Zbuild-std \
+	RUSTFLAGS=-Zsanitizer=thread TSAN_OPTIONS=halt_on_error=1:suppressions=$(CURDIR)/tsan-suppressions.txt cargo +nightly test -Zbuild-std \
 		--target $(TSAN_TARGET) --target-dir target/tsan \
 		--lib --test proxy --test revalidation --test failure --test cluster

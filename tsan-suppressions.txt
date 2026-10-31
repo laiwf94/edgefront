@@ -1,0 +1,8 @@
+# ThreadSanitizer does not link a dup of an epoll fd to the original, so it
+# misses the happens-before edge from epoll_ctl to epoll_wait. tokio registers
+# on a mio Registry::try_clone (F_DUPFD_CLOEXEC) and waits on the original, and
+# the ScheduledIo pointer reaches the driver only as the epoll token. See #233:
+# a plain C program with no tokio reports the same race 3 of 3 times with a dup
+# and 0 of 3 without one. Only the driver's own use of a new ScheduledIo is
+# listed here; a report in our code is still fatal.
+race:scheduled_io::ScheduledIo>::set_readiness
