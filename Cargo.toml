@@ -34,9 +34,9 @@ harness = false
 workspace = true
 
 [workspace]
-members = ["crates/edgefront-limiter"]
+members = ["crates/edgefront-limiter", "crates/edgefront-proxy"]
 # Plain cargo commands at the root (the gate) cover every crate.
-default-members = [".", "crates/edgefront-limiter"]
+default-members = [".", "crates/edgefront-limiter", "crates/edgefront-proxy"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
