@@ -35,7 +35,7 @@ jobs:
       - name: Tests with coverage (lines >= 90%)
         run: make cov
       - name: Benchmarks compile
-        run: cargo bench --no-run
+        run: cargo bench --workspace --no-run
 
   msrv:
     runs-on: ubuntu-latest
@@ -44,7 +44,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       - name: Build on the declared rust-version
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --workspace --all-targets
 
   supply-chain:
     runs-on: ubuntu-latest

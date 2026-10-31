@@ -7,7 +7,7 @@ FUZZ_SECS ?= 30
 check: fmt lint cov
 
 fmt:
-	cargo fmt --check
+	cargo fmt --all --check
 	cargo fmt --check --manifest-path fuzz/Cargo.toml
 
 lint:

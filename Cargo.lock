@@ -71,6 +71,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
+ "edgefront-cache",
+ "edgefront-core",
  "hmac",
  "http",
  "http-body-util",
@@ -266,6 +268,27 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "ctutils",
+]
+
+[[package]]
+name = "edgefront"
+version = "0.1.0"
+dependencies = [
+ "cachet",
+]
+
+[[package]]
+name = "edgefront-cache"
+version = "0.1.0"
+dependencies = [
+ "http",
+]
+
+[[package]]
+name = "edgefront-core"
+version = "0.1.0"
+dependencies = [
+ "http",
 ]
 
 [[package]]

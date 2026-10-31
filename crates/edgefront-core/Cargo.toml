@@ -1,0 +1,15 @@
+[package]
+name = "edgefront-core"
+description = "Runtime and data-plane foundation shared by every edgefront crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+http.workspace = true
+
+[lints]
+workspace = true

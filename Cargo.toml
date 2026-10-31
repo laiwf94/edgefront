@@ -1,13 +1,34 @@
-[package]
-name = "cachet"
+# The edgefront workspace. Every crate lives under crates/ and inherits its
+# package metadata, dependency pins and lints from here, and the whole
+# workspace shares one Cargo.lock.
+#
+# The root package is cachet as it was before the split. It keeps its
+# sources, tests, benchmarks and binary while the W01 cache tasks move them
+# into the member crates; once they have all moved, this becomes a virtual
+# manifest.
+
+[workspace]
+members = ["crates/*"]
+# Plain cargo commands at the root (the gate) cover every crate.
+default-members = [".", "crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "An HTTP caching reverse proxy for the edge."
 publish = false
+repository = "https://github.com/laiwf94/edgefront"
 
-[dependencies]
+[workspace.dependencies]
+# Workspace crates.
+cachet = { path = ".", version = "0.1.0" }
+edgefront-cache = { path = "crates/edgefront-cache", version = "0.1.0" }
+edgefront-core = { path = "crates/edgefront-core", version = "0.1.0" }
+
+# Runtime dependencies, pinned exactly. A crate that needs one names it with
+# `workspace = true` and adds features only where it needs more.
 bytes = "=1.12.1"
 hmac = "=0.13.0"
 http = "=1.5.0"
@@ -23,8 +44,42 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "fmt", "json", "env-filter", "ansi"] }
 tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "fs", "io-util"] }
 
-[dev-dependencies]
+# Development only.
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[package]
+name = "cachet"
+description = "An HTTP caching reverse proxy for the edge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgefront-cache.workspace = true
+edgefront-core.workspace = true
+
+bytes.workspace = true
+hmac.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+httpdate.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
 
 [[bench]]
 name = "hit_path"
@@ -32,14 +87,6 @@ harness = false
 
 [lints]
 workspace = true
-
-[workspace]
-members = ["crates/edgefront-limiter", "crates/edgefront-proxy"]
-# Plain cargo commands at the root (the gate) cover every crate.
-default-members = [".", "crates/edgefront-limiter", "crates/edgefront-proxy"]
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
 
 [profile.release]
 codegen-units = 1

@@ -6,6 +6,8 @@
 //! When a directive appears twice, the first occurrence wins (RFC 9111
 //! section 4.2.1 allows that or treating the response as stale).
 
+use http::header::{self, HeaderMap, HeaderValue};
+
 /// The value used when delta-seconds overflows (RFC 9111 section 1.2.2).
 pub const DELTA_SECONDS_MAX: u64 = 1 << 31;
 
@@ -166,12 +168,24 @@ fn for_each_directive(value: &[u8], mut f: impl FnMut(&[u8], Option<&[u8]>)) {
     }
 }
 
+impl CacheControl {
+    /// Parses the Cache-Control field lines of a header map.
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        CacheControl::parse(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .map(HeaderValue::as_bytes),
+        )
+    }
+}
+
 fn is_ows(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
 
 /// token characters from RFC 9110 section 5.6.2.
-pub(crate) fn is_tchar(b: u8) -> bool {
+pub fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
@@ -317,5 +331,15 @@ mod tests {
         assert_eq!(parse_delta(b"0"), Some(0));
         assert_eq!(parse_delta(b"007"), Some(7));
         assert_eq!(parse_delta(b"+7"), None);
+    }
+
+    #[test]
+    fn cache_control_from_several_lines() {
+        let mut h = HeaderMap::new();
+        h.append(header::CACHE_CONTROL, HeaderValue::from_static("max-age=5"));
+        h.append(header::CACHE_CONTROL, HeaderValue::from_static("public"));
+        let cc = CacheControl::from_headers(&h);
+        assert_eq!(cc.max_age, Some(5));
+        assert!(cc.public);
     }
 }

@@ -5,19 +5,7 @@ use std::time::SystemTime;
 
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 
-use crate::cache_control::{CacheControl, parse_delta};
-
-impl CacheControl {
-    /// Parses the Cache-Control field lines of a header map.
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        CacheControl::parse(
-            headers
-                .get_all(header::CACHE_CONTROL)
-                .iter()
-                .map(HeaderValue::as_bytes),
-        )
-    }
-}
+use crate::cache_control::parse_delta;
 
 /// Parses an HTTP-date in any of the three formats a recipient must accept.
 pub fn parse_http_date(value: &HeaderValue) -> Option<SystemTime> {
@@ -211,14 +199,6 @@ mod tests {
 
     fn tag(s: &str) -> EntityTag {
         EntityTag::parse(s.as_bytes()).unwrap()
-    }
-
-    #[test]
-    fn cache_control_from_several_lines() {
-        let h = map(&[("cache-control", "max-age=5"), ("cache-control", "public")]);
-        let cc = CacheControl::from_headers(&h);
-        assert_eq!(cc.max_age, Some(5));
-        assert!(cc.public);
     }
 
     #[test]
