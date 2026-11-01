@@ -74,6 +74,17 @@ pub enum Error {
     InvalidRate,
     /// A cost larger than the burst: it can never be granted.
     CostExceedsBurst,
+    /// A keyed-table configuration out of range: no entries, too many, or a
+    /// shard count that is not a power of two or exceeds the entries.
+    InvalidConfig,
+    /// A table key that is empty or longer than [`crate::table::KEY_MAX`].
+    InvalidKey,
+    /// The key is new and its shard of the table has no room for it.
+    TableFull,
+    /// The key is not in the table, or has no hold to release.
+    NoSuchKey,
+    /// The key already has as many holds as allowed.
+    HoldLimit,
 }
 
 impl fmt::Display for Error {
@@ -81,6 +92,11 @@ impl fmt::Display for Error {
         f.write_str(match self {
             Error::InvalidRate => "invalid argument",
             Error::CostExceedsBurst => "cost exceeds burst",
+            Error::InvalidConfig => "invalid table configuration",
+            Error::InvalidKey => "invalid key",
+            Error::TableFull => "table full",
+            Error::NoSuchKey => "no such key",
+            Error::HoldLimit => "concurrency limit reached",
         })
     }
 }
