@@ -13,11 +13,15 @@ bytes.workspace = true
 http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -155,7 +155,9 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
 ]
 
