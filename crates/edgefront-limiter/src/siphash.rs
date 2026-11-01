@@ -37,13 +37,6 @@ impl KeyHash {
     }
 }
 
-#[inline(always)]
-fn load_le64(bytes: &[u8]) -> u64 {
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(word)
-}
-
 #[derive(Clone, Copy)]
 struct State {
     v0: u64,
@@ -55,8 +48,9 @@ struct State {
 impl State {
     #[inline(always)]
     fn new(key: &[u8; KEY_LEN]) -> Self {
-        let k0 = load_le64(&key[..8]);
-        let k1 = load_le64(&key[8..]);
+        let (halves, _) = key.as_chunks::<8>();
+        let k0 = u64::from_le_bytes(halves[0]);
+        let k1 = u64::from_le_bytes(halves[1]);
         Self {
             v0: k0 ^ 0x736f_6d65_7073_6575,
             v1: k1 ^ 0x646f_7261_6e64_6f6d,
@@ -97,13 +91,12 @@ impl State {
 #[inline(always)]
 fn siphash<const C: usize, const D: usize>(key: &[u8; KEY_LEN], data: &[u8]) -> u64 {
     let mut s = State::new(key);
-    let mut blocks = data.chunks_exact(8);
-    for block in &mut blocks {
-        s.compress::<C>(load_le64(block));
+    let (blocks, rest) = data.as_chunks::<8>();
+    for block in blocks {
+        s.compress::<C>(u64::from_le_bytes(*block));
     }
     // Last block: the remaining bytes, zero padding, and the length's low
     // byte in the top position.
-    let rest = blocks.remainder();
     let mut tail = [0u8; 8];
     tail[..rest.len()].copy_from_slice(rest);
     tail[7] = data.len() as u8;
@@ -135,10 +128,10 @@ pub fn siphash24(key: &[u8; KEY_LEN], data: &[u8]) -> u64 {
 /// without the seed.
 pub fn random_key() -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
-    for (i, half) in key.chunks_exact_mut(8).enumerate() {
+    for (i, half) in key.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let mut h = RandomState::new().build_hasher();
         h.write_usize(i);
-        half.copy_from_slice(&h.finish().to_le_bytes());
+        *half = h.finish().to_le_bytes();
     }
     key
 }
