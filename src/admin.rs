@@ -1,98 +1,75 @@
 //! The admin listener: health, metrics and purges.
 //!
 //! It binds to localhost by default. `POST /purge` needs the admin token as
-//! a bearer token; without a configured token the purge API is off.
+//! a bearer token; without a configured token the purge API is off. The
+//! routing, token check and JSON errors come from `edgefront_core::admin`;
+//! this module holds cachet's routes.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use bytes::Bytes;
+use edgefront_core::admin::{BearerToken, Router, json, problem};
+use edgefront_core::metrics;
 use http::header::{self, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
-use sha2::{Digest, Sha256};
+
+pub use edgefront_core::admin::{Refusal, read_body};
 
 use crate::cluster::{Cluster, PEER_PATH};
 use crate::proxy::Proxy;
 use crate::purge::{self, MAX_PURGE_BODY};
-use crate::respond::{Body, full, text};
-use crate::server::Handler;
+use crate::respond::{Body, full};
 
+/// What cachet's admin routes share.
 pub struct Admin {
     proxy: Arc<Proxy>,
-    token: Option<[u8; 32]>,
+    token: Option<BearerToken>,
     cluster: Option<Arc<Cluster>>,
-}
-
-/// Compares two byte strings without a data-dependent early exit. Hashing
-/// first also hides the length of the expected value.
-fn same_secret(expected: &[u8; 32], given: &[u8]) -> bool {
-    let given = Sha256::digest(given);
-    expected
-        .iter()
-        .zip(given.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
-}
-
-fn json(status: StatusCode, value: &serde_json::Value) -> Response<Body> {
-    let mut resp = Response::new(full(Bytes::from(value.to_string())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    resp.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
-}
-
-fn problem(status: StatusCode, message: &str) -> Response<Body> {
-    json(status, &serde_json::json!({ "error": message }))
-}
-
-/// A request the admin API turns away.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Refusal {
-    pub status: StatusCode,
-    pub message: &'static str,
-}
-
-impl Refusal {
-    pub fn into_response(self) -> Response<Body> {
-        let mut resp = problem(self.status, self.message);
-        if self.status == StatusCode::UNAUTHORIZED {
-            resp.headers_mut()
-                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        }
-        resp
-    }
-}
-
-/// Reads a request body of at most `limit` bytes.
-pub(crate) async fn read_body(body: Incoming, limit: usize) -> Result<Bytes, Refusal> {
-    match Limited::new(body, limit).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(e) if e.is::<http_body_util::LengthLimitError>() => Err(Refusal {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: "body too large",
-        }),
-        Err(_) => Err(Refusal {
-            status: StatusCode::BAD_REQUEST,
-            message: "could not read body",
-        }),
-    }
 }
 
 impl Admin {
     pub fn new(proxy: Arc<Proxy>, token: Option<&str>, cluster: Option<Arc<Cluster>>) -> Self {
         Admin {
             proxy,
-            token: token.map(|t| Sha256::digest(t.as_bytes()).into()),
+            token: token.map(BearerToken::new),
             cluster,
         }
+    }
+
+    /// The admin API: `GET /healthz`, `GET /metrics`, `POST /purge` and the
+    /// peer purge endpoint.
+    pub fn router(self) -> Router<Admin> {
+        Router::new(Arc::new(self))
+            .health()
+            .route(
+                Method::GET,
+                "/metrics",
+                |admin: Arc<Admin>, _, _| async move { admin.metrics() },
+            )
+            .route(
+                Method::POST,
+                "/purge",
+                |admin: Arc<Admin>, req, peer| async move { admin.purge(req, peer).await },
+            )
+            .any(PEER_PATH, |admin: Arc<Admin>, req, peer| async move {
+                match &admin.cluster {
+                    Some(cluster) => cluster.receive(req, peer).await,
+                    None => problem(StatusCode::NOT_FOUND, "this node is not in a cluster"),
+                }
+            })
+    }
+
+    fn metrics(&self) -> Response<Body> {
+        let p = &self.proxy;
+        let body = p.metrics.render(&p.cache, &p.pool, p.in_flight());
+        let mut resp = Response::new(full(body));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(metrics::CONTENT_TYPE),
+        );
+        resp
     }
 
     fn authorized(&self, req: &Request<Incoming>) -> Result<(), Refusal> {
@@ -102,17 +79,7 @@ impl Admin {
                 message: "purge API is disabled: set CACHET_ADMIN_TOKEN",
             });
         };
-        let given = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "));
-        match given {
-            Some(token) if same_secret(expected, token) => Ok(()),
-            _ => Err(Refusal {
-                status: StatusCode::UNAUTHORIZED,
-                message: "missing or wrong bearer token",
-            }),
-        }
+        expected.check(req.headers())
     }
 
     async fn purge(&self, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
@@ -145,45 +112,5 @@ impl Admin {
             body["id"] = id.into();
         }
         json(StatusCode::OK, &body)
-    }
-}
-
-impl Handler for Admin {
-    async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
-        match (req.method(), req.uri().path()) {
-            (&Method::GET, "/healthz") => text(StatusCode::OK, "ok\n"),
-            (&Method::GET, "/metrics") => {
-                let p = &self.proxy;
-                let body = p.metrics.render(&p.cache, &p.pool, p.in_flight());
-                let mut resp = Response::new(full(body));
-                resp.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain; version=0.0.4"),
-                );
-                resp
-            }
-            (&Method::POST, "/purge") => self.purge(req, peer).await,
-            (_, PEER_PATH) => match &self.cluster {
-                Some(cluster) => cluster.receive(req, peer).await,
-                None => problem(StatusCode::NOT_FOUND, "this node is not in a cluster"),
-            },
-            (_, "/healthz" | "/metrics" | "/purge") => {
-                problem(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
-            }
-            _ => problem(StatusCode::NOT_FOUND, "not found"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn secret_comparison() {
-        let expected: [u8; 32] = Sha256::digest(b"token").into();
-        assert!(same_secret(&expected, b"token"));
-        assert!(!same_secret(&expected, b"token "));
-        assert!(!same_secret(&expected, b""));
     }
 }

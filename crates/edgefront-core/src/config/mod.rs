@@ -17,6 +17,7 @@
 //! `Config`.
 
 mod go;
+pub mod loader;
 mod node;
 mod raw;
 mod validate;

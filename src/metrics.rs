@@ -1,10 +1,13 @@
-//! Counters and a latency histogram on relaxed atomics, rendered in the
-//! Prometheus text exposition format. A handful of fixed metric families
-//! does not justify a metrics library.
+//! cachet's metric families: counters and a latency histogram on relaxed
+//! atomics, rendered in the Prometheus text exposition format with the
+//! helpers in `edgefront_core::metrics`.
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+pub use edgefront_core::metrics::Histogram;
+use edgefront_core::metrics::{Kind, counter, family, gauge};
 
 use crate::origin::OriginPool;
 use crate::policy::NotStorable;
@@ -65,43 +68,6 @@ const NOT_STORABLE: [NotStorable; 9] = [
     NotStorable::NeverReusable,
 ];
 
-/// Upper bounds of the latency buckets, in seconds.
-const BUCKETS: [f64; 14] = [
-    0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0,
-];
-
-#[derive(Debug, Default)]
-pub struct Histogram {
-    counts: [AtomicU64; BUCKETS.len() + 1],
-    sum_micros: AtomicU64,
-}
-
-impl Histogram {
-    pub fn observe(&self, d: Duration) {
-        let secs = d.as_secs_f64();
-        let i = BUCKETS
-            .iter()
-            .position(|&b| secs <= b)
-            .unwrap_or(BUCKETS.len());
-        self.counts[i].fetch_add(1, Ordering::Relaxed);
-        let micros = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
-    }
-
-    fn render(&self, out: &mut String, name: &str) {
-        let mut cumulative = 0;
-        for (i, bound) in BUCKETS.iter().enumerate() {
-            cumulative += self.counts[i].load(Ordering::Relaxed);
-            let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
-        }
-        cumulative += self.counts[BUCKETS.len()].load(Ordering::Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
-        let sum = self.sum_micros.load(Ordering::Relaxed) as f64 / 1e6;
-        let _ = writeln!(out, "{name}_sum {sum}");
-        let _ = writeln!(out, "{name}_count {cumulative}");
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct Metrics {
     requests: [AtomicU64; Outcome::ALL.len()],
@@ -117,20 +83,6 @@ pub struct Metrics {
     pub gossip_dropped: AtomicU64,
     pub gossip_rejected: AtomicU64,
     pub latency: Histogram,
-}
-
-fn counter(out: &mut String, name: &str, help: &str, value: u64) {
-    let _ = writeln!(
-        out,
-        "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
-    );
-}
-
-fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
-    let _ = writeln!(
-        out,
-        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
-    );
 }
 
 impl Metrics {
@@ -164,8 +116,12 @@ impl Metrics {
         let mut out = String::with_capacity(4096);
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
 
-        out.push_str("# HELP cachet_requests_total Client requests by how they were answered.\n");
-        out.push_str("# TYPE cachet_requests_total counter\n");
+        family(
+            &mut out,
+            "cachet_requests_total",
+            "Client requests by how they were answered.",
+            Kind::Counter,
+        );
         for (o, n) in Outcome::ALL.iter().zip(&self.requests) {
             let _ = writeln!(
                 out,
@@ -174,8 +130,12 @@ impl Metrics {
                 get(n)
             );
         }
-        out.push_str("# HELP cachet_not_stored_total Origin responses not stored, by reason.\n");
-        out.push_str("# TYPE cachet_not_stored_total counter\n");
+        family(
+            &mut out,
+            "cachet_not_stored_total",
+            "Origin responses not stored, by reason.",
+            Kind::Counter,
+        );
         for (r, n) in NOT_STORABLE.iter().zip(&self.not_stored) {
             let _ = writeln!(
                 out,
@@ -184,8 +144,12 @@ impl Metrics {
                 get(n)
             );
         }
-        out.push_str("# HELP cachet_request_duration_seconds Time to answer client requests.\n");
-        out.push_str("# TYPE cachet_request_duration_seconds histogram\n");
+        family(
+            &mut out,
+            "cachet_request_duration_seconds",
+            "Time to answer client requests.",
+            Kind::Histogram,
+        );
         self.latency
             .render(&mut out, "cachet_request_duration_seconds");
 
@@ -320,10 +284,12 @@ impl Metrics {
             in_flight as u64,
         );
 
-        out.push_str(
-            "# HELP cachet_origin_up Whether the origin is currently considered healthy.\n",
+        family(
+            &mut out,
+            "cachet_origin_up",
+            "Whether the origin is currently considered healthy.",
+            Kind::Gauge,
         );
-        out.push_str("# TYPE cachet_origin_up gauge\n");
         for o in pool.origins() {
             let _ = writeln!(
                 out,
@@ -332,8 +298,12 @@ impl Metrics {
                 u8::from(o.is_healthy())
             );
         }
-        out.push_str("# HELP cachet_origin_requests_total Requests sent to each origin.\n");
-        out.push_str("# TYPE cachet_origin_requests_total counter\n");
+        family(
+            &mut out,
+            "cachet_origin_requests_total",
+            "Requests sent to each origin.",
+            Kind::Counter,
+        );
         for o in pool.origins() {
             let _ = writeln!(
                 out,
@@ -342,8 +312,12 @@ impl Metrics {
                 get(&o.requests)
             );
         }
-        out.push_str("# HELP cachet_origin_errors_total Requests to each origin that failed without a response.\n");
-        out.push_str("# TYPE cachet_origin_errors_total counter\n");
+        family(
+            &mut out,
+            "cachet_origin_errors_total",
+            "Requests to each origin that failed without a response.",
+            Kind::Counter,
+        );
         for o in pool.origins() {
             let _ = writeln!(
                 out,

@@ -144,7 +144,9 @@ dependencies = [
 name = "edgefront-cache"
 version = "0.1.0"
 dependencies = [
+ "edgefront-core",
  "http",
+ "serde",
 ]
 
 [[package]]
@@ -153,9 +155,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "tracing",

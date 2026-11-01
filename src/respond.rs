@@ -6,38 +6,12 @@ use std::time::SystemTime;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Response, StatusCode};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty, Full};
 
 use crate::headers::{EntityTag, EtagMatch, date_header, parse_http_date};
 use crate::object::{CachedObject, SURROGATE_KEY};
 use crate::range::{self, ByteRange};
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
-pub type Body = BoxBody<Bytes, BoxError>;
-
-pub fn full(bytes: impl Into<Bytes>) -> Body {
-    Full::new(bytes.into())
-        .map_err(|never| match never {})
-        .boxed()
-}
-
-pub fn empty() -> Body {
-    Empty::new().map_err(|never| match never {}).boxed()
-}
-
-/// A plain-text response, for errors the proxy generates itself.
-pub fn text(status: StatusCode, message: &'static str) -> Response<Body> {
-    let mut resp = Response::new(full(message));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    resp.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp
-}
+pub use edgefront_core::body::{Body, BoxError, empty, full, text};
 
 /// Fields a 304 carries (RFC 9110 section 15.4.5), plus Last-Modified.
 const NOT_MODIFIED_FIELDS: [header::HeaderName; 7] = [
@@ -171,6 +145,7 @@ mod tests {
     use crate::headers::http_date;
     use crate::object::tests::map;
     use crate::policy::Freshness;
+    use http_body_util::BodyExt;
 
     fn t(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_700_000_000 + secs)

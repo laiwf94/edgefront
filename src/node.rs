@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use crate::admin::Admin;
 use crate::cluster::Cluster;
-use crate::config::{Config, Secrets, parse_base_url};
+use crate::config::{Config, Secrets, Settings, parse_base_url};
 use crate::origin::{self, Origin, OriginPool};
 use crate::proxy::{Proxy, SystemClock};
 use crate::server::{ServerLimits, serve};
@@ -93,11 +93,8 @@ pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
         }
         None => None,
     };
-    let admin = Arc::new(Admin::new(
-        proxy.clone(),
-        secrets.admin_token.as_deref(),
-        cluster,
-    ));
+    let admin =
+        Arc::new(Admin::new(proxy.clone(), secrets.admin_token.as_deref(), cluster).router());
     let servers = vec![
         tokio::spawn(serve(
             proxy_listener,

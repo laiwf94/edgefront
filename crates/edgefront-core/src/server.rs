@@ -1,22 +1,30 @@
-//! Accepting HTTP/1.1 connections, with limits and graceful shutdown.
+//! cachet's accept loop: HTTP/1.1 connections with a header read timeout,
+//! a head size limit and graceful shutdown.
+//!
+//! This is the loop cachet has always run, kept byte for byte so moving it
+//! here changes nothing a client sees. It serves the same [`Handler`]s as
+//! [`crate::listener`], which adds idle timeouts, a header count limit and
+//! a per-request drain; the cache moves onto that listener and this module
+//! goes away once the differential tests prove the two equivalent.
+//!
+//! Unlike the listener, hyper's own header read timeout is used here, so
+//! it also closes a keep-alive connection that stays silent for that long.
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{Request, Response};
-use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use tokio::net::TcpListener;
 
-use crate::respond::Body;
+pub use crate::listener::Handler;
 
-#[derive(Debug, Clone, Copy)]
+/// Limits for every connection [`serve`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerLimits {
     /// Time a client has to send its request headers.
     pub header_read: Duration,
@@ -24,15 +32,6 @@ pub struct ServerLimits {
     pub max_header_bytes: usize,
     /// How long shutdown waits for open requests.
     pub drain: Duration,
-}
-
-/// Something that answers requests.
-pub trait Handler: Send + Sync + 'static {
-    fn call(
-        self: Arc<Self>,
-        req: Request<Incoming>,
-        peer: SocketAddr,
-    ) -> impl Future<Output = Response<Body>> + Send;
 }
 
 /// Serves `handler` on `listener` until `shutdown` resolves, then stops
