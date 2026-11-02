@@ -336,8 +336,24 @@ mod tests {
 
     use super::*;
     use crate::origin::{HealthSettings, Origin, client};
-    use crate::store::disk::tests::TempDir;
     use crate::store::{CacheSettings, DiskSettings};
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("cachet-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            TempDir(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[tokio::test]
     async fn every_rendered_line_parses() {

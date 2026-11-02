@@ -32,7 +32,7 @@ pub fn primary_key(uri: &Uri, headers: &HeaderMap) -> Option<Key> {
 }
 
 /// The selecting header values a stored response was chosen by.
-pub type VaryValues = Vec<(HeaderName, Option<String>)>;
+pub(crate) type VaryValues = Vec<(HeaderName, Option<String>)>;
 
 /// A stored response.
 #[derive(Debug)]
@@ -117,12 +117,12 @@ impl CachedObject {
 
 /// The response header carrying surrogate keys, space separated.
 pub const SURROGATE_KEY: HeaderName = HeaderName::from_static("surrogate-key");
-pub const MAX_TAGS: usize = 64;
-pub const MAX_TAG_LEN: usize = 128;
+pub(crate) const MAX_TAGS: usize = 64;
+pub(crate) const MAX_TAG_LEN: usize = 128;
 
 /// Reads surrogate keys from a response. Keys are visible ASCII without
 /// spaces; overlong keys are dropped and at most `MAX_TAGS` are kept.
-pub fn surrogate_keys(headers: &HeaderMap) -> Vec<Arc<str>> {
+pub(crate) fn surrogate_keys(headers: &HeaderMap) -> Vec<Arc<str>> {
     let mut tags: Vec<Arc<str>> = Vec::new();
     for line in headers.get_all(SURROGATE_KEY) {
         let Ok(text) = line.to_str() else { continue };
@@ -137,7 +137,7 @@ pub fn surrogate_keys(headers: &HeaderMap) -> Vec<Arc<str>> {
 }
 
 /// Whether `tag` is usable as a surrogate key.
-pub fn valid_tag(tag: &str) -> bool {
+pub(crate) fn valid_tag(tag: &str) -> bool {
     !tag.is_empty() && tag.len() <= MAX_TAG_LEN && tag.bytes().all(|b| b.is_ascii_graphic())
 }
 
@@ -176,7 +176,7 @@ impl Entry {
     /// replaced, and the oldest variants are dropped beyond `max_variants`,
     /// so an origin varying on something like User-Agent cannot grow one
     /// URL without bound.
-    pub fn with_variant(
+    pub(crate) fn with_variant(
         &self,
         obj: Arc<CachedObject>,
         req: &HeaderMap,

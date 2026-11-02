@@ -16,7 +16,7 @@ use crate::object::{Key, primary_key, valid_tag};
 /// Largest purge request body accepted.
 pub const MAX_PURGE_BODY: usize = 64 * 1024;
 /// Most targets one purge request may name.
-pub const MAX_TARGETS: usize = 1000;
+pub(crate) const MAX_TARGETS: usize = 1000;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,7 +81,7 @@ struct Inner {
 }
 
 /// A bounded record of recent purges.
-pub struct PurgeLog {
+pub(crate) struct PurgeLog {
     inner: Mutex<Inner>,
     capacity: usize,
 }
@@ -122,7 +122,7 @@ impl PurgeLog {
 
     /// Whether a purge recorded after `epoch` matches this object. When the
     /// log no longer reaches back to `epoch`, the answer is a conservative yes.
-    pub fn purged_since(&self, epoch: u64, key: &str, tags: &[Arc<str>]) -> bool {
+    pub(crate) fn purged_since(&self, epoch: u64, key: &str, tags: &[Arc<str>]) -> bool {
         let inner = self.lock();
         if inner.epoch == epoch {
             return false;

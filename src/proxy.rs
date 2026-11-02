@@ -16,6 +16,7 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 
 use crate::cache_control::CacheControl;
+use crate::cluster::{GossipEvent, PurgeHost};
 use crate::collapse::{Collapser, Role};
 use crate::headers::strip_hop_by_hop;
 use crate::ids::{REQUEST_ID, request_id};
@@ -810,5 +811,29 @@ impl crate::server::Handler for Proxy {
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         self.handle(req, peer).await
+    }
+}
+
+impl PurgeHost for Proxy {
+    fn purge<'a>(
+        &'a self,
+        targets: &'a [PurgeTarget],
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
+        Box::pin(self.cache.purge(targets))
+    }
+
+    fn record(&self, event: GossipEvent) {
+        let m = &self.metrics;
+        match event {
+            GossipEvent::Sent => m.gossip_sent.fetch_add(1, Ordering::Relaxed),
+            GossipEvent::Retried => m.gossip_retries.fetch_add(1, Ordering::Relaxed),
+            GossipEvent::Dropped => m.gossip_dropped.fetch_add(1, Ordering::Relaxed),
+            GossipEvent::Rejected => m.gossip_rejected.fetch_add(1, Ordering::Relaxed),
+            GossipEvent::Applied { removed } => {
+                m.purges_peer.fetch_add(1, Ordering::Relaxed);
+                m.purged_objects
+                    .fetch_add(removed as u64, Ordering::Relaxed)
+            }
+        };
     }
 }

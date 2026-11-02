@@ -13,8 +13,9 @@
 //! The key is shared by the cluster and never sent.
 
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,23 +25,58 @@ use http::header::{self, HeaderName, HeaderValue};
 use http::uri::Authority;
 use http::{Method, Request, Response, StatusCode, Uri};
 use hyper::body::Incoming;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::admin::{Refusal, read_body};
-use crate::ids::new_id;
+use edgefront_core::admin::{Refusal, read_body};
+use edgefront_core::ids::new_id;
+
 use crate::object::{MAX_TAG_LEN, valid_tag};
-use crate::origin::Client;
-use crate::proxy::Proxy;
 use crate::purge::{MAX_PURGE_BODY, MAX_TARGETS, PurgeTarget};
 use crate::respond::{Body, full};
 
-pub const SIGNATURE: HeaderName = HeaderName::from_static("x-cachet-signature");
-pub const SENDER: HeaderName = HeaderName::from_static("x-cachet-node");
+pub(crate) const SIGNATURE: HeaderName = HeaderName::from_static("x-cachet-signature");
+pub(crate) const SENDER: HeaderName = HeaderName::from_static("x-cachet-node");
 pub const PEER_PATH: &str = "/peer/purge";
 const MAX_KEY_LEN: usize = 8 * 1024;
+
+/// The HTTP client purge messages go out on: the same pooled client type
+/// the node fetches from its origins with.
+pub type PeerClient = Client<HttpConnector, Body>;
+
+/// Something that happened to a purge message, for the node's metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GossipEvent {
+    /// A peer accepted a message.
+    Sent,
+    /// A delivery failed and will be tried again.
+    Retried,
+    /// A message was given up on for one peer: queue full, refused by the
+    /// peer, or past its retry window.
+    Dropped,
+    /// A message from a peer was refused.
+    Rejected,
+    /// A message from a peer was applied and removed this many objects.
+    Applied { removed: usize },
+}
+
+/// What the cluster needs from the node it runs in: a cache to purge and
+/// somewhere to count what happened.
+pub trait PurgeHost: Send + Sync + 'static {
+    /// Applies a purge to the local cache and returns how many objects it
+    /// removed.
+    fn purge<'a>(
+        &'a self,
+        targets: &'a [PurgeTarget],
+    ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
+
+    /// Records one gossip event.
+    fn record(&self, event: GossipEvent);
+}
 
 /// A purge as it travels between nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +218,7 @@ pub struct Cluster {
     key: Vec<u8>,
     peers: Vec<Peer>,
     seen: Mutex<Seen>,
-    proxy: Arc<Proxy>,
+    host: Arc<dyn PurgeHost>,
     settings: GossipSettings,
 }
 
@@ -212,8 +248,8 @@ impl Cluster {
         node_id: &str,
         key: Vec<u8>,
         peers: &[(String, Authority)],
-        proxy: Arc<Proxy>,
-        client: Client,
+        host: Arc<dyn PurgeHost>,
+        client: PeerClient,
         settings: GossipSettings,
     ) -> (Arc<Cluster>, Vec<JoinHandle<()>>) {
         let mut tasks = Vec::new();
@@ -234,7 +270,7 @@ impl Cluster {
                     .expect("valid peer URI"),
                 node_id: HeaderValue::from_str(node_id).expect("node id is a token"),
                 client: client.clone(),
-                proxy: proxy.clone(),
+                host: host.clone(),
                 settings: settings.clone(),
             };
             tasks.push(tokio::spawn(delivery.run(rx)));
@@ -244,7 +280,7 @@ impl Cluster {
             key,
             peers: list,
             seen: Mutex::new(Seen::default()),
-            proxy,
+            host,
             settings,
         });
         (cluster, tasks)
@@ -293,10 +329,7 @@ impl Cluster {
             .filter(|p| !skip.contains(&p.name.as_str()))
         {
             if peer.queue.try_send(envelope.clone()).is_err() {
-                self.proxy
-                    .metrics
-                    .gossip_dropped
-                    .fetch_add(1, Ordering::Relaxed);
+                self.host.record(GossipEvent::Dropped);
                 tracing::warn!(peer = %peer.name, "purge queue full; message dropped for this peer");
             }
         }
@@ -306,7 +339,7 @@ impl Cluster {
     pub async fn purge_local(&self, targets: &[PurgeTarget]) -> (usize, String) {
         let msg = PurgeMessage::from_targets(&self.node_id, targets, unix_now());
         self.remember(&msg.id, msg.issued_at);
-        let removed = self.proxy.cache.purge(targets).await;
+        let removed = self.host.purge(targets).await;
         self.send_to_peers(&self.envelope(&msg), &[]);
         (removed, msg.id)
     }
@@ -328,10 +361,7 @@ impl Cluster {
             Err(refusal) => return refusal.into_response(),
         };
         let reject = |status, message| {
-            self.proxy
-                .metrics
-                .gossip_rejected
-                .fetch_add(1, Ordering::Relaxed);
+            self.host.record(GossipEvent::Rejected);
             tracing::warn!(peer = %peer, sender = %sender, reason = message, "peer purge rejected");
             refuse(status, message)
         };
@@ -355,11 +385,8 @@ impl Cluster {
         if msg.origin == self.node_id || !self.remember(&msg.id, msg.issued_at) {
             return json(StatusCode::OK, &serde_json::json!({ "duplicate": true }));
         }
-        let removed = self.proxy.cache.purge(&targets).await;
-        let m = &self.proxy.metrics;
-        m.purges_peer.fetch_add(1, Ordering::Relaxed);
-        m.purged_objects
-            .fetch_add(removed as u64, Ordering::Relaxed);
+        let removed = self.host.purge(&targets).await;
+        self.host.record(GossipEvent::Applied { removed });
         tracing::info!(id = %msg.id, origin = %msg.origin, sender = %sender, removed, "peer purge applied");
         // Relay the same signed bytes; the signature stays valid.
         let envelope = Arc::new(Envelope {
@@ -378,8 +405,8 @@ struct Delivery {
     peer: String,
     uri: Uri,
     node_id: HeaderValue,
-    client: Client,
-    proxy: Arc<Proxy>,
+    client: PeerClient,
+    host: Arc<dyn PurgeHost>,
     settings: GossipSettings,
 }
 
@@ -422,27 +449,27 @@ impl Delivery {
     }
 
     async fn deliver(&self, envelope: &Envelope) {
-        let m = &self.proxy.metrics;
+        let host = &self.host;
         let mut backoff = self.settings.retry_initial;
         loop {
             match self.attempt(envelope).await {
                 Attempt::Delivered => {
-                    m.gossip_sent.fetch_add(1, Ordering::Relaxed);
+                    host.record(GossipEvent::Sent);
                     return;
                 }
                 Attempt::Refused(status) => {
-                    m.gossip_dropped.fetch_add(1, Ordering::Relaxed);
+                    host.record(GossipEvent::Dropped);
                     tracing::warn!(peer = %self.peer, status = status.as_u16(), "peer refused purge message");
                     return;
                 }
                 Attempt::Failed => {}
             }
             if envelope.issued_at + self.settings.max_age.as_secs() <= unix_now() {
-                m.gossip_dropped.fetch_add(1, Ordering::Relaxed);
+                host.record(GossipEvent::Dropped);
                 tracing::warn!(peer = %self.peer, "giving up on purge message: retry window passed");
                 return;
             }
-            m.gossip_retries.fetch_add(1, Ordering::Relaxed);
+            host.record(GossipEvent::Retried);
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(self.settings.retry_max);
         }
@@ -492,5 +519,56 @@ mod tests {
         let mut bad = msg;
         bad.tags = (0..=MAX_TARGETS).map(|i| format!("t{i}")).collect();
         assert_eq!(bad.targets().unwrap_err(), "too many targets");
+    }
+
+    /// A host that records what the cluster asked of it.
+    #[derive(Default)]
+    struct Recorder {
+        purged: Mutex<Vec<PurgeTarget>>,
+        events: Mutex<Vec<GossipEvent>>,
+    }
+
+    impl PurgeHost for Recorder {
+        fn purge<'a>(
+            &'a self,
+            targets: &'a [PurgeTarget],
+        ) -> Pin<Box<dyn Future<Output = usize> + Send + 'a>> {
+            self.purged.lock().unwrap().extend_from_slice(targets);
+            Box::pin(async move { targets.len() })
+        }
+
+        fn record(&self, event: GossipEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn purges_through_the_host_and_counts_full_queues() {
+        let host = Arc::new(Recorder::default());
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new()).build_http();
+        let settings = GossipSettings {
+            queue: 1,
+            ..GossipSettings::default()
+        };
+        // Port 9 on loopback refuses, so the first message sits in the
+        // one-slot queue (or in delivery) and the later ones overflow.
+        let peers = [("b".to_string(), Authority::from_static("127.0.0.1:9"))];
+        let (cluster, tasks) =
+            Cluster::start("a", b"k".repeat(32), &peers, host.clone(), client, settings);
+        let targets = [PurgeTarget::Tag("t".into())];
+        let (removed, id) = cluster.purge_local(&targets).await;
+        assert_eq!(removed, 1);
+        assert!(!id.is_empty());
+        // The node's own message is already known, so a relay of it is a
+        // duplicate.
+        assert!(!cluster.remember(&id, unix_now()));
+        for _ in 0..3 {
+            cluster.purge_local(&targets).await;
+        }
+        assert_eq!(host.purged.lock().unwrap().len(), 4);
+        assert!(host.events.lock().unwrap().contains(&GossipEvent::Dropped));
+        for task in tasks {
+            task.abort();
+        }
     }
 }

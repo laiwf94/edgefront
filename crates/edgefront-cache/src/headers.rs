@@ -13,7 +13,7 @@ pub fn parse_http_date(value: &HeaderValue) -> Option<SystemTime> {
 }
 
 /// The first value of a date header, if it parses.
-pub fn date_header(headers: &HeaderMap, name: &HeaderName) -> Option<SystemTime> {
+pub(crate) fn date_header(headers: &HeaderMap, name: &HeaderName) -> Option<SystemTime> {
     headers.get(name).and_then(parse_http_date)
 }
 
@@ -23,7 +23,7 @@ pub fn http_date(t: SystemTime) -> HeaderValue {
 }
 
 /// The Age header in seconds; missing or invalid values count as zero.
-pub fn age_value(headers: &HeaderMap) -> u64 {
+pub(crate) fn age_value(headers: &HeaderMap) -> u64 {
     headers
         .get(header::AGE)
         .and_then(|v| parse_delta(v.as_bytes().trim_ascii()))
@@ -141,7 +141,7 @@ impl EtagMatch {
 
 /// Splits comma-separated field lines (Vary, Connection) into lower-case
 /// members, dropping empty ones.
-pub fn field_list(headers: &HeaderMap, name: &HeaderName) -> Vec<String> {
+pub(crate) fn field_list(headers: &HeaderMap, name: &HeaderName) -> Vec<String> {
     let mut out = Vec::new();
     for line in headers.get_all(name) {
         let Ok(s) = line.to_str() else { continue };

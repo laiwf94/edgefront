@@ -28,9 +28,9 @@ use crate::policy::Freshness;
 pub const MAGIC: &[u8; 8] = b"CACHET\0\x01";
 const SUM: usize = 32;
 /// Upper bound on a record header, far above anything a real entry needs.
-pub const MAX_HEADER: usize = 1 << 20;
+pub(crate) const MAX_HEADER: usize = 1 << 20;
 /// Bytes before the header: magic and header length.
-pub const PREFIX: usize = MAGIC.len() + 4;
+pub(crate) const PREFIX: usize = MAGIC.len() + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
@@ -132,7 +132,7 @@ pub fn encode(key: &str, entry: &Entry) -> Option<Vec<u8>> {
 
 /// Length of the header section from the record prefix, including the
 /// prefix and header checksum: how much a startup scan must read.
-pub fn header_span(prefix: &[u8]) -> Result<usize, DecodeError> {
+pub(crate) fn header_span(prefix: &[u8]) -> Result<usize, DecodeError> {
     if prefix.len() < PREFIX {
         return Err(DecodeError::Truncated);
     }

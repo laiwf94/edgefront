@@ -122,7 +122,7 @@ impl MemoryStore {
     }
 
     /// Looks up an entry without counting the read.
-    pub fn peek(&self, key: &str) -> Option<Arc<Entry>> {
+    pub(crate) fn peek(&self, key: &str) -> Option<Arc<Entry>> {
         let (_, shard) = self.locate(key);
         read(shard).map.get(key).map(|s| s.entry.clone())
     }
@@ -155,7 +155,7 @@ impl MemoryStore {
     }
 
     /// Removes every entry carrying surrogate key `tag`.
-    pub fn purge_tag(&self, tag: &str) -> Vec<(Key, Arc<Entry>)> {
+    pub(crate) fn purge_tag(&self, tag: &str) -> Vec<(Key, Arc<Entry>)> {
         let mut out = Vec::new();
         for shard in &self.shards {
             let mut shard = write(shard);

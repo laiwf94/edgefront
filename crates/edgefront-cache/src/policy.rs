@@ -133,7 +133,7 @@ pub fn storable(x: &Exchange<'_>, heuristic_max: Duration) -> Result<(), NotStor
 
 /// Freshness lifetime (RFC 9111 section 4.2.1). `response_time` stands in
 /// for a missing Date header.
-pub fn freshness_lifetime(
+pub(crate) fn freshness_lifetime(
     status: StatusCode,
     headers: &HeaderMap,
     cc: &CacheControl,
@@ -196,7 +196,7 @@ impl Freshness {
         }
     }
 
-    pub fn current_age(&self, now: SystemTime) -> Duration {
+    pub(crate) fn current_age(&self, now: SystemTime) -> Duration {
         let resident = now
             .duration_since(self.response_time)
             .unwrap_or(Duration::ZERO);
@@ -204,7 +204,7 @@ impl Freshness {
     }
 
     /// How long the response has been stale; zero while fresh.
-    pub fn staleness(&self, now: SystemTime) -> Duration {
+    pub(crate) fn staleness(&self, now: SystemTime) -> Duration {
         self.current_age(now).saturating_sub(self.lifetime)
     }
 

@@ -281,9 +281,19 @@ dependencies = [
 name = "edgefront-cache"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "edgefront-core",
+ "hmac",
  "http",
+ "http-body-util",
+ "httpdate",
+ "hyper",
+ "hyper-util",
  "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
