@@ -4,6 +4,9 @@
 //! `netip.ParseAddr` and `ParsePrefix`, `strings.ToLower`,
 //! `textproto.CanonicalMIMEHeaderKey` and `path/filepath`'s `Clean`, `Dir`
 //! and `Join` for slash-separated paths.
+//!
+//! [`split_host_port`] and [`parse_addr`] are public because the proxy's
+//! client address handling (`X-Forwarded-For`) needs Go's rules too.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -182,7 +185,7 @@ fn fraction(v: &mut u64, prec: u32) -> String {
 
 /// Go's `net.SplitHostPort`. The port may be empty or any text without a
 /// colon; a bracketed host may hold colons.
-pub(crate) fn split_host_port(hp: &str) -> Result<(&str, &str), &'static str> {
+pub fn split_host_port(hp: &str) -> Result<(&str, &str), &'static str> {
     let b = hp.as_bytes();
     let colon = b
         .iter()
@@ -223,14 +226,16 @@ pub(crate) fn split_host_port(hp: &str) -> Result<(&str, &str), &'static str> {
 /// An address as Go's `netip.ParseAddr` returns it: IPv4, or IPv6 with an
 /// optional zone. An IPv4-mapped IPv6 address stays IPv6.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Addr {
-    pub(crate) ip: IpAddr,
-    pub(crate) zone: Option<String>,
+pub struct Addr {
+    /// The address.
+    pub ip: IpAddr,
+    /// The IPv6 zone, such as `eth0` in `fe80::1%eth0`.
+    pub zone: Option<String>,
 }
 
 /// Go's `netip.ParseAddr`: dotted-quad IPv4 without leading zeros, or IPv6
 /// with an optional non-empty `%zone`.
-pub(crate) fn parse_addr(s: &str) -> Option<Addr> {
+pub fn parse_addr(s: &str) -> Option<Addr> {
     match s.bytes().find(|c| matches!(c, b'.' | b':' | b'%'))? {
         b'.' => {
             let ip = s.parse::<Ipv4Addr>().ok()?;

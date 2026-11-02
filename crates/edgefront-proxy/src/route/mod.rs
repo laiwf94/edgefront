@@ -86,17 +86,19 @@ impl<T> Router<T> {
 
     /// The route for a request. `host` is the Host header as sent (case,
     /// port, brackets and a trailing dot are ignored, see
-    /// [`normalize_host`]); `path` should already be cleaned, since a prefix
-    /// is matched byte for byte.
-    pub fn route(&self, host: &str, path: &str) -> Option<&T> {
+    /// [`normalize_host`]); `path` should already be cleaned (see
+    /// [`crate::path::RequestTarget::clean_path`]), since a prefix is
+    /// matched byte for byte. A path may be any bytes, as a decoded `%ff`
+    /// is.
+    pub fn route(&self, host: &str, path: impl AsRef<[u8]>) -> Option<&T> {
         self.route_normalized(&normalize_host(host), path)
     }
 
     /// As [`Router::route`], for a host already passed through
     /// [`normalize_host`].
-    pub fn route_normalized(&self, host: &str, path: &str) -> Option<&T> {
+    pub fn route_normalized(&self, host: &str, path: impl AsRef<[u8]>) -> Option<&T> {
         let vhost = self.vhost(host)?;
-        let index = *self.vhosts[vhost].longest_prefix(path.as_bytes())?;
+        let index = *self.vhosts[vhost].longest_prefix(path.as_ref())?;
         Some(&self.routes[index])
     }
 

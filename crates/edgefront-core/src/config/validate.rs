@@ -906,7 +906,7 @@ fn check_probe_path(p: &str) -> Result<(), String> {
 }
 
 /// A CIDR without host bits, or a single address without a zone.
-fn parse_trusted_prefix(s: &str) -> Result<IpPrefix, String> {
+pub(crate) fn parse_trusted_prefix(s: &str) -> Result<IpPrefix, String> {
     if let Some((addr, len)) = go::parse_prefix(s) {
         let masked = go::mask(addr, len);
         if masked != addr {

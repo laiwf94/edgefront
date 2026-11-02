@@ -316,6 +316,8 @@ name = "edgefront-proxy"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "edgefront-core",
+ "http",
  "proptest",
 ]
 

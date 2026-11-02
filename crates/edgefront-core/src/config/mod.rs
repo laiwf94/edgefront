@@ -16,7 +16,7 @@
 //! the way Go prints them (`"1m30s"`), and the result parses into an equal
 //! `Config`.
 
-mod go;
+pub mod go;
 pub mod loader;
 mod node;
 mod raw;
@@ -133,6 +133,17 @@ impl IpPrefix {
     /// `::ffff:10.0.0.1` is not in `10.0.0.0/8`.
     pub fn contains(&self, ip: IpAddr) -> bool {
         ip.is_ipv4() == self.addr.is_ipv4() && go::mask(ip, self.len) == self.addr
+    }
+}
+
+impl std::str::FromStr for IpPrefix {
+    type Err = String;
+
+    /// Parses an entry of `trusted_proxies`: a CIDR without host bits, such
+    /// as `10.0.0.0/8`, or a single address without a zone, with steer's
+    /// error messages.
+    fn from_str(s: &str) -> Result<Self, String> {
+        validate::parse_trusted_prefix(s)
     }
 }
 
