@@ -9,7 +9,9 @@
 pub mod gcra;
 pub mod siphash;
 pub mod table;
+pub mod window;
 
 pub use gcra::{Decision, Error, Gcra, Rate};
 pub use siphash::KeyHash;
 pub use table::{EntryState, FullPolicy, Table, TableConfig, TableStats};
+pub use window::Window;

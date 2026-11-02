@@ -85,6 +85,10 @@ pub enum Error {
     NoSuchKey,
     /// The key already has as many holds as allowed.
     HoldLimit,
+    /// A sliding-window configuration out of range: no slots, more than
+    /// [`crate::window::SLOTS_MAX`], or a window shorter than its slot count
+    /// in nanoseconds.
+    InvalidWindow,
 }
 
 impl fmt::Display for Error {
@@ -97,6 +101,7 @@ impl fmt::Display for Error {
             Error::TableFull => "table full",
             Error::NoSuchKey => "no such key",
             Error::HoldLimit => "concurrency limit reached",
+            Error::InvalidWindow => "invalid window configuration",
         })
     }
 }
