@@ -9,7 +9,6 @@ pub use edgefront_cache::{
 pub use edgefront_core::{ids, server};
 
 pub mod admin;
-pub mod cli;
 pub mod config;
 pub mod metrics;
 pub mod node;

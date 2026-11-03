@@ -1,0 +1,5 @@
+$ {program} --config {dir}/node.toml
+exit: 1
+stdout:
+{"timestamp":"<time>","level":"ERROR","fields":{"message":"cannot start","error":"cannot listen on 127.0.0.1:<port>: Address already in use (os error 98)"},"target":"cachet"}
+stderr:

@@ -1,0 +1,85 @@
+$ {program} --check-config {dir}/good.toml
+exit: 0
+stdout:
+{dir}/good.toml: ok
+stderr:
+
+$ CACHET_ADMIN_TOKEN=<5 bytes> {program} --check-config {dir}/good.toml
+exit: 0
+stdout:
+{dir}/good.toml: ok
+stderr:
+
+$ {program} --check-config {dir}/unknown.toml
+exit: 2
+stdout:
+stderr:
+{program}: {dir}/unknown.toml: TOML parse error at line 2, column 1
+  |
+2 | bogus = 1
+  | ^^^^^
+unknown field `bogus`, expected one of `node_id`, `listen`, `admin_listen`, `origins`, `cache`, `health`, `timeouts`, `limits`, `peers`, `gossip`
+
+
+$ {program} --check-config {dir}/syntax.toml
+exit: 2
+stdout:
+stderr:
+{program}: {dir}/syntax.toml: TOML parse error at line 1, column 18
+  |
+1 | node_id = "edge-a
+  |                  ^
+invalid basic string, expected `"`
+
+
+$ {program} --check-config {dir}/invalid.toml
+exit: 2
+stdout:
+stderr:
+{program}: {dir}/invalid.toml: TOML parse error at line 2, column 10
+  |
+2 | listen = "not an address"
+  |          ^^^^^^^^^^^^^^^^
+invalid socket address syntax
+
+
+$ {program} --check-config {dir}/missing.toml
+exit: 2
+stdout:
+stderr:
+{program}: cannot read {dir}/missing.toml: No such file or directory (os error 2)
+
+$ {program} --config {dir}/missing.toml
+exit: 2
+stdout:
+stderr:
+{program}: cannot read {dir}/missing.toml: No such file or directory (os error 2)
+
+$ {program} --check-config {dir}/peers.toml
+exit: 2
+stdout:
+stderr:
+{program}: CACHET_CLUSTER_SECRET is required when peers are configured
+
+$ CACHET_CLUSTER_SECRET=<5 bytes> {program} --check-config {dir}/peers.toml
+exit: 2
+stdout:
+stderr:
+{program}: CACHET_CLUSTER_SECRET must be at least 32 bytes
+
+$ CACHET_CLUSTER_SECRET=<32 bytes> {program} --check-config {dir}/peers.toml
+exit: 0
+stdout:
+{dir}/peers.toml: ok
+stderr:
+
+$ {program} --config {dir}/invalid.toml
+exit: 2
+stdout:
+stderr:
+{program}: {dir}/invalid.toml: TOML parse error at line 2, column 10
+  |
+2 | listen = "not an address"
+  |          ^^^^^^^^^^^^^^^^
+invalid socket address syntax
+

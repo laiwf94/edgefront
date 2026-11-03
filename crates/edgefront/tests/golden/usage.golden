@@ -1,0 +1,61 @@
+$ {program} --version
+exit: 0
+stdout:
+{program} {version}
+stderr:
+
+$ {program}
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version
+
+$ {program} --config
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version
+
+$ {program} --check-config
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version
+
+$ {program} --bogus x
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version
+
+$ {program} --version x
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version
+
+$ {program} --config a b
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version
+
+$ {program} --help
+exit: 2
+stdout:
+stderr:
+usage: {program} --config <file>
+       {program} --check-config <file>
+       {program} --version

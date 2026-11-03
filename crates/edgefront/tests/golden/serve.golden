@@ -1,0 +1,19 @@
+$ CACHET_LOG=info CACHET_ADMIN_TOKEN=<5 bytes> {program} --config {dir}/node.toml
+> GET /a HTTP/1.1 | host: example.com
+< HTTP/1.1 502 Bad Gateway
+< cache-status: edge-a; fwd=miss; detail=connect
+< content-type: text/plain; charset=utf-8
+< origin unreachable
+
+> POST /purge (bearer token)
+< HTTP/1.1 200 OK
+< content-type: application/json
+< {"removed":0,"targets":1}
+exit: 0
+stdout:
+{"timestamp":"<time>","level":"INFO","fields":{"message":"cachet started","node":"edge-a","listen":"127.0.0.1:<port>","admin":"127.0.0.1:<port>","origins":1},"target":"cachet::node"}
+{"timestamp":"<time>","level":"INFO","fields":{"message":"request","request_id":"<id>","client":"127.0.0.1:<port>","method":"GET","uri":"/a","status":502,"outcome":"error","cache_status":"fwd=miss; detail=connect","elapsed_us":"<us>"},"target":"cachet::proxy"}
+{"timestamp":"<time>","level":"INFO","fields":{"message":"purge","peer":"127.0.0.1:<port>","id":"","targets":1,"removed":0},"target":"cachet::admin"}
+{"timestamp":"<time>","level":"INFO","fields":{"message":"shutting down"},"target":"cachet"}
+{"timestamp":"<time>","level":"INFO","fields":{"message":"cachet stopped"},"target":"cachet::node"}
+stderr:

@@ -1,18 +1,23 @@
-//! The command line shared by the `cachet` and `edgefront` binaries: the
-//! flags, exit codes, environment variables and log setup are the same for
-//! both, and only the program name in messages differs.
+//! The command line: `--config`, `--check-config` and `--version`.
+//!
+//! Exit codes are 0 on success, 2 for bad usage, an unreadable or invalid
+//! config or missing secrets, and 1 when the node cannot start. The log is
+//! JSON on stdout, filtered by `CACHET_LOG` (default `info`); secrets come
+//! from `CACHET_ADMIN_TOKEN` and `CACHET_CLUSTER_SECRET`.
 
 use std::process::ExitCode;
 
+use cachet::config::{Config, Secrets};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, Secrets};
+const PROGRAM: &str = "edgefront";
 
-fn usage(program: &str) -> String {
-    format!(
-        "usage: {program} --config <file>\n       {program} --check-config <file>\n       {program} --version\n"
-    )
-}
+const USAGE: &str = "usage: edgefront --config <file>\n       edgefront --check-config <file>\n       edgefront --version\n";
+
+/// The target of the events this module logs. cachet's binary logged them
+/// under its crate name, so `CACHET_LOG` directives such as `cachet=warn`
+/// and log pipelines that match on the target keep working unchanged.
+const LOG_TARGET: &str = "cachet";
 
 fn load(path: &str) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -40,32 +45,31 @@ async fn wait_for_signal() {
     let _ = ctrl_c.await;
 }
 
-/// Runs the binary named `program` with `args` (without the program name)
-/// and returns its exit code: 0 on success, 2 for bad usage or config, 1
-/// when the node cannot start.
-pub fn main(program: &str, args: &[String]) -> ExitCode {
+/// Runs the command line `args` (without the program name) and returns the
+/// exit code.
+pub fn run(args: &[String]) -> ExitCode {
     let (check_only, path) = match args {
         [flag] if flag == "--version" => {
-            println!("{program} {}", env!("CARGO_PKG_VERSION"));
+            println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        [flag, path] if flag == "--config" => (false, path.clone()),
-        [flag, path] if flag == "--check-config" => (true, path.clone()),
+        [flag, path] if flag == "--config" => (false, path.as_str()),
+        [flag, path] if flag == "--check-config" => (true, path.as_str()),
         _ => {
-            eprint!("{}", usage(program));
+            eprint!("{USAGE}");
             return ExitCode::from(2);
         }
     };
-    let config = match load(&path) {
+    let config = match load(path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("{program}: {e}");
+            eprintln!("{PROGRAM}: {e}");
             return ExitCode::from(2);
         }
     };
     let secrets = Secrets::from_env();
     if let Err(e) = config.validate_secrets(&secrets) {
-        eprintln!("{program}: {e}");
+        eprintln!("{PROGRAM}: {e}");
         return ExitCode::from(2);
     }
     if check_only {
@@ -86,20 +90,20 @@ pub fn main(program: &str, args: &[String]) -> ExitCode {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{program}: cannot start the runtime: {e}");
+            eprintln!("{PROGRAM}: cannot start the runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
     runtime.block_on(async {
-        let node = match crate::node::start(&config, &secrets).await {
+        let node = match cachet::node::start(&config, &secrets).await {
             Ok(n) => n,
             Err(e) => {
-                tracing::error!(error = %e, "cannot start");
+                tracing::error!(target: LOG_TARGET, error = %e, "cannot start");
                 return ExitCode::FAILURE;
             }
         };
         wait_for_signal().await;
-        tracing::info!("shutting down");
+        tracing::info!(target: LOG_TARGET, "shutting down");
         node.shutdown().await;
         ExitCode::SUCCESS
     })

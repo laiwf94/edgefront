@@ -1,0 +1,4 @@
+$ CACHET_LOG=warn {program} --config {dir}/node.toml
+exit: 0
+stdout:
+stderr:
