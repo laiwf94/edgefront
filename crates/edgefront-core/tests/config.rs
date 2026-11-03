@@ -1192,3 +1192,22 @@ proptest! {
         let _ = Config::from_toml(&doc);
     }
 }
+
+#[test]
+fn messages_quote_values_the_way_go_does() {
+    // steer wrote every quoted value with %q, which escapes DEL as \x7f, a
+    // no-break space as   and keeps printable non-ASCII as it is.
+    let err = parse(
+        r#"{"listen":":80","routes":[{"path_prefix":"/a\u007f","cluster":"a"},{"path_prefix":"/a\u007f","cluster":"a"},
+            {"cluster":"é \u0000"}],"clusters":[{"name":"a","endpoints":[{"address":"h:1"}]}]}"#,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid configuration:\n\
+         routes[0].path_prefix: must not contain spaces, control characters, ?, #, % or backslashes\n\
+         routes[1].path_prefix: must not contain spaces, control characters, ?, #, % or backslashes\n\
+         routes[1]: duplicate route for host \"*\" and path_prefix \"/a\\x7f\"\n\
+         routes[2].cluster: unknown cluster \"é\\u00a0\\x00\""
+    );
+}

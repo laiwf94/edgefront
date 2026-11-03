@@ -294,6 +294,61 @@ pub(crate) fn mask(ip: IpAddr, bits: u8) -> IpAddr {
     }
 }
 
+/// Go's `strconv.Quote` (the `%q` verb) for a valid UTF-8 string: a double
+/// quoted literal in which `"` and `\\` are escaped, printable runes (by
+/// `strconv.IsPrint`) are written as they are, the seven C escapes are used
+/// where they apply, other ASCII control bytes become `\\xNN`, and other
+/// unprintable runes `\\uNNNN` or `\\UNNNNNNNN`, in lower-case hex.
+pub(crate) fn quote(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ if is_print(c) => out.push(c),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            _ if c < ' ' || c == '\u{7f}' => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            _ if u32::from(c) < 0x10000 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            _ => {
+                let _ = write!(out, "\\U{:08x}", u32::from(c));
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Go's `strconv.IsPrint`: letters, marks, numbers, punctuation, symbols and
+/// the ASCII space, as Go's Unicode tables have them.
+pub(crate) fn is_print(c: char) -> bool {
+    let c = u32::from(c);
+    super::go_print::PRINT
+        .binary_search_by(|&(lo, hi)| {
+            if hi < c {
+                std::cmp::Ordering::Less
+            } else if lo > c {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
 /// Go's `strings.ToLower`: ASCII letters, and other characters by their
 /// simple (one character) Unicode mapping, under which U+0130 (capital I
 /// with dot above) becomes a plain `i`.
@@ -386,6 +441,67 @@ mod tests {
 
     const MS: i64 = 1_000_000;
     const S: i64 = 1_000 * MS;
+
+    #[test]
+    fn quote_matches_strconv_quote() {
+        // Each pair is an input and Go's strconv.Quote of it (go1.27.3).
+        let cases = [
+            ("", r#""""#),
+            ("a\u{7f}", r#""a\x7f""#),
+            (
+                "\0\u{7}\u{8}\u{c}\n\r\t\u{b}\u{1b}",
+                r#""\x00\a\b\f\n\r\t\v\x1b""#,
+            ),
+            ("\"\\'", r#""\"\\'""#),
+            (
+                "é\u{a0}\u{301}\u{200b}\u{2028}\u{feff}\u{fffd}",
+                "\"é\\u00a0\u{301}\\u200b\\u2028\\ufeff\u{fffd}\"",
+            ),
+            (
+                "\u{1f600}\u{e0001}\u{10ffff}\u{f0000}",
+                "\"\u{1f600}\\U000e0001\\U0010ffff\\U000f0000\"",
+            ),
+            (
+                "\u{378}\u{600}\u{61c}\u{2066}\u{e000}",
+                r#""\u0378\u0600\u061c\u2066\ue000""#,
+            ),
+            ("ſ\u{212a}\u{130}", "\"ſ\u{212a}\u{130}\""),
+            (" \u{3000}", r#"" \u3000""#),
+        ];
+        for (input, want) in cases {
+            assert_eq!(quote(input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn print_table_is_sorted_and_spot_checks_hold() {
+        let table = super::super::go_print::PRINT;
+        for w in table.windows(2) {
+            assert!(w[0].0 <= w[0].1 && w[0].1 + 1 < w[1].0, "{w:?}");
+        }
+        for c in [
+            ' ',
+            '~',
+            'é',
+            '\u{301}',
+            '\u{fffd}',
+            '\u{1f600}',
+            '\u{33479}',
+        ] {
+            assert!(is_print(c), "{c:?}");
+        }
+        for c in [
+            '\0',
+            '\u{7f}',
+            '\u{a0}',
+            '\u{378}',
+            '\u{e000}',
+            '\u{10ffff}',
+            '\u{2028}',
+        ] {
+            assert!(!is_print(c), "{c:?}");
+        }
+    }
 
     #[test]
     fn parse_duration_matches_go() {

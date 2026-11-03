@@ -80,7 +80,7 @@ fn members(
                 let at = field(path, &name);
                 match set(&name, value, &at) {
                     Some(result) => result?,
-                    None => return Err(fail(path, format!("unknown field {key:?}"))),
+                    None => return Err(fail(path, format!("unknown field {}", go::quote(key)))),
                 }
             }
             Ok(())
@@ -164,7 +164,7 @@ impl Decode for Duration {
         match node {
             Node::String(s) => {
                 self.0 = go::parse_duration(s)
-                    .ok_or_else(|| fail(path, format!("invalid duration {s:?}")))?;
+                    .ok_or_else(|| fail(path, format!("invalid duration {}", go::quote(s))))?;
                 Ok(())
             }
             _ => Err(fail(

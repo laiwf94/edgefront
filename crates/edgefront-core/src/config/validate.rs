@@ -196,7 +196,7 @@ impl Validator {
             if !names.insert(c.name.clone()) {
                 self.add(
                     format!("{path}.name"),
-                    format!("duplicate cluster {:?}", c.name),
+                    format!("duplicate cluster {}", go::quote(&c.name)),
                 );
             }
             cfg.clusters.push(c);
@@ -232,15 +232,16 @@ impl Validator {
             if !names.contains(&r.cluster) {
                 self.add(
                     format!("{path}.cluster"),
-                    format!("unknown cluster {:?}", r.cluster),
+                    format!("unknown cluster {}", go::quote(&r.cluster)),
                 );
             }
             if !seen.insert((r.host.clone(), r.path_prefix.clone())) {
                 self.add(
                     path,
                     format!(
-                        "duplicate route for host {:?} and path_prefix {:?}",
-                        r.host, r.path_prefix
+                        "duplicate route for host {} and path_prefix {}",
+                        go::quote(&r.host),
+                        go::quote(&r.path_prefix)
                     ),
                 );
             }
@@ -343,7 +344,7 @@ impl Validator {
                     if n == "*" || check_host_pattern(&n).is_err() {
                         self.add(
                             format!("{cp}.server_names[{j}]"),
-                            format!("{n:?} must be a host name or *.suffix"),
+                            format!("{} must be a host name or *.suffix", go::quote(&n)),
                         );
                         continue;
                     }
@@ -376,13 +377,19 @@ impl Validator {
         for (i, n) in names.iter().enumerate() {
             let at = format!("{path}[{i}]");
             match SECURE_SUITES.iter().find(|(s, _)| s.name == n) {
-                None => self.add(at, format!("{n:?} is not a supported secure cipher suite")),
+                None => self.add(
+                    at,
+                    format!("{} is not a supported secure cipher suite", go::quote(n)),
+                ),
                 Some((_, true)) => self.add(
                     at,
-                    format!("{n:?} is a TLS 1.3 suite; those are always enabled"),
+                    format!(
+                        "{} is a TLS 1.3 suite; those are always enabled",
+                        go::quote(n)
+                    ),
                 ),
                 Some((s, false)) if out.contains(s) => {
-                    self.add(at, format!("duplicate cipher suite {n:?}"));
+                    self.add(at, format!("duplicate cipher suite {}", go::quote(n)));
                 }
                 Some(&(s, false)) => out.push(s),
             }
@@ -449,7 +456,7 @@ impl Validator {
             if !addrs.insert(re.address.as_str()) {
                 self.add(
                     format!("{ep}.address"),
-                    format!("duplicate address {:?}", re.address),
+                    format!("duplicate address {}", go::quote(&re.address)),
                 );
             }
             let weight = self.int_in(
@@ -798,13 +805,14 @@ fn valid_token(s: &str) -> bool {
 
 fn check_listen(addr: &str) -> Result<(), String> {
     let (host, port) =
-        go::split_host_port(addr).map_err(|_| format!("{addr:?} is not host:port"))?;
+        go::split_host_port(addr).map_err(|_| format!("{} is not host:port", go::quote(addr)))?;
     check_port(port, true)?;
     if host.is_empty() || host == "localhost" || go::parse_addr(host).is_some() {
         return Ok(());
     }
     Err(format!(
-        "listen host {host:?} must be an IP address, localhost or empty"
+        "listen host {} must be an IP address, localhost or empty",
+        go::quote(host)
     ))
 }
 
@@ -816,14 +824,15 @@ fn check_port(port: &str, allow_zero: bool) -> Result<(), String> {
     match port.parse::<u32>() {
         Ok(n) if canonical && n <= 65535 && (n != 0 || allow_zero) => Ok(()),
         _ => Err(format!(
-            "port {port:?} must be a number between 1 and 65535"
+            "port {} must be a number between 1 and 65535",
+            go::quote(port)
         )),
     }
 }
 
 fn check_endpoint_address(addr: &str) -> Result<(), String> {
     let (host, port) =
-        go::split_host_port(addr).map_err(|_| format!("{addr:?} is not host:port"))?;
+        go::split_host_port(addr).map_err(|_| format!("{} is not host:port", go::quote(addr)))?;
     check_port(port, false)?;
     if go::parse_addr(host).is_some() {
         return Ok(());
@@ -834,7 +843,7 @@ fn check_endpoint_address(addr: &str) -> Result<(), String> {
 /// A DNS name made of letters, digits and hyphens.
 fn check_hostname(h: &str) -> Result<(), String> {
     if h.is_empty() || h.len() > 253 {
-        return Err(format!("host {h:?} must be 1 to 253 characters"));
+        return Err(format!("host {} must be 1 to 253 characters", go::quote(h)));
     }
     let valid = h.split('.').all(|label| {
         (1..=63).contains(&label.len())
@@ -847,7 +856,7 @@ fn check_hostname(h: &str) -> Result<(), String> {
     if valid {
         Ok(())
     } else {
-        Err(format!("host {h:?} is not a valid DNS name"))
+        Err(format!("host {} is not a valid DNS name", go::quote(h)))
     }
 }
 
@@ -857,9 +866,14 @@ fn check_host_pattern(h: &str) -> Result<(), String> {
     }
     if let Some(rest) = h.strip_prefix("*.") {
         return check_hostname(rest)
-            .map_err(|_| format!("{h:?} must be *, a host name, or *.suffix"));
+            .map_err(|_| format!("{} must be *, a host name, or *.suffix", go::quote(h)));
     }
-    check_hostname(h).map_err(|_| format!("{h:?} must be *, a host name, or *.suffix (no port)"))
+    check_hostname(h).map_err(|_| {
+        format!(
+            "{} must be *, a host name, or *.suffix (no port)",
+            go::quote(h)
+        )
+    })
 }
 
 /// An absolute path without empty, `.` or `..` segments, so the prefix can
@@ -911,7 +925,10 @@ pub(crate) fn parse_trusted_prefix(s: &str) -> Result<IpPrefix, String> {
         let masked = go::mask(addr, len);
         if masked != addr {
             let want = IpPrefix { addr: masked, len };
-            return Err(format!("{s:?} has host bits set; did you mean {want}?"));
+            return Err(format!(
+                "{} has host bits set; did you mean {want}?",
+                go::quote(s)
+            ));
         }
         return Ok(IpPrefix { addr, len });
     }
@@ -920,7 +937,7 @@ pub(crate) fn parse_trusted_prefix(s: &str) -> Result<IpPrefix, String> {
             addr: a.ip,
             len: if a.ip.is_ipv4() { 32 } else { 128 },
         }),
-        _ => Err(format!("{s:?} is not an IP address or CIDR")),
+        _ => Err(format!("{} is not an IP address or CIDR", go::quote(s))),
     }
 }
 
