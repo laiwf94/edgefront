@@ -1,0 +1,8 @@
+# Formatting: comments, blank lines and stray spaces print nothing extra.
+
+   echo   leading spaces are trimmed before the command
+echo
+	now	5	
+advance 18446744073709551615
+advance 1
+sync

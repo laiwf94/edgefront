@@ -1,0 +1,38 @@
+# Sliding window cases from tests/test_window.c.
+echo invalid windows: no slots, too many slots, narrower than its slots
+window 0 init 1000 0
+window 0 init 1000 17
+window 0 init 3 4
+echo counts inside one window, then the oldest bucket weighted out
+now 1000
+window 1 init 1000 4
+window 1 add 10
+advance 250
+window 1 add 20
+window 1 count
+advance 750
+window 1 count
+advance 125
+window 1 count
+advance 125
+window 1 count
+advance 250
+window 1 count
+echo late times count at the newest time seen
+now 1200
+window 1 add 7
+window 1 count
+echo a jump of a whole ring clears it
+advance 100000
+window 1 count
+window 1 add 1
+window 1 count
+echo counts wrap at 2^64 like the C
+window 1 add 18446744073709551615
+window 1 count
+echo a window near the top of the clock
+now 18446744073709551000
+window 2 init 1000 4
+window 2 add 3
+now 18446744073709551615
+window 2 count

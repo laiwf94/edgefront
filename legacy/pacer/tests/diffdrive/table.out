@@ -1,0 +1,82 @@
+now=1000000000
+invalid configs: zero entries, shards not a power of two, more shards than keys, zero tokens
+rc=EINVAL
+rc=EINVAL
+rc=EINVAL
+rc=EINVAL
+rc=EINVAL
+keys are independent
+rc=0
+rc=1 granted=2 remaining=0 retry=0
+rc=0 granted=0 remaining=0 retry=100000000
+rc=1 granted=1 remaining=1 retry=0
+rc=1 granted=2 remaining=0 retry=0
+rc=0 granted=0 remaining=0 retry=100000000
+now=1100000000
+rc=1 granted=1 remaining=0 retry=0
+entries=3 capacity=1000 inserts=3 removals=0 reclaims=0 evictions=0 rejections=0 holds=0
+tat=83200000000 holds=0
+absent
+bad keys and costs
+rc=EINVAL granted=0 remaining=0 retry=0
+rc=EINVAL granted=0 remaining=0 retry=0
+rc=1 granted=1 remaining=1 retry=0
+rc=ERANGE granted=0 remaining=0 retry=0
+rc=EINVAL granted=0 remaining=0 retry=0
+rc=EINVAL
+rc=EINVAL
+rc=EINVAL
+take_upto, take_range and refund per key
+rc=0 granted=2 remaining=0 retry=0
+rc=0 granted=0 remaining=0 retry=100000000
+ok
+rc=0 granted=0 remaining=1 retry=100000000
+ok
+absent
+holds: a cap and an arrival rate in one call
+rc=1 granted=1 remaining=1 retry=0
+rc=1 granted=1 remaining=0 retry=0
+rc=ELIMIT granted=0 remaining=0 retry=0
+now=1200000000
+rc=ELIMIT granted=0 remaining=0 retry=0
+rc=ELIMIT granted=0 remaining=0 retry=0
+tat=83200000000 holds=2
+entries=6 capacity=1000 inserts=6 removals=0 reclaims=0 evictions=0 rejections=0 holds=2
+rc=0
+rc=0
+rc=ENOENT
+rc=ELIMIT granted=0 remaining=0 retry=0
+rc=0
+rc=ENOENT
+check=0
+reconfigure keeps debt, sweep drops idle keys
+rc=0
+rc=EINVAL
+rc=0 granted=0 remaining=0 retry=100000000
+now=11200000000
+swept=5
+entries=0 capacity=1000 inserts=6 removals=6 reclaims=0 evictions=0 rejections=0 holds=0
+check=0
+ok
+a full shard denies new keys, or evicts the coldest unheld one
+rc=0
+rc=1 granted=1 remaining=0 retry=0
+rc=1 granted=1 remaining=0 retry=0
+rc=EFULL granted=0 remaining=0 retry=0
+entries=2 capacity=2 inserts=2 removals=0 reclaims=0 evictions=0 rejections=1 holds=0
+ok
+rc=0
+rc=1 granted=1 remaining=0 retry=0
+rc=1 granted=1 remaining=0 retry=0
+rc=1 granted=1 remaining=0 retry=0
+absent
+tat=780800000000 holds=1
+tat=780800000000 holds=0
+rc=1 granted=1 remaining=0 retry=0
+entries=2 capacity=2 inserts=4 removals=0 reclaims=0 evictions=2 rejections=0 holds=1
+an idle key is reclaimed without counting as an eviction
+now=12200000000
+rc=0
+rc=1 granted=1 remaining=0 retry=0
+entries=2 capacity=2 inserts=5 removals=0 reclaims=1 evictions=2 rejections=0 holds=0
+check=0

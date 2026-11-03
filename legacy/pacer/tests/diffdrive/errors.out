@@ -1,0 +1,6 @@
+  leading spaces are trimmed before the command
+
+now=5
+now=18446744073709551615
+now=18446744073709551615
+sync

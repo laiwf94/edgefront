@@ -1,0 +1,83 @@
+# Keyed table cases from tests/test_table.c. Keys are hex: 61 is "a".
+now 1000000000
+echo invalid configs: zero entries, shards not a power of two, more shards than keys, zero tokens
+table 0 create 0 0 10 1000000000 1 deny 0102030405060708090a0b0c0d0e0f10
+table 0 create 100 3 10 1000000000 1 deny 0102030405060708090a0b0c0d0e0f10
+table 0 create 100 128 10 1000000000 1 deny 0102030405060708090a0b0c0d0e0f10
+table 0 create 100 0 0 1000000000 1 deny 0102030405060708090a0b0c0d0e0f10
+table 0 create 268435457 0 1 1000000000 1 deny 0102030405060708090a0b0c0d0e0f10
+echo keys are independent
+table 0 create 1000 0 10 1000000000 2 deny 0102030405060708090a0b0c0d0e0f10
+table 0 take 61 2
+table 0 take 61 1
+table 0 take 62 1
+table 0 take 6162 2
+table 0 take 61 1
+advance 100000000
+table 0 take 61 1
+table 0 stats
+table 0 get 61
+table 0 get 63
+echo bad keys and costs
+table 0 take - 1
+table 0 take 6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b 1
+table 0 take 6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b 1
+table 0 take 61 3
+table 0 take_upto - 1
+table 0 get -
+table 0 release -
+table 0 remove -
+echo take_upto, take_range and refund per key
+table 0 take_upto 7a 5
+table 0 take_upto 7a 5
+table 0 refund 7a 1
+table 0 take_range 7a 2 2
+table 0 refund 7778 1
+table 0 get 7778
+echo holds: a cap and an arrival rate in one call
+table 0 hold 68 2
+table 0 hold 68 2
+table 0 hold 68 2
+advance 100000000
+table 0 hold 68 2
+table 0 hold 68 2
+table 0 get 68
+table 0 stats
+table 0 release 68
+table 0 release 68
+table 0 release 68
+table 0 hold 68 0
+table 0 remove 68
+table 0 remove 68
+table 0 check
+echo reconfigure keeps debt, sweep drops idle keys
+table 0 reconfigure 1 1000000000 1
+table 0 reconfigure 0 1 1
+table 0 take 61 1
+advance 10000000000
+table 0 sweep 1024
+table 0 stats
+table 0 check
+table 0 destroy
+echo a full shard denies new keys, or evicts the coldest unheld one
+table 1 create 2 1 1 1000000000 1 deny 0102030405060708090a0b0c0d0e0f10
+table 1 take 01 1
+table 1 take 02 1
+table 1 take 03 1
+table 1 stats
+table 1 destroy
+table 1 create 2 1 1 1000000000 1 evict 0102030405060708090a0b0c0d0e0f10
+table 1 take 01 1
+table 1 hold 02 1
+table 1 take 03 1
+table 1 get 01
+table 1 get 02
+table 1 get 03
+table 1 take 04 1
+table 1 stats
+echo an idle key is reclaimed without counting as an eviction
+advance 1000000000
+table 1 release 02
+table 1 take 05 1
+table 1 stats
+table 1 check

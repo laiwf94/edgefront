@@ -322,6 +322,7 @@ name = "edgefront-difftest"
 version = "0.1.0"
 dependencies = [
  "edgefront-core",
+ "edgefront-limiter",
  "edgefront-proxy",
  "serde",
  "serde_json",

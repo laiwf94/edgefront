@@ -1,0 +1,87 @@
+invalid rates: zero tokens, zero period, zero burst, huge burst
+rc=EINVAL
+rc=EINVAL
+rc=EINVAL
+rc=EINVAL
+burst then deny at 10/s burst 5
+now=42000000000
+rc=0 tat=0 iv=6400000000 tol=32000000000
+rc=1 granted=1 remaining=4 retry=0 tat=2694400000000 iv=6400000000 tol=32000000000
+rc=1 granted=1 remaining=3 retry=0 tat=2700800000000 iv=6400000000 tol=32000000000
+rc=1 granted=1 remaining=2 retry=0 tat=2707200000000 iv=6400000000 tol=32000000000
+rc=1 granted=1 remaining=1 retry=0 tat=2713600000000 iv=6400000000 tol=32000000000
+rc=1 granted=1 remaining=0 retry=0 tat=2720000000000 iv=6400000000 tol=32000000000
+rc=0 granted=0 remaining=0 retry=100000000 tat=2720000000000 iv=6400000000 tol=32000000000
+retry_after is exact
+now=42099999999
+rc=0 granted=0 remaining=0 retry=1 tat=2720000000000 iv=6400000000 tol=32000000000
+now=42100000000
+rc=1 granted=1 remaining=0 retry=0 tat=2726400000000 iv=6400000000 tol=32000000000
+rc=0 granted=0 remaining=0 retry=300000000 tat=2726400000000 iv=6400000000 tol=32000000000
+now=42400000000
+rc=1 granted=3 remaining=0 retry=0 tat=2745600000000 iv=6400000000 tol=32000000000
+cost above the burst is ERANGE, zero cost only reports
+rc=0 tat=0 iv=6400000000 tol=32000000000
+rc=ERANGE granted=0 remaining=0 retry=0 tat=0 iv=6400000000 tol=32000000000
+rc=1 granted=0 remaining=5 retry=0 tat=2713600000000 iv=6400000000 tol=32000000000
+remaining=5 tat=2713600000000 iv=6400000000 tol=32000000000
+rc=1 granted=5 remaining=0 retry=0 tat=2745600000000 iv=6400000000 tol=32000000000
+remaining refills over time
+now=42650000000
+remaining=2 tat=2745600000000 iv=6400000000 tol=32000000000
+now=52650000000
+remaining=5 tat=2745600000000 iv=6400000000 tol=32000000000
+take_upto grants what is available at 1000/s burst 100
+now=1000000000
+rc=0 tat=0 iv=64000000 tol=6400000000
+got=60 granted=60 remaining=40 retry=0 tat=67840000000 iv=64000000 tol=6400000000
+got=40 granted=40 remaining=0 retry=0 tat=70400000000 iv=64000000 tol=6400000000
+got=0 granted=0 remaining=0 retry=1000000 tat=70400000000 iv=64000000 tol=6400000000
+now=1001000000
+got=1 granted=1 remaining=0 retry=0 tat=70464000000 iv=64000000 tol=6400000000
+now=1011000000
+got=10 granted=10 remaining=0 retry=0 tat=71104000000 iv=64000000 tol=6400000000
+got=0 granted=0 remaining=0 retry=0 tat=71104000000 iv=64000000 tol=6400000000
+take_range waits for the minimum
+now=1014000000
+got=0 granted=0 remaining=3 retry=2000000 tat=71104000000 iv=64000000 tol=6400000000
+now=1016000000
+got=5 granted=5 remaining=0 retry=0 tat=71424000000 iv=64000000 tol=6400000000
+got=0 granted=0 remaining=0 retry=100000000 tat=71424000000 iv=64000000 tol=6400000000
+refund restores state but never past a full bucket
+rc=0 tat=0 iv=64000000 tol=6400000000
+got=100 granted=100 remaining=0 retry=0 tat=71424000000 iv=64000000 tol=6400000000
+ok tat=69504000000 iv=64000000 tol=6400000000
+remaining=30 tat=69504000000 iv=64000000 tol=6400000000
+ok tat=65024000000 iv=64000000 tol=6400000000
+remaining=100 tat=65024000000 iv=64000000 tol=6400000000
+ok tat=65024000000 iv=64000000 tol=6400000000
+remaining=100 tat=65024000000 iv=64000000 tol=6400000000
+zero cost is denied while debt exceeds the burst
+rc=0 tat=0 iv=64000000 tol=6400000000
+got=100 granted=100 remaining=0 retry=0 tat=71424000000 iv=64000000 tol=6400000000
+rc=0 tat=71424000000 iv=64000000 tol=640000000
+rc=0 granted=0 remaining=0 retry=90000000 tat=71424000000 iv=64000000 tol=640000000
+now=1106000000
+rc=1 granted=0 remaining=0 retry=0 tat=71424000000 iv=64000000 tol=640000000
+rc=EINVAL tat=71424000000 iv=64000000 tol=640000000
+reconfigure keeps debt in time
+now=1000000000
+rc=0 tat=0 iv=64000000000 tol=64000000000
+rc=1 granted=1 remaining=0 retry=0 tat=128000000000 iv=64000000000 tol=64000000000
+rc=0 tat=128000000000 iv=64000000 tol=64000000
+rc=0 granted=0 remaining=0 retry=1000000000 tat=128000000000 iv=64000000 tol=64000000
+now=1999999999
+rc=0 granted=0 remaining=0 retry=1 tat=128000000000 iv=64000000 tol=64000000
+now=2000000000
+rc=1 granted=1 remaining=0 retry=0 tat=128064000000 iv=64000000 tol=64000000
+high byte rates keep precision; a rate past one token per tick is capped
+rc=0 tat=0 iv=64 tol=67108864
+rc=0 tat=0 iv=1 tol=1
+time past the horizon is clamped
+rc=0 tat=0 iv=64000000000 tol=64000000000
+now=18446744073709551615
+rc=1 granted=1 remaining=0 retry=0 tat=9223372100854775744 iv=64000000000 tol=64000000000
+rc=0 granted=0 remaining=0 retry=1000000000 tat=9223372100854775744 iv=64000000000 tol=64000000000
+ok tat=9223372100854775744 iv=64000000000 tol=64000000000
+now=18446744073709551615

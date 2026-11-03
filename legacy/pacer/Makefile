@@ -63,13 +63,13 @@ IT_OBJ    := $(sort $(IT_SRC:%.c=$(BUILD)/%.o))
 FUZZ_SRC  := $(wildcard fuzz/fuzz_*.c)
 BENCH_SRC := bench/bench_limiter.c bench/bench_proxy.c
 ALL_C     := $(LIB_SRC) $(PD_ALL) src/pacerd/main.c src/pacerctl/pacerctl.c \
-             $(sort $(TEST_SRC) $(IT_SRC)) $(FUZZ_SRC) $(BENCH_SRC)
+             $(sort $(TEST_SRC) $(IT_SRC)) $(FUZZ_SRC) $(BENCH_SRC) tests/diffdrive.c
 ALL_SRC   := $(ALL_C) $(wildcard include/*.h src/*/*.h tests/*.h)
 
-.PHONY: all lib test run-tests check format format-check tidy coverage clean require-linux \
+.PHONY: all lib test run-tests run-diffdrive check format format-check tidy coverage clean require-linux \
         fuzz fuzz-smoke bench bench-build
 
-all: lib $(BINS)
+all: lib $(BINS) $(BUILD)/diffdrive
 
 lib: $(BUILD)/libpacer.a
 
@@ -96,6 +96,13 @@ $(BUILD)/pacerctl: $(BUILD)/src/pacerctl/pacerctl.o $(BUILD)/libpacerd.a $(BUILD
 
 $(BUILD)/itest: $(IT_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^
+
+# The differential driver: operations on stdin, decisions on stdout. Each
+# tests/diffdrive/NAME.ops script must print exactly NAME.out.
+$(BUILD)/diffdrive: $(BUILD)/tests/diffdrive.o $(BUILD)/libpacer.a
+	$(CC) $(LDFLAGS) -o $@ $^
+
+DIFF_OPS := $(wildcard tests/diffdrive/*.ops)
 
 # LeakSanitizer is part of ASan on Linux only.
 ifeq ($(UNAME),Linux)
@@ -125,13 +132,18 @@ bench: bench-build
 	PACERD_BIN=build/release/pacerd build/release/bench_proxy
 
 ifeq ($(UNAME),Linux)
-run-tests: $(BUILD)/unit $(BUILD)/pacerd $(BUILD)/pacerctl $(BUILD)/itest
+run-tests: $(BUILD)/unit $(BUILD)/pacerd $(BUILD)/pacerctl $(BUILD)/itest run-diffdrive
 	$(TEST_ENV) $(BUILD)/unit
 	$(TEST_ENV) $(BUILD)/itest
 else
-run-tests: $(BUILD)/unit
+run-tests: $(BUILD)/unit run-diffdrive
 	$(TEST_ENV) $(BUILD)/unit
 endif
+
+run-diffdrive: $(BUILD)/diffdrive
+	set -e; for f in $(DIFF_OPS); do \
+	  $(TEST_ENV) $(BUILD)/diffdrive < $$f | diff -u $${f%.ops}.out - ; \
+	done; echo "diffdrive: $(words $(DIFF_OPS)) transcripts match"
 
 test:
 	$(MAKE) VARIANT=asan run-tests
@@ -195,4 +207,4 @@ clean:
 	rm -rf build
 
 -include $(BUILD)/bench/bench_limiter.d $(BUILD)/bench/bench_proxy.d
--include $(LIB_OBJ:.o=.d) $(PD_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(IT_OBJ:.o=.d) $(BUILD)/src/pacerd/main.d $(BUILD)/src/pacerctl/pacerctl.d
+-include $(BUILD)/tests/diffdrive.d $(LIB_OBJ:.o=.d) $(PD_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(IT_OBJ:.o=.d) $(BUILD)/src/pacerd/main.d $(BUILD)/src/pacerctl/pacerctl.d

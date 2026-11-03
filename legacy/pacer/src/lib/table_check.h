@@ -12,4 +12,12 @@
  */
 int pacer_table_check(pacer_table *t);
 
+/*
+ * Read a key's state without adding it or changing its recency: its
+ * theoretical arrival time in ticks and its open holds. Returns PACER_OK,
+ * PACER_ENOENT for a key that is not present, or PACER_EINVAL for an empty
+ * or oversized key. The differential driver compares table states with it.
+ */
+int pacer_table_peek(pacer_table *t, const void *key, size_t len, uint64_t *tat, uint32_t *holds);
+
 #endif

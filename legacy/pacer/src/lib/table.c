@@ -620,3 +620,23 @@ int pacer_table_check(pacer_table *t)
     }
     return 0;
 }
+
+int pacer_table_peek(pacer_table *t, const void *key, size_t len, uint64_t *tat, uint32_t *holds)
+{
+    if (!key_ok(key, len)) {
+        return PACER_EINVAL;
+    }
+    uint64_t hash = pacer_siphash24(t->hash_key, key, len);
+    struct shard *s = shard_for(t, hash);
+
+    (void)pthread_mutex_lock(&s->mu);
+    const struct entry *e = &s->slots[probe(s, hash, key, len)];
+    int rc = PACER_ENOENT;
+    if (e->keylen != 0) {
+        *tat = e->tat;
+        *holds = e->holds;
+        rc = PACER_OK;
+    }
+    (void)pthread_mutex_unlock(&s->mu);
+    return rc;
+}

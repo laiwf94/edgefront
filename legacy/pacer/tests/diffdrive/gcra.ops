@@ -1,0 +1,88 @@
+# GCRA cases from tests/test_gcra.c, one object per case.
+echo invalid rates: zero tokens, zero period, zero burst, huge burst
+gcra 0 init 0 1000000000 1
+gcra 0 init 1 0 1
+gcra 0 init 1 1000000000 0
+gcra 0 init 1 1000000000 18446744073709551615
+echo burst then deny at 10/s burst 5
+now 42000000000
+gcra 1 init 10 1000000000 5
+gcra 1 take 1
+gcra 1 take 1
+gcra 1 take 1
+gcra 1 take 1
+gcra 1 take 1
+gcra 1 take 1
+echo retry_after is exact
+advance 99999999
+gcra 1 take 1
+advance 1
+gcra 1 take 1
+gcra 1 take 3
+advance 300000000
+gcra 1 take 3
+echo cost above the burst is ERANGE, zero cost only reports
+gcra 2 init 10 1000000000 5
+gcra 2 take 6
+gcra 2 take 0
+gcra 2 remaining
+gcra 2 take 5
+echo remaining refills over time
+advance 250000000
+gcra 2 remaining
+advance 10000000000
+gcra 2 remaining
+echo take_upto grants what is available at 1000/s burst 100
+now 1000000000
+gcra 3 init 1000 1000000000 100
+gcra 3 take_upto 60
+gcra 3 take_upto 60
+gcra 3 take_upto 60
+advance 1000000
+gcra 3 take_upto 60
+advance 10000000
+gcra 3 take_upto 60
+gcra 3 take_upto 0
+echo take_range waits for the minimum
+advance 3000000
+gcra 3 take_range 5 50
+advance 2000000
+gcra 3 take_range 5 50
+gcra 3 take_range 500 1000
+echo refund restores state but never past a full bucket
+gcra 4 init 1000 1000000000 100
+gcra 4 take_upto 100
+gcra 4 refund 30
+gcra 4 remaining
+gcra 4 refund 70
+gcra 4 remaining
+gcra 4 refund 18446744073709551615
+gcra 4 remaining
+echo zero cost is denied while debt exceeds the burst
+gcra 5 init 1000 1000000000 100
+gcra 5 take_upto 100
+gcra 5 reconfigure 1000 1000000000 10
+gcra 5 take 0
+advance 90000000
+gcra 5 take 0
+gcra 5 reconfigure 0 1 1
+echo reconfigure keeps debt in time
+now 1000000000
+gcra 6 init 1 1000000000 1
+gcra 6 take 1
+gcra 6 reconfigure 1000 1000000000 1
+gcra 6 take 1
+now 1999999999
+gcra 6 take 1
+now 2000000000
+gcra 6 take 1
+echo high byte rates keep precision; a rate past one token per tick is capped
+gcra 7 init 1000000000 1000000000 1048576
+gcra 7 init 18446744073709551615 1 1
+echo time past the horizon is clamped
+gcra 8 init 1 1000000000 1
+now 18446744073709551615
+gcra 8 take 1
+gcra 8 take 1
+gcra 8 state
+advance 5
