@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan
+.PHONY: check fmt lint test cov audit fuzz tsan difftest
 
 FUZZ_TARGETS := cache_control entity_tags range http_date disk_record purge_messages
 FUZZ_SECS ?= 30
@@ -36,3 +36,12 @@ tsan:
 	RUSTFLAGS=-Zsanitizer=thread TSAN_OPTIONS=halt_on_error=1:suppressions=$(CURDIR)/tsan-suppressions.txt cargo +nightly test -Zbuild-std \
 		--target $(TSAN_TARGET) --target-dir target/tsan \
 		--lib --test proxy --test revalidation --test failure --test cluster
+
+# Diff the Rust port against steer: 10,000 generated configs and 100,000
+# generated requests through legacy/steer/cmd/diffdrive and the Rust crates.
+# Needs Go. The seed comes from the clock and is printed; replay a run with
+# DIFFTEST_ARGS="--seed N".
+DIFFTEST_ARGS ?=
+difftest:
+	cd legacy/steer && go build -o $(CURDIR)/target/diffdrive ./cmd/diffdrive
+	cargo run --release --locked -p edgefront-difftest -- steer $(DIFFTEST_ARGS) -- target/diffdrive

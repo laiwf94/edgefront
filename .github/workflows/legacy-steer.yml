@@ -38,3 +38,16 @@ jobs:
           go test ./cmd/loadgen -run=^$ -fuzz=FuzzParseHeader -fuzztime=10s
       - name: Vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  # Diffs edgefront's Rust port against steer until legacy/steer is deleted.
+  difftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: legacy/steer/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Diff 10,000 configs and 100,000 requests against steer
+        run: make difftest

@@ -315,6 +315,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgefront-difftest"
+version = "0.1.0"
+dependencies = [
+ "edgefront-core",
+ "edgefront-proxy",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "edgefront-limiter"
 version = "0.1.0"
 dependencies = [
