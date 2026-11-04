@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan difftest e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan difftest difftest-pacer e2e-steer
 
 FUZZ_TARGETS := cache_control entity_tags range http_date disk_record purge_messages
 FUZZ_SECS ?= 30
@@ -52,3 +52,11 @@ difftest:
 e2e-steer:
 	cd legacy/steer && go build -o $(CURDIR)/target/steer ./cmd/steer
 	STEER_BIN=$(CURDIR)/target/steer cargo test --locked -p edgefront --test e2e_port_http1
+
+# Diff edgefront-limiter against libpacer: 100 generated scripts of 10,000
+# operations each through legacy/pacer/tests/diffdrive.c (built by
+# edgefront-difftest's build script) and the Rust crate. Needs a C compiler.
+# The seed comes from the clock and is printed; a divergence prints the
+# command that replays it.
+difftest-pacer:
+	cargo run --release --locked -p edgefront-difftest -- pacer $(DIFFTEST_ARGS)

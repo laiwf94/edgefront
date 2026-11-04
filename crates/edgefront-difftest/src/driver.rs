@@ -36,7 +36,13 @@ impl Transcript {
 /// broken pipe is ignored and its exit status says what happened. Output
 /// that is not UTF-8 is an [`io::ErrorKind::InvalidData`] error.
 pub fn run(program: &Path, script: &str) -> io::Result<Transcript> {
+    run_with_args(program, &[], script)
+}
+
+/// [`run`] with arguments for the program.
+pub fn run_with_args(program: &Path, args: &[String], script: &str) -> io::Result<Transcript> {
     let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
