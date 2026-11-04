@@ -10,10 +10,15 @@ repository.workspace = true
 
 [dependencies]
 cachet.workspace = true
+edgefront-core.workspace = true
+edgefront-proxy.workspace = true
 
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

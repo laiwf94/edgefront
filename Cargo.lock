@@ -275,6 +275,9 @@ name = "edgefront"
 version = "0.1.0"
 dependencies = [
  "cachet",
+ "edgefront-core",
+ "edgefront-proxy",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -340,10 +343,16 @@ dependencies = [
 name = "edgefront-proxy"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "edgefront-core",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "proptest",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

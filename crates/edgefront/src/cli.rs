@@ -24,7 +24,7 @@ fn load(path: &str) -> Result<Config, String> {
     Config::parse(&text).map_err(|e| format!("{path}: {e}"))
 }
 
-async fn wait_for_signal() {
+pub(crate) async fn wait_for_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
@@ -48,6 +48,11 @@ async fn wait_for_signal() {
 /// Runs the command line `args` (without the program name) and returns the
 /// exit code.
 pub fn run(args: &[String]) -> ExitCode {
+    if let [command, rest @ ..] = args
+        && command == "proxy"
+    {
+        return crate::proxy::run(rest);
+    }
     let (check_only, path) = match args {
         [flag] if flag == "--version" => {
             println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION"));

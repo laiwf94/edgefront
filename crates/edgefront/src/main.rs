@@ -2,8 +2,12 @@
 //! exactly as cachet's binary did: the same flags, exit codes, `CACHET_*`
 //! environment variables and JSON log fields, under its own name. The golden
 //! transcripts in tests/golden hold both binaries to that.
+//!
+//! `edgefront proxy` runs the HTTP/1.1 proxy ported from steer instead; see
+//! the `proxy` module.
 
 mod cli;
+mod proxy;
 
 use std::process::ExitCode;
 

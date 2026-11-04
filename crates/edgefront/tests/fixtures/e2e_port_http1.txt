@@ -1,0 +1,470 @@
+== readme_hello
+> GET /hello HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/hello\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /hello HTTP/1.1
+| accept: */*
+| host: localhost:18080
+| user-agent: curl/8.5.0
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== head
+> HEAD /hello HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: 
+upstream requests: 1
+| at {a|b}
+| HEAD /hello HTTP/1.1
+| accept: */*
+| host: localhost:18080
+| user-agent: curl/8.5.0
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== post_json
+> POST /orders HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"POST\",\"path\":\"/orders\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| POST /orders HTTP/1.1
+| content-length: 13
+| content-type: application/json
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: {\"sku\":\"a-1\"}
+
+== post_chunked
+> POST /upload HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"POST\",\"path\":\"/upload\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| POST /upload HTTP/1.1
+| host: localhost:18080
+| transfer-encoding: chunked
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: hello world
+
+== post_chunked_large
+> POST /upload HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"POST\",\"path\":\"/upload\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| POST /upload HTTP/1.1
+| host: localhost:18080
+| transfer-encoding: chunked
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: <70000 bytes, fnv1a 4e30a751c2da5095>
+
+== post_large
+> POST /upload HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"POST\",\"path\":\"/upload\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| POST /upload HTTP/1.1
+| content-length: 70000
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: <70000 bytes, fnv1a 4e30a751c2da5095>
+
+== put_empty
+> PUT /items/1 HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"PUT\",\"path\":\"/items/1\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| PUT /items/1 HTTP/1.1
+| content-length: 0
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== get_content_length_zero
+> GET /items/1 HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/items/1\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /items/1 HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== dot_segments
+> GET /public/../admin HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/admin\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /admin HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== encoded_dot_segments
+> GET /public%2F..%2Fadmin HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/admin\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /admin HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== encoded_slash_kept
+> GET /a%2Fb?x=1&y=%20 HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/a/b\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /a%2Fb?x=1&y=%20 HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== double_slashes
+> GET //double//slashes/ HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/double/slashes/\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /double/slashes/ HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== bare_query
+> GET /x? HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/x\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /x? HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== options_star
+> OPTIONS * HTTP/1.1
+< 200 OK
+< body: 
+upstream requests: 0
+
+== hop_by_hop
+> GET /hop HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-kept: yes
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/hop\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /hop HTTP/1.1
+| host: localhost:18080
+| te: trailers
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== spoofed_forwarding
+> GET /hello HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/hello\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /hello HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-real-ip: 1.2.3.4
+| x-request-id: {generated-id}
+| body: 
+
+== host_case_and_port
+> GET /hello HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/hello\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /hello HTTP/1.1
+| host: Shop.Example.COM:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: Shop.Example.COM:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== request_id_kept
+> GET /hello HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: abc-123.x_y:z
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/hello\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /hello HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: abc-123.x_y:z
+| body: 
+
+== request_id_replaced
+> GET /hello HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/hello\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /hello HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== upstream_503_passed_through
+> POST /fail HTTP/1.1
+< 503 Service Unavailable
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"error\":\"injected failure\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| POST /fail HTTP/1.1
+| content-length: 2
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: {}
+
+== upstream_500_passed_through
+> GET /error500 HTTP/1.1
+< 500 Internal Server Error
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"error\":\"boom\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /error500 HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== chunked_response
+> GET /chunked HTTP/1.1
+< 200 OK
+< content-type: text/plain
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: one two three\n
+upstream requests: 1
+| at {a|b}
+| GET /chunked HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== no_content
+> GET /empty HTTP/1.1
+< 204 No Content
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: 
+upstream requests: 1
+| at {a|b}
+| GET /empty HTTP/1.1
+| host: localhost:18080
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: localhost:18080
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== absolute_form
+> GET http://Shop.Example.com/abs?q=1 HTTP/1.1
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/abs\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /abs?q=1 HTTP/1.1
+| host: Shop.Example.com
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-host: Shop.Example.com
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== http10_without_host
+> GET /old HTTP/1.0
+< 200 OK
+< content-type: application/json
+< x-request-id: {generated-id}
+< x-upstream: {a|b}
+< body: {\"method\":\"GET\",\"path\":\"/old\",\"upstream\":\"{a|b}\"}\n
+upstream requests: 1
+| at {a|b}
+| GET /old HTTP/1.1
+| host: {endpoint-a|b}
+| x-forwarded-for: 127.0.0.1
+| x-forwarded-proto: http
+| x-request-id: {generated-id}
+| body: 
+
+== connect_refused
+> CONNECT example.com:443 HTTP/1.1
+< 405 Method Not Allowed
+< allow: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS
+< cache-control: no-store
+< connection: close
+< content-type: application/json
+< x-content-type-options: nosniff
+< x-request-id: {generated-id}
+< body: {\"error\":{\"code\":\"method_not_allowed\",\"message\":\"CONNECT is not supported\",\"request_id\":\"{generated-id}\"}}\n
+upstream requests: 0
+
+== bad_escape
+> GET /bad%zz HTTP/1.1
+< 400 Bad Request
+< connection: close
+< content-type: text/plain; charset=utf-8
+< body: 400 Bad Request
+upstream requests: 0
+
+== missing_host
+> GET /hello HTTP/1.1
+< 400 Bad Request: missing required Host header
+< connection: close
+< content-type: text/plain; charset=utf-8
+< body: 400 Bad Request: missing required Host header
+upstream requests: 0
+
+== two_hosts
+> GET /hello HTTP/1.1
+< 400 Bad Request
+< connection: close
+< content-type: text/plain; charset=utf-8
+< body: 400 Bad Request
+upstream requests: 0
+
+== malformed_host
+> GET /hello HTTP/1.1
+< 400 Bad Request: malformed Host header
+< connection: close
+< content-type: text/plain; charset=utf-8
+< body: 400 Bad Request: malformed Host header
+upstream requests: 0
+

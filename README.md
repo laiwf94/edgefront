@@ -5,10 +5,35 @@ A self-hosted application edge in one Rust binary. It brings three projects toge
 | Part | Started as | Today |
 |---|---|---|
 | Cache | cachet | An HTTP caching reverse proxy in Rust (this directory) |
-| Proxy | steer | A Go edge proxy and load balancer, under [legacy/steer](legacy/steer) until its Rust port passes differential tests |
+| Proxy | steer | A Go edge proxy and load balancer, under [legacy/steer](legacy/steer), being ported to `edgefront-proxy`; the Rust port already proxies HTTP/1.1 with steer's configuration (see below) |
 | Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer) until its Rust port passes differential tests |
 
 All three keep their full history. The plan for the next year, three tracks in parallel, is in [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap`.
+
+## Workspace
+
+| Crate | What it holds |
+|---|---|
+| `crates/edgefront` | The `edgefront` binary |
+| `crates/edgefront-core` | The listener, pooled HTTP/1.1 client, steer's config schema, metrics and admin plumbing |
+| `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request IDs and the HTTP/1.1 request path ported from steer |
+| `crates/edgefront-cache` | cachet's caching policy, storage and purge |
+| `crates/edgefront-limiter` | pacer's rate limiting algorithms |
+| `crates/edgefront-difftest` | Differential tests against `legacy/steer` and `legacy/pacer` |
+
+## Proxy (port of steer)
+
+`edgefront proxy` runs the proxy from a steer configuration file, unchanged, in JSON or the same schema in TOML:
+
+```sh
+cargo build --release -p edgefront
+target/release/edgefront proxy --check-config legacy/steer/examples/steer.json
+target/release/edgefront proxy --config legacy/steer/examples/steer.json   # listens on 127.0.0.1:18080
+```
+
+The log is JSON on stdout (`EDGEFRONT_LOG` sets the filter, default `info`), one line per request with steer's fields, and SIGTERM drains in-flight requests before exiting. The request path behaves as steer's did: routing on host and longest prefix after path cleaning, `X-Forwarded-*` rewritten and trusted only from `trusted_proxies`, request IDs accepted or generated and returned, hop-by-hop headers removed both ways, each cluster's `max_requests` and `timeout`, and steer's JSON errors (`no_route`, `overloaded`, `bad_gateway`, `upstream_timeout`, `bad_request`, `method_not_allowed`). `crates/edgefront/tests/e2e_port_http1.rs` holds the binary to a transcript recorded from steer, header values byte for byte, and in CI it also runs steer itself on the same 30 requests.
+
+Still to come from steer: the balancing policies and priority load (week 2; until then each cluster takes turns over its most preferred endpoints), health checks, outlier detection, retries, the admin API and metrics (week 3), and TLS termination, reload and drain (week 4). A configuration with a `tls` block is refused rather than served in plain text.
 
 ## Cache (formerly cachet)
 
@@ -123,6 +148,8 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 ## Checking a change
 
 `make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests with at least 90% line coverage through cargo-llvm-cov. `make audit` runs cargo deny and cargo audit, `make fuzz` runs the six cargo-fuzz targets (nightly), and `make tsan` runs the concurrency tests under ThreadSanitizer (nightly with rust-src). CI runs all of these, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
+
+While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus two comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary.
 
 ## License
 

@@ -27,6 +27,7 @@ cachet = { path = ".", version = "0.1.0" }
 edgefront-cache = { path = "crates/edgefront-cache", version = "0.1.0" }
 edgefront-core = { path = "crates/edgefront-core", version = "0.1.0" }
 edgefront-limiter = { path = "crates/edgefront-limiter", version = "0.1.0" }
+edgefront-proxy = { path = "crates/edgefront-proxy", version = "0.1.0" }
 
 # Runtime dependencies, pinned exactly. A crate that needs one names it with
 # `workspace = true` and adds features only where it needs more.

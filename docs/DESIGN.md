@@ -1,4 +1,32 @@
-# cachet design notes
+# edgefront design notes
+
+The first two sections cover the workspace and the steer port. The rest are cachet's design notes, which still describe the cache.
+
+## The workspace
+
+edgefront is one Cargo workspace. Every crate lives under `crates/` and takes its version, edition, lints and dependency pins from the root `Cargo.toml`, and the whole workspace shares one `Cargo.lock`. `crates/edgefront` is the binary. `edgefront-core` holds what every product needs: the HTTP/1.1 listener with steer's connection limits and graceful drain, the pooled client, steer's config schema, metrics and admin plumbing. `edgefront-proxy` is steer's routing and request path, `edgefront-cache` is cachet's engine, `edgefront-limiter` is pacer's algorithms, and `edgefront-difftest` diffs the ports against the legacy programs. The root package is cachet as it was before the split, kept until its sources have all moved into the member crates. `legacy/steer` (Go) and `legacy/pacer` (C) keep building and testing in CI, with their full history, until their ports pass their differential suites. Each is then deleted, and its history stays reachable through the merge commit.
+
+## Porting steer: the request path and the differential tests
+
+The port keeps steer's behaviour exactly, byte for byte where bytes are visible, so every decision can be diffed against the Go code before the Go code goes. That means porting the parts of Go's standard library steer leaned on, not only steer's own code. The config reader follows `encoding/json`'s rules (case-insensitive keys, duplicate keys merging, invalid UTF-8 becoming U+FFFD). Durations, addresses, `strconv.Quote` and `path.Clean` follow Go. Request targets are decoded and re-encoded with `net/url`'s rules, and Go's server checks (`Host` validity, `OPTIONS *`, `CONNECT`) come first.
+
+The HTTP/1.1 request path is `edgefront_proxy::server::Proxy`, a handler for the core listener:
+
+1. Go's server checks.
+2. Route on the host and the cleaned path.
+3. Take a place under the cluster's `max_requests`.
+4. Remove hop-by-hop headers and the headers `Connection` names, rewrite the forwarding headers, and set the request ID.
+5. Send the upstream target: the client's own encoding when cleaning changed nothing, Go's encoding of the cleaned path otherwise.
+
+The body keeps the client's framing, because Go's transport copied `TransferEncoding`: a chunked body stays chunked even after steer buffered it for replay. The cluster's `timeout` covers the whole exchange, so it answers `504` before the response head and cuts the body after it. The place under `max_requests` is held until the response body is dropped, which is when steer's handler returned.
+
+Three layers check the port:
+
+- **Unit and property tests** use Go's own test vectors and, for the trickier functions, fixtures recorded by running steer's Go code.
+- **`edgefront-difftest`** (`make difftest`, in CI on every push) feeds 10,000 generated configs and 100,000 generated requests to `legacy/steer/cmd/diffdrive` and to the Rust crates. It fails on any difference in acceptance, error text, route choice or cleaned path.
+- **`crates/edgefront/tests/e2e_port_http1.rs`** starts the binary with `legacy/steer/examples/steer.json` and three recording fake upstreams. It sends 30 raw requests: the README's traffic, path cleaning, spoofed forwarding headers, request IDs, hop-by-hop headers both ways, body framing, upstream errors and the requests Go refuses. It then compares the response and the upstream's view of each request with a transcript recorded from steer. `make e2e-steer`, also in CI, runs steer live on the same cases and requires it to still produce that transcript.
+
+Until the balancer port lands, each cluster takes turns over its endpoints of the most preferred priority. The end-to-end transcript only records which priority level answered, so it holds when steer's `least_loaded` picks either primary.
 
 ## What cachet is for
 

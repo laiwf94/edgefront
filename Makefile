@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan difftest
+.PHONY: check fmt lint test cov audit fuzz tsan difftest e2e-steer
 
 FUZZ_TARGETS := cache_control entity_tags range http_date disk_record purge_messages
 FUZZ_SECS ?= 30
@@ -45,3 +45,10 @@ DIFFTEST_ARGS ?=
 difftest:
 	cd legacy/steer && go build -o $(CURDIR)/target/diffdrive ./cmd/diffdrive
 	cargo run --release --locked -p edgefront-difftest -- steer $(DIFFTEST_ARGS) -- target/diffdrive
+
+# Run the end-to-end HTTP/1.1 cases against a live steer as well as the
+# edgefront binary, and check steer still matches the recorded transcript.
+# Needs Go. E2E_BLESS=1 rewrites the recording from steer.
+e2e-steer:
+	cd legacy/steer && go build -o $(CURDIR)/target/steer ./cmd/steer
+	STEER_BIN=$(CURDIR)/target/steer cargo test --locked -p edgefront --test e2e_port_http1
