@@ -1,0 +1,41 @@
+[package]
+name = "edgefront-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+http = "=1.5.0"
+libfuzzer-sys = "=0.4.13"
+
+[dependencies.edgefront-core]
+path = ".."
+
+# Keep the fuzz crate out of the main workspace: it needs nightly and
+# libFuzzer, and has its own Cargo.lock.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "request_id"
+path = "fuzz_targets/request_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base_url"
+path = "fuzz_targets/base_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bearer_token"
+path = "fuzz_targets/bearer_token.rs"
+test = false
+doc = false
+bench = false

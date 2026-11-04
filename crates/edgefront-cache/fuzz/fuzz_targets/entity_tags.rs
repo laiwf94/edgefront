@@ -1,6 +1,6 @@
 #![no_main]
 
-use cachet::headers::{EntityTag, EtagMatch};
+use edgefront_cache::headers::{EntityTag, EtagMatch};
 use http::header::{HeaderMap, HeaderValue, IF_NONE_MATCH};
 use libfuzzer_sys::fuzz_target;
 

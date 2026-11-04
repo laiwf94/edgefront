@@ -1,6 +1,8 @@
 .PHONY: check fmt lint test cov audit fuzz tsan difftest difftest-pacer e2e-steer
 
-FUZZ_TARGETS := cache_control entity_tags range http_date disk_record purge_messages
+# A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
+# a crate outside the workspace, with its own Cargo.lock.
+FUZZ_DIRS := crates/edgefront-cache/fuzz crates/edgefront-core/fuzz
 FUZZ_SECS ?= 30
 
 # The full gate: format, lint with warnings as errors, tests with line coverage.
@@ -8,11 +10,11 @@ check: fmt lint cov
 
 fmt:
 	cargo fmt --all --check
-	cargo fmt --check --manifest-path fuzz/Cargo.toml
+	for d in $(FUZZ_DIRS); do cargo fmt --check --manifest-path $$d/Cargo.toml || exit 1; done
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+	for d in $(FUZZ_DIRS); do cargo clippy --manifest-path $$d/Cargo.toml --all-targets -- -D warnings || exit 1; done
 
 test:
 	cargo test --workspace
@@ -23,11 +25,16 @@ cov:
 audit:
 	cargo deny check
 	cargo audit
-	cargo audit --file fuzz/Cargo.lock
+	for d in $(FUZZ_DIRS); do cargo audit --file $$d/Cargo.lock || exit 1; done
 
-# Needs a nightly toolchain and cargo-fuzz.
+# Runs every target of every fuzz crate for FUZZ_SECS seconds. Needs a
+# nightly toolchain and cargo-fuzz.
 fuzz:
-	for t in $(FUZZ_TARGETS); do cargo +nightly fuzz run $$t -- -max_total_time=$(FUZZ_SECS) || exit 1; done
+	for d in $(FUZZ_DIRS); do \
+		for t in $$(cargo +nightly fuzz list --fuzz-dir $$d); do \
+			cargo +nightly fuzz run --fuzz-dir $$d $$t -- -max_total_time=$(FUZZ_SECS) || exit 1; \
+		done; \
+	done
 
 # ThreadSanitizer over the concurrency-heavy tests. Needs nightly with
 # rust-src; set TSAN_TARGET to the host triple.

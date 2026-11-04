@@ -1,6 +1,6 @@
 #![no_main]
 
-use cachet::cache_control::{CacheControl, DELTA_SECONDS_MAX};
+use edgefront_cache::cache_control::{CacheControl, DELTA_SECONDS_MAX};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

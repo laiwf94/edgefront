@@ -147,7 +147,7 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 
 ## Checking a change
 
-`make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests with at least 90% line coverage through cargo-llvm-cov. `make audit` runs cargo deny and cargo audit, `make fuzz` runs the six cargo-fuzz targets (nightly), and `make tsan` runs the concurrency tests under ThreadSanitizer (nightly with rust-src). CI runs all of these, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
+`make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests with at least 90% line coverage through cargo-llvm-cov. `make audit` runs cargo deny and cargo audit, `make fuzz` runs every cargo-fuzz target in `crates/edgefront-cache/fuzz` and `crates/edgefront-core/fuzz` (nightly; CI gives each target 10 minutes), and `make tsan` runs the concurrency tests under ThreadSanitizer (nightly with rust-src). CI runs all of these, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
 
 While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus two comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary.
 

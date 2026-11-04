@@ -1,7 +1,7 @@
 #![no_main]
 
-use cachet::cluster::{PurgeMessage, sign, verify};
-use cachet::purge::parse_request;
+use edgefront_cache::cluster::{PurgeMessage, sign, verify};
+use edgefront_cache::purge::parse_request;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -1,6 +1,6 @@
 #![no_main]
 
-use cachet::store::codec::{MAGIC, decode, decode_header, encode};
+use edgefront_cache::store::codec::{MAGIC, decode, decode_header, encode};
 use libfuzzer_sys::fuzz_target;
 use sha2::{Digest, Sha256};
 

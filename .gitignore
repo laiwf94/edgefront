@@ -1,8 +1,8 @@
 /target
-/fuzz/target
-/fuzz/corpus/*/*
-!/fuzz/corpus/*/seed-*
-/fuzz/artifacts
-/fuzz/coverage
+/crates/*/fuzz/target
+/crates/*/fuzz/corpus/*/*
+!/crates/*/fuzz/corpus/*/seed-*
+/crates/*/fuzz/artifacts
+/crates/*/fuzz/coverage
 *.profraw
 lcov.info

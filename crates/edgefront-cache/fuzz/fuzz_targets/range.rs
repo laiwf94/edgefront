@@ -1,6 +1,6 @@
 #![no_main]
 
-use cachet::range::{ByteRange, parse};
+use edgefront_cache::range::{ByteRange, parse};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: (u16, &[u8])| {

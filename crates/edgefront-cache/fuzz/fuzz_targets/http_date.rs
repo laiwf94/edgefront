@@ -1,6 +1,6 @@
 #![no_main]
 
-use cachet::headers::{http_date, parse_http_date};
+use edgefront_cache::headers::{http_date, parse_http_date};
 use http::HeaderValue;
 use libfuzzer_sys::fuzz_target;
 

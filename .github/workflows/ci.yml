@@ -23,7 +23,8 @@ jobs:
         with:
           workspaces: |
             .
-            fuzz
+            crates/edgefront-cache/fuzz
+            crates/edgefront-core/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
@@ -56,11 +57,28 @@ jobs:
           tool: cargo-audit
       - name: Audit
         run: cargo audit
-      - name: Audit the fuzz crate
-        run: cargo audit --file fuzz/Cargo.lock
+      - name: Audit the fuzz crates
+        run: |
+          cargo audit --file crates/edgefront-cache/fuzz/Cargo.lock
+          cargo audit --file crates/edgefront-core/fuzz/Cargo.lock
 
   fuzz:
+    name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { crate: edgefront-cache, target: cache_control }
+          - { crate: edgefront-cache, target: entity_tags }
+          - { crate: edgefront-cache, target: range }
+          - { crate: edgefront-cache, target: http_date }
+          - { crate: edgefront-cache, target: disk_record }
+          - { crate: edgefront-cache, target: purge_messages }
+          - { crate: edgefront-core, target: request_id }
+          - { crate: edgefront-core, target: base_url }
+          - { crate: edgefront-core, target: bearer_token }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -69,11 +87,18 @@ jobs:
           tool: cargo-fuzz
       # The prebuilt cargo-fuzz is a musl binary and defaults to its own
       # target, where the sanitizers cannot link; name the gnu target.
-      - name: Fuzz each target for 30 seconds
-        run: |
-          for target in cache_control entity_tags range http_date disk_record purge_messages; do
-            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=30
-          done
+      - name: Fuzz for 10 minutes
+        run: >
+          cargo fuzz run --fuzz-dir crates/${{ matrix.crate }}/fuzz
+          ${{ matrix.target }} --target x86_64-unknown-linux-gnu
+          -- -max_total_time=600
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.crate }}-${{ matrix.target }}
+          path: crates/${{ matrix.crate }}/fuzz/artifacts/
+          if-no-files-found: ignore
 
   thread-sanitizer:
     runs-on: ubuntu-latest
