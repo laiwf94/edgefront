@@ -63,6 +63,20 @@ pub fn parse_base_url(url: &str) -> Result<Authority, String> {
     if authority.as_str().contains('@') {
         return Err(format!("{url:?} must not contain credentials"));
     }
+    // The http crate leaves the host and port unchecked, and a client
+    // connector falls back to port 80 when the port is not a number.
+    if authority.host().is_empty() {
+        return Err(format!("{url:?} has no host"));
+    }
+    let valid_port = match authority.as_str()[authority.host().len()..].strip_prefix(':') {
+        None => true,
+        Some(port) => {
+            port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p != 0)
+        }
+    };
+    if !valid_port {
+        return Err(format!("{url:?} has an invalid port"));
+    }
     Ok(authority)
 }
 
@@ -106,6 +120,12 @@ mod tests {
         assert_eq!(parse_base_url("http://a:1").unwrap().as_str(), "a:1");
         assert_eq!(parse_base_url("http://a:1/").unwrap().as_str(), "a:1");
         assert_eq!(parse_base_url("http://a").unwrap().as_str(), "a");
+        assert_eq!(
+            parse_base_url("http://a:65535").unwrap().port_u16(),
+            Some(65535)
+        );
+        assert_eq!(parse_base_url("http://[::1]:80").unwrap().host(), "[::1]");
+        assert_eq!(parse_base_url("http://[::1]").unwrap().port_u16(), None);
         let cases = [
             ("https://a", "must use http://"),
             ("http://a/path", "must not have a path"),
@@ -114,6 +134,14 @@ mod tests {
             ("/path", "must use http://"),
             ("http://u:p@a", "must not contain credentials"),
             ("ht tp://", "is not a URL"),
+            ("http://:80", "has no host"),
+            ("http://:11NNNNbttpNNN80", "has no host"),
+            ("http://a:", "has an invalid port"),
+            ("http://a:8o8o", "has an invalid port"),
+            ("http://a:+80", "has an invalid port"),
+            ("http://a:0", "has an invalid port"),
+            ("http://a:65536", "has an invalid port"),
+            ("http://[::1]:x", "has an invalid port"),
         ];
         for (bad, want) in cases {
             let err = parse_base_url(bad).unwrap_err();
