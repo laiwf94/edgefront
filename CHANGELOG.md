@@ -6,6 +6,7 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ### Proxy
 
+- `edgefront_core::clock`, ported from steer's `internal/clock`: a `Clock` trait over monotonic time and one-shot timers, `MonotonicClock` on tokio's timer, and `ManualClock`, which moves only when advanced and then fires due timers earliest deadline first, ties in the order they were made. Balancing, health checks and outlier detection take it so tests and the difftest can drive time. (#80)
 - `edgefront proxy --config <file>` runs the HTTP/1.1 proxy ported from steer, from steer's configuration file unchanged (JSON, or the same schema in TOML). `--check-config` validates a file. The request path matches steer:
   - Go's server checks and steer's JSON errors.
   - Routing on the cleaned path.

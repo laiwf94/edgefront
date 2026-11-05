@@ -6,6 +6,8 @@
 //! - [`config`]: the proxy configuration (steer's schema, in JSON or
 //!   TOML), and in [`config::loader`] the TOML loading, validation and
 //!   environment secrets the cache's config builds on;
+//! - [`clock`]: monotonic time and timers behind a trait, with a manual
+//!   clock for deterministic tests;
 //! - [`ids`]: request identifiers;
 //! - [`listener`] and [`http1`]: the HTTP/1.1 listener with its connection
 //!   limits and graceful drain, and the pooled HTTP/1.1 client;
@@ -18,6 +20,7 @@
 
 pub mod admin;
 pub mod body;
+pub mod clock;
 pub mod config;
 pub mod http1;
 pub mod ids;
