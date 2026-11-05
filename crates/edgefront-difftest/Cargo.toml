@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 edgefront-core.workspace = true
 edgefront-limiter.workspace = true
-edgefront-proxy = { path = "../edgefront-proxy", version = "0.1.0" }
+edgefront-proxy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

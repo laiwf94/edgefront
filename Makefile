@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan difftest difftest-pacer e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-pacer e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -19,13 +19,22 @@ lint:
 test:
 	cargo test --workspace
 
+# Line coverage, held to the floor for every crate on its own sources and
+# for the workspace as a whole.
+COVERAGE_FLOOR ?= 90
 cov:
-	cargo llvm-cov --workspace --summary-only --fail-under-lines 90
+	scripts/coverage.sh $(COVERAGE_FLOOR)
 
+# The supply-chain gate: cargo deny's policy on the workspace and on each fuzz
+# crate's own lockfile, RustSec on every lockfile, and the direct dependency
+# budget (exact pins, at most DIRECT_DEPS runtime crates).
+DIRECT_DEPS ?= 14
 audit:
 	cargo deny check
+	for d in $(FUZZ_DIRS); do cargo deny --manifest-path $$d/Cargo.toml check || exit 1; done
 	cargo audit
 	for d in $(FUZZ_DIRS); do cargo audit --file $$d/Cargo.lock || exit 1; done
+	scripts/direct-deps.sh $(DIRECT_DEPS)
 
 # Runs every target of every fuzz crate for FUZZ_SECS seconds. Needs a
 # nightly toolchain and cargo-fuzz.
@@ -36,13 +45,32 @@ fuzz:
 		done; \
 	done
 
-# ThreadSanitizer over the concurrency-heavy tests. Needs nightly with
-# rust-src; set TSAN_TARGET to the host triple.
+# ThreadSanitizer, one crate at a time: each crate's unit tests plus the
+# integration tests listed for it below, the ones that run servers, clients
+# and background tasks concurrently. `make tsan` runs every crate in
+# TSAN_CRATES and `make tsan-<crate>` runs one. Needs nightly with rust-src;
+# TSAN_TARGET is the host triple.
 TSAN_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
-tsan:
-	RUSTFLAGS=-Zsanitizer=thread TSAN_OPTIONS=halt_on_error=1:suppressions=$(CURDIR)/tsan-suppressions.txt cargo +nightly test -Zbuild-std \
-		--target $(TSAN_TARGET) --target-dir target/tsan \
-		--lib --test proxy --test revalidation --test failure --test cluster
+TSAN_CARGO ?= cargo +nightly
+TSAN_CRATES := cachet edgefront-cache edgefront-core edgefront-limiter edgefront-proxy edgefront-difftest
+TSAN_TESTS_cachet := proxy revalidation failure cluster
+TSAN_TESTS_edgefront-core := listener admin client
+TSAN_TESTS_edgefront-proxy := server
+
+define tsan_crate
+.PHONY: tsan-$(1)
+tsan-$(1):
+	RUSTFLAGS=-Zsanitizer=thread TSAN_OPTIONS=halt_on_error=1:suppressions=$(CURDIR)/tsan-suppressions.txt \
+		$(TSAN_CARGO) test -Zbuild-std --target $(TSAN_TARGET) --target-dir target/tsan \
+		-p $(1) --lib $(addprefix --test ,$(TSAN_TESTS_$(1)))
+endef
+$(foreach c,$(TSAN_CRATES),$(eval $(call tsan_crate,$(c))))
+
+tsan: $(addprefix tsan-,$(TSAN_CRATES))
+
+# The list CI builds its per-crate ThreadSanitizer matrix from.
+tsan-crates:
+	@echo $(TSAN_CRATES)
 
 # Diff the Rust port against steer: 10,000 generated configs and 100,000
 # generated requests through legacy/steer/cmd/diffdrive and the Rust crates.

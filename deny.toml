@@ -1,4 +1,6 @@
-# cargo-deny policy: run with `cargo deny check`.
+# cargo-deny policy: `make audit` runs `cargo deny check` on the workspace
+# and on each fuzz crate (crates/*/fuzz), which finds this file by walking up
+# from its manifest, so every crate in the repository is held to it.
 
 [graph]
 all-features = false
@@ -15,6 +17,12 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "Unicode-3.0",
 ]
+
+# libfuzzer-sys bundles LLVM's libFuzzer, which is NCSA. Only the fuzz crates
+# depend on it, and they are never built into anything that ships.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]
 
 [bans]
 multiple-versions = "allow"

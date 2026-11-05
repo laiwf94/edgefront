@@ -33,7 +33,7 @@ jobs:
         run: make fmt
       - name: Clippy
         run: make lint
-      - name: Tests with coverage (lines >= 90%)
+      - name: Tests with coverage (lines >= 90% in every crate)
         run: make cov
       - name: Benchmarks compile
         run: cargo bench --workspace --no-run
@@ -51,16 +51,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
+          tool: cargo-deny,cargo-audit
+      # cargo deny on the workspace and each fuzz crate, cargo audit on every
+      # lockfile, and the direct dependency budget.
       - name: Audit
-        run: cargo audit
-      - name: Audit the fuzz crates
-        run: |
-          cargo audit --file crates/edgefront-cache/fuzz/Cargo.lock
-          cargo audit --file crates/edgefront-core/fuzz/Cargo.lock
+        run: make audit
 
   fuzz:
     name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
@@ -100,20 +98,31 @@ jobs:
           path: crates/${{ matrix.crate }}/fuzz/artifacts/
           if-no-files-found: ignore
 
-  thread-sanitizer:
+  # One ThreadSanitizer job per crate, from the Makefile's list.
+  tsan-crates:
     runs-on: ubuntu-latest
+    outputs:
+      crates: ${{ steps.list.outputs.crates }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: echo "crates=$(make -s tsan-crates | jq -Rc 'split(" ")')" >> "$GITHUB_OUTPUT"
+
+  thread-sanitizer:
+    name: thread-sanitizer (${{ matrix.crate }})
+    needs: tsan-crates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: ${{ fromJSON(needs.tsan-crates.outputs.crates) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      - name: Concurrency tests under ThreadSanitizer
-        env:
-          RUSTFLAGS: -Zsanitizer=thread
-          TSAN_OPTIONS: halt_on_error=1:suppressions=${{ github.workspace }}/tsan-suppressions.txt
-        run: >
-          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu
-          --lib --test proxy --test revalidation --test failure --test cluster
+      - name: Unit and concurrency tests under ThreadSanitizer
+        run: make tsan-${{ matrix.crate }} TSAN_CARGO=cargo
 
   demo:
     runs-on: ubuntu-latest

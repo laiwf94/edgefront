@@ -3,6 +3,7 @@ name = "edgefront-cache-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+license = "MIT"
 
 [package.metadata]
 cargo-fuzz = true
@@ -15,6 +16,7 @@ sha2 = "=0.11.0"
 
 [dependencies.edgefront-cache]
 path = ".."
+version = "0.1.0"
 
 # Keep the fuzz crate out of the main workspace: it needs nightly and
 # libFuzzer, and has its own Cargo.lock.
