@@ -6,7 +6,7 @@ A self-hosted application edge in one Rust binary. It brings three projects toge
 |---|---|---|
 | Cache | cachet | An HTTP caching reverse proxy in Rust (this directory) |
 | Proxy | steer | A Go edge proxy and load balancer, under [legacy/steer](legacy/steer), being ported to `edgefront-proxy`; the Rust port already proxies HTTP/1.1 with steer's configuration (see below) |
-| Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer) until its Rust port passes differential tests |
+| Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer), being ported to `edgefront-limiter`; its algorithms are ported and make the same decisions as the C (see below) |
 
 All three keep their full history. The plan for the next year, three tracks in parallel, is in [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap`.
 
@@ -34,6 +34,32 @@ target/release/edgefront proxy --config legacy/steer/examples/steer.json   # lis
 The log is JSON on stdout (`EDGEFRONT_LOG` sets the filter, default `info`), one line per request with steer's fields, and SIGTERM drains in-flight requests before exiting. The request path behaves as steer's did: routing on host and longest prefix after path cleaning, `X-Forwarded-*` rewritten and trusted only from `trusted_proxies`, request IDs accepted or generated and returned, hop-by-hop headers removed both ways, each cluster's `max_requests` and `timeout`, and steer's JSON errors (`no_route`, `overloaded`, `bad_gateway`, `upstream_timeout`, `bad_request`, `method_not_allowed`). `crates/edgefront/tests/e2e_port_http1.rs` holds the binary to a transcript recorded from steer, header values byte for byte, and in CI it also runs steer itself on the same 30 requests.
 
 Still to come from steer: the balancing policies and priority load (week 2; until then each cluster takes turns over its most preferred endpoints), health checks, outlier detection, retries, the admin API and metrics (week 3), and TLS termination, reload and drain (week 4). A configuration with a `tls` block is refused rather than served in plain text.
+
+## Limiter (port of pacer)
+
+`edgefront-limiter` holds libpacer's algorithms, ported to safe Rust with no dependencies:
+
+- `Gcra`: an exact token bucket (the generic cell rate algorithm) whose arrival time is one `AtomicU64` updated by compare-and-swap. `take`, `take_upto`, `take_range`, `refund`, `remaining` and `reconfigure` never lock, and a denied take says exactly how many nanoseconds to wait before it would be admitted.
+- `Table`: a fixed-memory map from keys (an API key, an address) to their own bucket, in power-of-two shards, keyed by SipHash with a random key. When it is full it reclaims idle entries, then denies new keys or evicts the coldest of eight, and it never drops a key that holds a concurrency slot (`hold`/`release`).
+- `Window`: a sliding-window counter of up to 16 buckets, for quotas such as 1,000 requests an hour, that weights the oldest bucket by the part of it still inside the window.
+
+Every call takes the time in nanoseconds from the caller, so the library reads no clock and its answers are exact:
+
+```rust
+use edgefront_limiter::{Rate, Table, TableConfig};
+
+const SEC: u64 = 1_000_000_000;
+// 100 requests a minute per API key, in bursts of up to 10.
+let limits = Table::new(&TableConfig::new(100_000, Rate::new(100, 60 * SEC, 10)))?;
+let d = limits.take(b"alice", now_ns, 1)?;
+if !d.allowed {
+    // d.retry_after_ns: 600,000,000 right after a full burst.
+}
+```
+
+`edgefront-difftest` holds the port to libpacer through `legacy/pacer/tests/diffdrive.c`, a C driver that reads one operation per line and prints each decision with the full state after it. `make difftest-pacer` diffs 100 generated scripts of 10,000 operations against the Rust crate and prints the seed, step and replay command of the first difference. `crates/edgefront-difftest/tests/e2e_limiter_port.rs` runs one million of those operations in CI on every push, plus a worked example of per-key limits, retry times and an hourly quota that both sides must answer exactly. How the port was checked and where it deliberately differs from the C is in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
+
+Still to come from pacer: its configuration and quotas (week 2), the L4 data path with connection limits and shaping (week 3), and `pacerctl` with the published C-versus-Rust benchmark (week 4), after which `legacy/pacer` is removed.
 
 ## Cache (formerly cachet)
 
@@ -150,6 +176,8 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 `make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests under cargo-llvm-cov, where `scripts/coverage.sh` holds every crate to at least 90% line coverage on its own sources, and the workspace too. `make audit` runs cargo deny on the workspace and on each fuzz crate, cargo audit on every lockfile, and `scripts/direct-deps.sh`, which requires exact pins and allows at most 14 direct runtime dependencies across the workspace. `make fuzz` runs every cargo-fuzz target in `crates/edgefront-cache/fuzz` and `crates/edgefront-core/fuzz` (nightly; CI gives each target 10 minutes). `make tsan` runs each crate's unit tests and its concurrency tests under ThreadSanitizer, one crate at a time (`make tsan-<crate>` for one; nightly with rust-src). `scripts/verify-history.sh` runs `make check` on every commit of the branch and prints each one's lowest crate coverage. CI runs all of these, with one ThreadSanitizer job per crate, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
 
 While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus two comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary.
+
+While `legacy/pacer` exists, its gate runs as well (format, lint, the tests under ASan+UBSan and TSan with coverage, short fuzzing, its demo and its image), and the pacer differential test needs only a C compiler: `make test` already runs a million operations through it, and `make difftest-pacer` runs ten times more from a clock seed.
 
 ## License
 

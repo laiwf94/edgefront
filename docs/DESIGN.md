@@ -4,7 +4,7 @@ The first two sections cover the workspace and the steer port. The rest are cach
 
 ## The workspace
 
-edgefront is one Cargo workspace. Every crate lives under `crates/` and takes its version, edition, lints and dependency pins from the root `Cargo.toml`, and the whole workspace shares one `Cargo.lock`. `crates/edgefront` is the binary. `edgefront-core` holds what every product needs: the HTTP/1.1 listener with steer's connection limits and graceful drain, the pooled client, steer's config schema, metrics and admin plumbing. `edgefront-proxy` is steer's routing and request path, `edgefront-cache` is cachet's engine, `edgefront-limiter` is pacer's algorithms, and `edgefront-difftest` diffs the ports against the legacy programs. The root package is cachet as it was before the split, kept until its sources have all moved into the member crates. `legacy/steer` (Go) and `legacy/pacer` (C) keep building and testing in CI, with their full history, until their ports pass their differential suites. Each is then deleted, and its history stays reachable through the merge commit.
+edgefront is one Cargo workspace. Every crate lives under `crates/` and takes its version, edition, lints and dependency pins from the root `Cargo.toml`, and the whole workspace shares one `Cargo.lock`. `crates/edgefront` is the binary. `edgefront-core` holds what every product needs: the HTTP/1.1 listener with steer's connection limits and graceful drain, the pooled client, steer's config schema, metrics and admin plumbing. `edgefront-proxy` is steer's routing and request path, `edgefront-cache` is cachet's engine, `edgefront-limiter` is pacer's rate limiting algorithms, and `edgefront-difftest` diffs the ports against the legacy programs. The root package is cachet as it was before the split, kept until its sources have all moved into the member crates. `legacy/steer` (Go) and `legacy/pacer` (C) keep building and testing in CI, with their full history, until their ports pass their differential suites. Each is then deleted, and its history stays reachable through the merge commit.
 
 ## Porting steer: the request path and the differential tests
 
@@ -27,6 +27,28 @@ Three layers check the port:
 - **`crates/edgefront/tests/e2e_port_http1.rs`** starts the binary with `legacy/steer/examples/steer.json` and three recording fake upstreams. It sends 30 raw requests: the README's traffic, path cleaning, spoofed forwarding headers, request IDs, hop-by-hop headers both ways, body framing, upstream errors and the requests Go refuses. It then compares the response and the upstream's view of each request with a transcript recorded from steer. `make e2e-steer`, also in CI, runs steer live on the same cases and requires it to still produce that transcript.
 
 Until the balancer port lands, each cluster takes turns over its endpoints of the most preferred priority. The end-to-end transcript only records which priority level answered, so it holds when steer's `least_loaded` picks either primary.
+
+## Porting pacer: the limiter algorithms
+
+`edgefront-limiter` is libpacer's `gcra.c`, `gcra_math.h`, `siphash.c`, `table.c` and `window.c` in safe Rust, with no dependencies. The port keeps the C's arithmetic and memory layout, not only its behaviour, so that a table holding the same keys holds them in the same slots and evicts the same ones.
+
+- **GCRA.** A limiter's changing state is its theoretical arrival time (TAT), one `AtomicU64` in ticks of 1/64 ns, so high byte rates keep their fractional intervals; the interval and tolerance sit in two more words that only `reconfigure` writes. A decision is a pure function from the TAT, the interval, the tolerance (burst times interval) and the time to a new TAT and a `Decision` (allowed, granted, remaining, retry-after in nanoseconds, rounded up). `Gcra` applies it with a relaxed compare-and-swap loop, and `Table` applies the same function under its shard lock. Times past 2^57 ns, about four and a half years of uptime, are clamped. `reconfigure` changes the rate while takes race with it and keeps debt as time: a client that had to wait 2 s still waits 2 s. A take at the same moment may mix the old interval with the new tolerance, and is then bounded by the larger of the two rates.
+- **Keyed table.** All memory is allocated in `Table::new`: power-of-two shards picked by the top hash bits, each a 64-byte-aligned mutex over a linear-probing array kept at most three quarters full, 64-byte entries and an intrusive LRU list. Deletion shifts the probe chain back instead of leaving tombstones. When a shard is full it first reclaims an idle entry (one whose bucket has refilled and that holds nothing), then denies the new key or evicts the coldest of the eight least recent entries that hold nothing. Keys are hashed with SipHash-1-3 under a random key by default; SipHash-2-4, libpacer's choice, is kept so the differential tests can place keys exactly as the C does.
+- **Window.** A fixed 168-byte value owned by one connection: up to 16 buckets plus the bucket being filled, with the oldest bucket weighted by the part of it still inside the window. Times that go backwards count at the newest time seen, and a jump of a whole window clears it.
+
+Two inputs make the C wrong, and the Rust refuses them rather than copying the bug:
+
+- `pacer_rate_ticks` multiplied interval by burst in wrapping 128-bit arithmetic, so a rate such as one token per 2^60 ns with a burst of 2^62 wrapped to a tolerance of 0 and the next take divided by zero. `Rate::ticks` returns `InvalidRate` on any overflow.
+- `window.c` tested `now < head_start + slot_ns`, which wraps near the top of the clock. The Rust compares the difference, which agrees whenever the C does not wrap.
+
+The generator keeps clear of both (`wraps_in_c`, and a clock at or below 2^60), and everything else is compared exactly. Four layers check the port:
+
+- **Unit tests** port every case of `test_gcra.c`, `test_table.c`, `test_siphash.c` and `test_window.c`, plus threaded tests that also run under ThreadSanitizer.
+- **`tests/model_gcra.rs`** holds `Gcra` to a token bucket kept as an exact reduced rational, through seeded scripts and a proptest tape that shrinks to a minimal failing script. A failure prints the seed and a replay command.
+- **`legacy/pacer/tests/diffdrive.c`** reads one operation per line (clock, `gcra`, `table` and `window` operations) and prints the decision and the full state after it: TAT, interval and tolerance, table stats and invariant checks, window start and total. `edgefront-difftest` answers the same protocol from the Rust crate, byte for byte, and generates scripts that mix four limiters, three tables and three windows under one clock that jumps, goes backwards and passes the clamp. Each script ends by dumping every live object. The first differing line is reported with its seed, its step, the eight steps before it and a replay command.
+- **`crates/edgefront-difftest/tests/e2e_limiter_port.rs`** drives the `edgefront-difftest` binary: one million generated operations against the C driver on every push, a divergence that must replay from the command it prints, and a worked example (per-key limits with exact retry times, then an hourly window quota) whose answers are written out in the test.
+
+`legacy/pacer` stays until its L4 data path and `pacerctl` are ported too (week 4).
 
 ## What cachet is for
 
