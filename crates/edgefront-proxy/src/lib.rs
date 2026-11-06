@@ -6,6 +6,7 @@
 //! Each port keeps steer's behaviour exactly, so that `edgefront-difftest`
 //! can diff every decision against the Go original before steer is deleted.
 
+pub mod balancer;
 pub mod forwarded;
 pub mod path;
 pub mod reqid;
