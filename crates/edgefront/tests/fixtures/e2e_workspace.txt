@@ -1,0 +1,33 @@
+== 1. A miss is fetched and stored; the next request is a hit
+edge-a GET /static/demo -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; ttl=300 | body: "static /static/demo\n"
+edge-a GET /static/demo -> 200 | cache-status: edge-a; hit; ttl=300 | body: "static /static/demo\n"
+origin requests for /static/demo: 1
+
+== 2. A stale object is revalidated with its entity tag
+edge-a GET /versioned -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; ttl=-8 | body: "version 0\n"
+edge-a GET /versioned -> 200 | cache-status: edge-a; fwd=stale; fwd-status=304; stored; ttl=-8 | body: "version 0\n"
+origin changed /versioned
+edge-a GET /versioned -> 200 | cache-status: edge-a; fwd=stale; fwd-status=200; stored; ttl=-8 | body: "version 1\n"
+origin requests for /versioned: 3
+
+== 3. 50 concurrent requests for a cold URL make one origin request
+49 x edge-a GET /slow -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; collapsed; ttl=60 | body: "slow but shared\n"
+1 x edge-a GET /slow -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; ttl=60 | body: "slow but shared\n"
+origin requests for /slow: 1
+
+== 4. With the origin down, a stale object is served (stale-if-error)
+edge-a GET /news -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; ttl=-8 | body: "headlines, edition 1\n"
+origin stopped
+edge-a GET /news -> 200 | cache-status: edge-a; hit; ttl=-8; fwd=stale; detail-origin=connect; detail=stale-if-error | body: "headlines, edition 1\n"
+edge-a GET /static/never-cached -> 502 | cache-status: edge-a; fwd=miss; detail=connect | body: "origin unreachable\n"
+origin restarted
+
+== 5. A purge on edge-a reaches edge-b
+edge-a GET /static/tagged -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; ttl=300 | body: "static /static/tagged\n"
+edge-b GET /static/tagged -> 200 | cache-status: edge-b; fwd=miss; fwd-status=200; stored; ttl=300 | body: "static /static/tagged\n"
+edge-b GET /static/tagged -> 200 | cache-status: edge-b; hit; ttl=300 | body: "static /static/tagged\n"
+edge-a POST /purge {"tags": ["static"]} -> 200 | "removed":2,"targets":1}
+edge-b applied the purge
+edge-a GET /static/tagged -> 200 | cache-status: edge-a; fwd=miss; fwd-status=200; stored; ttl=300 | body: "static /static/tagged\n"
+edge-b GET /static/tagged -> 200 | cache-status: edge-b; fwd=miss; fwd-status=200; stored; ttl=300 | body: "static /static/tagged\n"
+origin requests for /static/tagged: 4

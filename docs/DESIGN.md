@@ -6,6 +6,22 @@ The first two sections cover the workspace and the steer port. The rest are cach
 
 edgefront is one Cargo workspace. Every crate lives under `crates/` and takes its version, edition, lints and dependency pins from the root `Cargo.toml`, and the whole workspace shares one `Cargo.lock`. `crates/edgefront` is the binary. `edgefront-core` holds what every product needs: the HTTP/1.1 listener with steer's connection limits and graceful drain, the pooled client, steer's config schema, metrics and admin plumbing. `edgefront-proxy` is steer's routing and request path, `edgefront-cache` is cachet's engine, `edgefront-limiter` is pacer's rate limiting algorithms, and `edgefront-difftest` diffs the ports against the legacy programs. The root package is cachet as it was before the split, kept until its sources have all moved into the member crates. `legacy/steer` (Go) and `legacy/pacer` (C) keep building and testing in CI, with their full history, until their ports pass their differential suites. Each is then deleted, and its history stays reachable through the merge commit.
 
+### Crate map
+
+Each crate and the workspace crates it depends on. There are no cycles: `edgefront-cache` reaches its node through the `cluster::PurgeHost` trait rather than depending on cachet, and `edgefront-limiter` depends on nothing at all.
+
+| Crate | Holds | Workspace dependencies |
+|---|---|---|
+| `crates/edgefront` | The binary: cachet's command line (`--config`, `--check-config`, `--version`, the `CACHET_*` variables, exit codes and JSON log) and `edgefront proxy` | cachet, edgefront-core, edgefront-proxy |
+| `.` (`cachet`) | The node runtime still to move: the cache's request path (`proxy`), origins and health checks (`origin`), node start-up (`node`), metric families and the admin routes; and the reference `cachet` binary | edgefront-cache, edgefront-core |
+| `crates/edgefront-cache` | Caching policy, Cache-Control and range parsing, objects, request collapsing, purge, cluster gossip, the memory and disk stores, and the cache's config sections | edgefront-core |
+| `crates/edgefront-core` | The accept loop and HTTP/1.1 listener, the pooled client, the clock, request ids, config loading and steer's schema, metrics writers and the admin router | none |
+| `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request ids and the request path ported from steer | edgefront-core |
+| `crates/edgefront-limiter` | pacer's GCRA, keyed table and sliding window | none |
+| `crates/edgefront-difftest` | Differential drivers against `legacy/steer` and `legacy/pacer` | edgefront-core, edgefront-proxy, edgefront-limiter |
+
+Two tests hold the edgefront binary to cachet's behaviour while both exist. `crates/edgefront/tests/golden.rs` compares the command line's transcripts (usage, config checks, a served request, a purge, shutdown and start failure, log lines included) with `tests/golden/`. `crates/edgefront/tests/e2e_workspace.rs` runs `examples/demo.sh`'s five steps against two edgefront nodes and an origin served by the test, and compares every response's status, `Cache-Status` and body with `tests/fixtures/e2e_workspace.txt` byte for byte. The origin sends no `Date` header and makes objects stale on arrival with `Age`, so no value in the transcript depends on timing and nothing is blanked. The root package's `tests/golden_cli.rs` and `tests/e2e_workspace.rs` run the reference cachet binary against the same files, and CI runs the demo script against both binaries.
+
 ## Porting steer: the request path and the differential tests
 
 The port keeps steer's behaviour exactly, byte for byte where bytes are visible, so every decision can be diffed against the Go code before the Go code goes. That means porting the parts of Go's standard library steer leaned on, not only steer's own code. The config reader follows `encoding/json`'s rules (case-insensitive keys, duplicate keys merging, invalid UTF-8 becoming U+FFFD). Durations, addresses, `strconv.Quote` and `path.Clean` follow Go. Request targets are decoded and re-encoded with `net/url`'s rules, and Go's server checks (`Host` validity, `OPTIONS *`, `CONNECT`) come first.

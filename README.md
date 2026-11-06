@@ -4,7 +4,7 @@ A self-hosted application edge in one Rust binary. It brings three projects toge
 
 | Part | Started as | Today |
 |---|---|---|
-| Cache | cachet | An HTTP caching reverse proxy in Rust (this directory) |
+| Cache | cachet | An HTTP caching reverse proxy in Rust, split into `edgefront-cache` and the root package and served by the `edgefront` binary |
 | Proxy | steer | A Go edge proxy and load balancer, under [legacy/steer](legacy/steer), being ported to `edgefront-proxy`; the Rust port already proxies HTTP/1.1 with steer's configuration (see below) |
 | Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer), being ported to `edgefront-limiter`; its algorithms are ported and make the same decisions as the C (see below) |
 
@@ -14,12 +14,15 @@ All three keep their full history. The plan for the next year, three tracks in p
 
 | Crate | What it holds |
 |---|---|
-| `crates/edgefront` | The `edgefront` binary |
+| `crates/edgefront` | The `edgefront` binary: the cache node (cachet's command line, unchanged) and `edgefront proxy` |
 | `crates/edgefront-core` | The listener, pooled HTTP/1.1 client, steer's config schema, metrics and admin plumbing |
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request IDs and the HTTP/1.1 request path ported from steer |
 | `crates/edgefront-cache` | cachet's caching policy, storage and purge |
 | `crates/edgefront-limiter` | pacer's rate limiting algorithms |
 | `crates/edgefront-difftest` | Differential tests against `legacy/steer` and `legacy/pacer` |
+| `.` (`cachet`) | The cache node's runtime still to move into the crates, and the reference `cachet` binary |
+
+Which crate depends on which is in [docs/DESIGN.md](docs/DESIGN.md#crate-map).
 
 ## Proxy (port of steer)
 
@@ -72,16 +75,19 @@ It is a single binary: an S3-FIFO memory cache with a byte budget, an optional c
 You need Rust 1.88 or newer.
 
 ```sh
-cargo build --release --bin cachet --example origin
+cargo build --release -p edgefront --bin edgefront
+cargo build --release -p cachet --example origin
 
 # A small origin with cacheable routes, on 127.0.0.1:9100.
 target/release/examples/origin 127.0.0.1:9100 &
 
-# cachet on :8080, admin API on 127.0.0.1:9090.
-CACHET_ADMIN_TOKEN=change-me target/release/cachet --config examples/cachet.toml
+# The cache on :8080, admin API on 127.0.0.1:9090.
+CACHET_ADMIN_TOKEN=change-me target/release/edgefront --config examples/cachet.toml
 ```
 
-`examples/cachet.toml` lists every setting with its default. Secrets are read only from the environment: `CACHET_ADMIN_TOKEN` enables `POST /purge`, and `CACHET_CLUSTER_SECRET` (at least 32 bytes) signs purges between peers. `cachet --check-config <file>` validates a config without starting.
+The `edgefront` binary takes cachet's flags, environment variables and config file unchanged and prints the same responses and log lines. The `cachet` binary (`--bin cachet`) still builds as the reference it is checked against.
+
+`examples/cachet.toml` lists every setting with its default. Secrets are read only from the environment: `CACHET_ADMIN_TOKEN` enables `POST /purge`, and `CACHET_CLUSTER_SECRET` (at least 32 bytes) signs purges between peers. `edgefront --check-config <file>` validates a config without starting.
 
 To run two nodes and the origin in containers:
 
@@ -111,7 +117,7 @@ $ curl -s -X POST -H "authorization: Bearer change-me" \
 
 The admin listener also serves `/healthz` and `/metrics`.
 
-`examples/demo.sh` runs the release binary as two nodes in front of the example origin and checks each behaviour as it goes: a stored miss and a hit, a 304 revalidation, 50 concurrent clients making one origin request, a stale copy served while the origin is stopped, and a purge on one node reaching the other. Part of a run:
+`examples/demo.sh` runs the release `edgefront` binary (`DEMO_BIN=cachet` for the reference binary) as two nodes in front of the example origin and checks each behaviour as it goes: a stored miss and a hit, a 304 revalidation, 50 concurrent clients making one origin request, a stale copy served while the origin is stopped, and a purge on one node reaching the other. `crates/edgefront/tests/e2e_workspace.rs` runs the same five steps as a test and checks every `Cache-Status` byte for byte. Part of a run:
 
 ```
 == 3. 50 concurrent requests for a cold URL make one origin request

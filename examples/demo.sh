@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# A live run of the release binary: two cachet nodes in front of the
+# A live run of the release binary: two cache nodes in front of the
 # example origin. Each step prints what happened and fails the script if
 # the cache did not behave as described.
+#
+# DEMO_BIN picks the binary: edgefront (the default) or the reference
+# cachet binary it replaces. Both must pass every step unchanged;
+# crates/edgefront/tests/e2e_workspace.rs runs the same steps as a test.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+DEMO_BIN=${DEMO_BIN:-edgefront}
+case $DEMO_BIN in
+edgefront) BUILD=(-p edgefront --bin edgefront) ;;
+cachet) BUILD=(-p cachet --bin cachet) ;;
+*) echo "DEMO_BIN must be edgefront or cachet, not $DEMO_BIN" >&2; exit 2 ;;
+esac
 ORIGIN=127.0.0.1:9200
 A=127.0.0.1:8201 A_ADMIN=127.0.0.1:9201
 B=127.0.0.1:8202 B_ADMIN=127.0.0.1:9202
@@ -69,16 +79,17 @@ interval_ms = 500
 name = "$peer"
 url = "http://$peer_admin"
 TOML
-    target/release/cachet --config "$WORK/$name.toml" &
+    "target/release/$DEMO_BIN" --config "$WORK/$name.toml" &
     PIDS+=($!)
     wait_for "http://$admin/healthz"
 }
 
-cargo build --release --quiet --bin cachet --example origin
+cargo build --release --quiet "${BUILD[@]}"
+cargo build --release --quiet -p cachet --example origin
 start_origin
 node edge-a "$A" "$A_ADMIN" edge-b "$B_ADMIN"
 node edge-b "$B" "$B_ADMIN" edge-a "$A_ADMIN"
-echo "origin on $ORIGIN, edge-a on $A (admin $A_ADMIN), edge-b on $B (admin $B_ADMIN)"
+echo "$DEMO_BIN: origin on $ORIGIN, edge-a on $A (admin $A_ADMIN), edge-b on $B (admin $B_ADMIN)"
 
 step "1. A miss is fetched and stored; the next request is a hit"
 get "$A" /static/demo

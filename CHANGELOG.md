@@ -4,6 +4,18 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ## Unreleased
 
+### Cache
+
+- cachet is split into the edgefront workspace with no change a client can see (#78):
+  - `edgefront-core` holds the accept loop, config loading (`config::loader`), the metrics writers, the admin router with bearer tokens, request ids and the response body type.
+  - `edgefront-cache` holds the caching policy, Cache-Control and range parsing, objects, request collapsing, purge, cluster gossip (through a `PurgeHost` trait, so the crate never depends on cachet), the memory and disk stores, and the cache's config sections.
+  - `crates/edgefront` is the binary. It takes cachet's flags, `CACHET_*` variables, exit codes and config file unchanged, and logs the same JSON lines under the same targets.
+  - The root package keeps the node runtime still to move and the reference `cachet` binary.
+- `crates/edgefront/tests/golden.rs` and `tests/golden_cli.rs` hold both binaries to the same command-line transcripts, log lines included. (#78)
+- `crates/edgefront/tests/e2e_workspace.rs` runs the demo's five steps against two edgefront nodes and compares every status, `Cache-Status` and body with a fixture byte for byte; `tests/e2e_workspace.rs` runs the cachet binary against the same fixture. `examples/demo.sh` runs the edgefront binary by default and the reference one with `DEMO_BIN=cachet`, and CI runs both. (#78)
+- The fuzz targets live in `crates/edgefront-cache/fuzz` and `crates/edgefront-core/fuzz`, and CI fuzzes each of the nine for 10 minutes. The three new core targets (`request_id`, `base_url`, `bearer_token`) found that `http://:80` and `http://origin:8o8o` were accepted as origin URLs; both are now rejected. (#78, #240)
+- `make cov` holds every crate to 90% line coverage on its own sources, `make tsan` runs ThreadSanitizer one crate at a time (one CI job each), and `make audit` runs cargo deny on every manifest, cargo audit on every lockfile and a budget of 14 exactly pinned direct dependencies. (#78)
+
 ### Proxy
 
 - `edgefront_core::clock`, ported from steer's `internal/clock`: a `Clock` trait over monotonic time and one-shot timers, `MonotonicClock` on tokio's timer, and `ManualClock`, which moves only when advanced and then fires due timers earliest deadline first, ties in the order they were made. Balancing, health checks and outlier detection take it so tests and the difftest can drive time. (#80)
