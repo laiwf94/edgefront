@@ -114,9 +114,13 @@ pub struct EntryState {
     pub holds: u32,
 }
 
-/// One key's state. 64 bytes, so an entry never straddles two cache lines
-/// when the slot array starts on one.
+/// One key's state: 64 bytes and aligned to 64, so every entry sits on one
+/// cache line and a probe or an LRU update touches one line per entry.
+/// libpacer's slot array came from `calloc`, which for a large table
+/// returns memory 16 bytes into a line, so three entries in four straddled
+/// two lines.
 #[derive(Clone, Copy)]
+#[repr(align(64))]
 struct Entry {
     hash: u64,
     tat: u64,
@@ -129,7 +133,7 @@ struct Entry {
     key: [u8; KEY_MAX],
 }
 
-const _: () = assert!(std::mem::size_of::<Entry>() == 64);
+const _: () = assert!(std::mem::size_of::<Entry>() == 64 && std::mem::align_of::<Entry>() == 64);
 
 impl Entry {
     const EMPTY: Entry = Entry {

@@ -87,6 +87,36 @@ impl State {
     }
 }
 
+/// The 0 to 7 bytes after the last whole block as a little-endian word,
+/// zero padded.
+///
+/// Built from at most three loads in registers rather than by copying the
+/// bytes into a zeroed buffer and loading it back as one word: that load
+/// spans several narrower stores, which the processor cannot forward, and
+/// the stall it costs was the largest single gap between the keyed table
+/// and libpacer's (whose byte-at-a-time load does not stall).
+#[inline(always)]
+fn tail_le(rest: &[u8]) -> u64 {
+    let n = rest.len();
+    debug_assert!(n < 8);
+    let mut word = 0u64;
+    let mut at = 0;
+    if n >= 4 {
+        let (four, _) = rest.as_chunks::<4>();
+        word = u64::from(u32::from_le_bytes(four[0]));
+        at = 4;
+    }
+    if n - at >= 2 {
+        let (two, _) = rest[at..].as_chunks::<2>();
+        word |= u64::from(u16::from_le_bytes(two[0])) << (8 * at);
+        at += 2;
+    }
+    if at < n {
+        word |= u64::from(rest[at]) << (8 * at);
+    }
+    word
+}
+
 /// SipHash-c-d of `data` under `key`.
 #[inline(always)]
 fn siphash<const C: usize, const D: usize>(key: &[u8; KEY_LEN], data: &[u8]) -> u64 {
@@ -97,10 +127,7 @@ fn siphash<const C: usize, const D: usize>(key: &[u8; KEY_LEN], data: &[u8]) -> 
     }
     // Last block: the remaining bytes, zero padding, and the length's low
     // byte in the top position.
-    let mut tail = [0u8; 8];
-    tail[..rest.len()].copy_from_slice(rest);
-    tail[7] = data.len() as u8;
-    s.compress::<C>(u64::from_le_bytes(tail));
+    s.compress::<C>(tail_le(rest) | (data.len() as u64) << 56);
     s.v2 ^= 0xff;
     for _ in 0..D {
         s.round();
@@ -319,6 +346,18 @@ mod tests {
             let mut h24 = std::hash::SipHasher::new();
             h24.write(msg);
             assert_eq!(siphash24(&zero, msg), h24.finish());
+        }
+    }
+
+    #[test]
+    fn tail_word_matches_a_zero_padded_copy() {
+        // Every tail length with bytes that differ per position and have
+        // the top bit set, so a wrong shift or a sign extension shows.
+        let bytes = [0x81u8, 0xf2, 0x93, 0xa4, 0xc5, 0xe6, 0x97];
+        for n in 0..8 {
+            let mut padded = [0u8; 8];
+            padded[..n].copy_from_slice(&bytes[..n]);
+            assert_eq!(tail_le(&bytes[..n]), u64::from_le_bytes(padded), "n={n}");
         }
     }
 
