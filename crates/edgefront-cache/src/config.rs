@@ -5,13 +5,42 @@
 //! committed and shared. Loading, base URLs and secret handling come from
 //! `edgefront_core::config::loader`; this module holds the cache's own
 //! sections and the checks serde cannot express.
+//!
+//! # Cache settings per route
+//!
+//! The `[cache]` section is also the global block that routes inherit
+//! from. Each `[[cache.routes]]` entry names one proxy route by its `host`
+//! and `path_prefix` and turns the cache on for it, overriding any of the
+//! global `max_object_bytes`, `max_variants`, `heuristic_max_secs` and
+//! `max_ttl_secs`; `enabled = false` keeps a route's block but bypasses the
+//! cache. A route with no entry bypasses the cache. [`CacheConfig::resolve`]
+//! ties the entries to the proxy's routes and gives each route its
+//! effective [`RoutePolicy`], or every problem it found, each with the path
+//! of its field, such as `cache.routes[2].max_variants`.
+//!
+//! ```toml
+//! [cache]
+//! max_ttl_secs = 86400            # inherited by every cached route
+//!
+//! [[cache.routes]]                # cached with the global settings
+//! host = "*"
+//! path_prefix = "/static/"
+//!
+//! [[cache.routes]]                # cached with tighter limits
+//! host = "api.example.com"
+//! path_prefix = "/v1/catalog"
+//! max_object_bytes = 262144
+//! max_ttl_secs = 60
+//! ```
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use edgefront_core::config::loader::{
     self as config, Redacted, Validate, env_secret, parse_base_url,
 };
+use edgefront_core::config::{FieldError, Route, limits};
 use http::uri::PathAndQuery;
 use serde::Deserialize;
 
@@ -93,7 +122,12 @@ pub struct CacheConfig {
     pub shards: usize,
     pub max_variants: usize,
     pub heuristic_max_secs: u64,
+    /// Cap on any stored response's freshness lifetime, inherited by every
+    /// route; `None` leaves the origin's lifetime as it is.
+    pub max_ttl_secs: Option<u64>,
     pub disk: Option<DiskConfig>,
+    /// The routes the cache serves, each with its overrides.
+    pub routes: Vec<RouteCacheConfig>,
 }
 
 impl Default for CacheConfig {
@@ -104,7 +138,218 @@ impl Default for CacheConfig {
             shards: 16,
             max_variants: 8,
             heuristic_max_secs: 86_400,
+            max_ttl_secs: None,
             disk: None,
+            routes: Vec::new(),
+        }
+    }
+}
+
+/// The longest freshness lifetime a route may be given or allowed to keep,
+/// one year: RFC 9111 section 4.2.1 calls longer lifetimes unlikely, and a
+/// cap keeps the arithmetic far from overflow.
+pub const MAX_TTL_SECS: u64 = 365 * 86_400;
+
+/// One `[[cache.routes]]` entry: the cache turned on for the proxy route
+/// with this `host` and `path_prefix`. Every other field is an override of
+/// the global `[cache]` value of the same name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteCacheConfig {
+    pub host: String,
+    pub path_prefix: String,
+    /// `false` keeps the entry but bypasses the cache for the route.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub max_object_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_variants: Option<usize>,
+    #[serde(default)]
+    pub heuristic_max_secs: Option<u64>,
+    #[serde(default)]
+    pub max_ttl_secs: Option<u64>,
+}
+
+/// What the cache does on one route, with the global values filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePolicy {
+    /// The largest response body stored for the route.
+    pub max_object_bytes: u64,
+    /// Stored variants per URL when the origin sends `Vary`.
+    pub max_variants: usize,
+    /// Cap on freshness guessed from `Last-Modified`, already held under
+    /// `max_ttl`.
+    pub heuristic_max: Duration,
+    /// Cap on any stored response's freshness lifetime.
+    pub max_ttl: Option<Duration>,
+}
+
+/// The effective cache policy of every proxy route, in the routes' order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoutePolicies {
+    routes: Vec<Option<RoutePolicy>>,
+}
+
+impl RoutePolicies {
+    /// The policy of route `index`, or `None` when the route bypasses the
+    /// cache (no entry, `enabled = false`, or no such route).
+    pub fn get(&self, index: usize) -> Option<&RoutePolicy> {
+        self.routes.get(index).and_then(Option::as_ref)
+    }
+
+    /// The number of routes, cached or not.
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// How many routes go through the cache.
+    pub fn cached(&self) -> usize {
+        self.routes.iter().filter(|p| p.is_some()).count()
+    }
+}
+
+/// Collects field errors up to [`limits::MAX_ERRORS`], as the proxy's
+/// config validation does.
+#[derive(Default)]
+struct Errors(Vec<FieldError>);
+
+impl Errors {
+    fn push(&mut self, path: impl Into<String>, message: impl Into<String>) {
+        if self.0.len() < limits::MAX_ERRORS {
+            self.0.push(FieldError {
+                path: path.into(),
+                message: message.into(),
+            });
+        }
+    }
+
+    fn range<T: PartialOrd + std::fmt::Display>(&mut self, path: &str, v: T, lo: T, hi: T) {
+        if v < lo || v > hi {
+            self.push(path, format!("must be between {lo} and {hi}, got {v}"));
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Checks the global block's route settings and every
+    /// `[[cache.routes]]` entry on its own, without the proxy's routes:
+    /// value ranges, overrides that exceed what the store holds, and
+    /// entries naming the same route twice.
+    pub fn route_errors(&self) -> Vec<FieldError> {
+        let mut errs = Errors::default();
+        self.check_routes(&mut errs);
+        errs.0
+    }
+
+    fn check_routes(&self, errs: &mut Errors) {
+        if let Some(ttl) = self.max_ttl_secs {
+            errs.range("cache.max_ttl_secs", ttl, 1, MAX_TTL_SECS);
+        }
+        if self.heuristic_max_secs > MAX_TTL_SECS {
+            errs.push(
+                "cache.heuristic_max_secs",
+                format!(
+                    "must be at most {MAX_TTL_SECS}, got {}",
+                    self.heuristic_max_secs
+                ),
+            );
+        }
+        if self.routes.len() > limits::MAX_ROUTES {
+            errs.push(
+                "cache.routes",
+                format!(
+                    "at most {} entries, got {}",
+                    limits::MAX_ROUTES,
+                    self.routes.len()
+                ),
+            );
+        }
+        let mut seen = std::collections::HashMap::new();
+        for (i, r) in self.routes.iter().enumerate() {
+            let at = |field: &str| format!("cache.routes[{i}].{field}");
+            if r.host.is_empty() {
+                errs.push(at("host"), "must not be empty");
+            }
+            if !r.path_prefix.starts_with('/') {
+                errs.push(
+                    at("path_prefix"),
+                    format!("must start with \"/\", got {:?}", r.path_prefix),
+                );
+            }
+            if let Some(v) = r.max_object_bytes {
+                // The store refuses anything larger, whatever the route says.
+                errs.range(&at("max_object_bytes"), v, 1, self.max_object_bytes);
+            }
+            if let Some(v) = r.max_variants {
+                errs.range(&at("max_variants"), v, 1, self.max_variants);
+            }
+            if let Some(v) = r.heuristic_max_secs {
+                errs.range(&at("heuristic_max_secs"), v, 0, MAX_TTL_SECS);
+            }
+            if let Some(v) = r.max_ttl_secs {
+                errs.range(&at("max_ttl_secs"), v, 1, MAX_TTL_SECS);
+            }
+            let key = (r.host.to_ascii_lowercase(), r.path_prefix.as_str());
+            if let Some(first) = seen.insert(key, i) {
+                errs.push(
+                    format!("cache.routes[{i}]"),
+                    format!("names the same route as cache.routes[{first}]"),
+                );
+            }
+        }
+    }
+
+    /// Ties the `[[cache.routes]]` entries to the proxy's `routes` and
+    /// gives each route its effective policy, or every problem found. An
+    /// entry matches the route with the same `path_prefix` and the same
+    /// `host`, compared without case as host names are. An entry that
+    /// matches no route is an error, so a typo cannot silently leave a
+    /// route uncached.
+    pub fn resolve(&self, routes: &[Route]) -> Result<RoutePolicies, Vec<FieldError>> {
+        let mut errs = Errors::default();
+        self.check_routes(&mut errs);
+        let mut policies = vec![None; routes.len()];
+        for (i, entry) in self.routes.iter().enumerate() {
+            let Some(index) = routes.iter().position(|r| {
+                r.host.eq_ignore_ascii_case(&entry.host) && r.path_prefix == entry.path_prefix
+            }) else {
+                errs.push(
+                    format!("cache.routes[{i}]"),
+                    format!(
+                        "no route has host {:?} and path_prefix {:?}",
+                        entry.host, entry.path_prefix
+                    ),
+                );
+                continue;
+            };
+            if entry.enabled.unwrap_or(true) {
+                policies[index] = Some(self.policy(entry));
+            }
+        }
+        if errs.0.is_empty() {
+            Ok(RoutePolicies { routes: policies })
+        } else {
+            Err(errs.0)
+        }
+    }
+
+    fn policy(&self, entry: &RouteCacheConfig) -> RoutePolicy {
+        let max_ttl = entry
+            .max_ttl_secs
+            .or(self.max_ttl_secs)
+            .map(Duration::from_secs);
+        let heuristic =
+            Duration::from_secs(entry.heuristic_max_secs.unwrap_or(self.heuristic_max_secs));
+        RoutePolicy {
+            max_object_bytes: entry.max_object_bytes.unwrap_or(self.max_object_bytes),
+            max_variants: entry.max_variants.unwrap_or(self.max_variants),
+            heuristic_max: max_ttl.map_or(heuristic, |cap| heuristic.min(cap)),
+            max_ttl,
         }
     }
 }
@@ -272,6 +517,9 @@ impl Config {
                 "cache.disk.max_bytes must hold at least one object and queue must be positive"
                     .into(),
             );
+        }
+        if let Some(e) = c.route_errors().first() {
+            return Err(e.to_string());
         }
         let h = &self.health;
         if h.path.parse::<PathAndQuery>().is_err() || !h.path.starts_with('/') {
@@ -488,5 +736,220 @@ mod tests {
             format!("{:?}", Secrets::default()),
             "Secrets { admin_token: None, cluster_secret: None }"
         );
+    }
+
+    fn route(host: &str, path_prefix: &str) -> Route {
+        Route {
+            host: host.into(),
+            path_prefix: path_prefix.into(),
+            cluster: "web".into(),
+        }
+    }
+
+    fn proxy_routes() -> Vec<Route> {
+        vec![
+            route("*", "/static/"),
+            route("api.example.com", "/v1/catalog"),
+            route("api.example.com", "/"),
+            route("*", "/"),
+        ]
+    }
+
+    /// The `[cache]` section of `MINIMAL` plus `extra`, parsed but not
+    /// validated.
+    fn cache_section(extra: &str) -> CacheConfig {
+        toml::from_str::<Config>(&format!("{MINIMAL}\n{extra}"))
+            .unwrap()
+            .cache
+    }
+
+    fn paths(errs: &[FieldError]) -> Vec<String> {
+        errs.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn routes_inherit_the_global_block() {
+        let c = cache_section(
+            r#"
+            [cache]
+            max_object_bytes = 1048576
+            max_variants = 4
+            heuristic_max_secs = 600
+            max_ttl_secs = 3600
+            [[cache.routes]]
+            host = "*"
+            path_prefix = "/static/"
+            [[cache.routes]]
+            host = "API.example.com"
+            path_prefix = "/v1/catalog"
+            max_object_bytes = 262144
+            max_variants = 2
+            heuristic_max_secs = 120
+            max_ttl_secs = 60
+            [[cache.routes]]
+            host = "api.example.com"
+            path_prefix = "/"
+            enabled = false
+            "#,
+        );
+        let p = c.resolve(&proxy_routes()).unwrap();
+        assert_eq!(p.len(), 4);
+        assert!(!p.is_empty());
+        assert_eq!(p.cached(), 2);
+        assert_eq!(
+            p.get(0),
+            Some(&RoutePolicy {
+                max_object_bytes: 1 << 20,
+                max_variants: 4,
+                heuristic_max: Duration::from_secs(600),
+                max_ttl: Some(Duration::from_secs(3600)),
+            })
+        );
+        // The heuristic cap never outlasts the route's own lifetime cap.
+        assert_eq!(
+            p.get(1),
+            Some(&RoutePolicy {
+                max_object_bytes: 262_144,
+                max_variants: 2,
+                heuristic_max: Duration::from_secs(60),
+                max_ttl: Some(Duration::from_secs(60)),
+            })
+        );
+        // Disabled, without an entry, and out of range all bypass.
+        assert_eq!(p.get(2), None);
+        assert_eq!(p.get(3), None);
+        assert_eq!(p.get(4), None);
+    }
+
+    #[test]
+    fn without_entries_every_route_bypasses() {
+        let c = Config::parse(MINIMAL).unwrap().cache;
+        assert!(c.route_errors().is_empty());
+        let p = c.resolve(&proxy_routes()).unwrap();
+        assert_eq!((p.len(), p.cached()), (4, 0));
+        assert!(RoutePolicies::default().is_empty());
+        let none: &[Route] = &[];
+        assert!(c.resolve(none).unwrap().is_empty());
+    }
+
+    #[test]
+    fn defaults_apply_without_a_lifetime_cap() {
+        let c = cache_section("[[cache.routes]]\nhost = \"*\"\npath_prefix = \"/\"");
+        let p = c.resolve(&proxy_routes()).unwrap();
+        assert_eq!(p.cached(), 1);
+        assert_eq!(
+            p.get(3),
+            Some(&RoutePolicy {
+                max_object_bytes: 8 << 20,
+                max_variants: 8,
+                heuristic_max: Duration::from_secs(86_400),
+                max_ttl: None,
+            })
+        );
+    }
+
+    #[test]
+    fn route_errors_name_their_fields() {
+        let mut c = cache_section(
+            r#"
+            [cache]
+            max_ttl_secs = 0
+            [[cache.routes]]
+            host = ""
+            path_prefix = "static"
+            max_object_bytes = 0
+            max_variants = 9
+            heuristic_max_secs = 99999999999
+            max_ttl_secs = 99999999999
+            [[cache.routes]]
+            host = "*"
+            path_prefix = "/static/"
+            max_object_bytes = 8388609
+            [[cache.routes]]
+            host = "*"
+            path_prefix = "/static/"
+            max_ttl_secs = 0
+            [[cache.routes]]
+            host = "nowhere.example"
+            path_prefix = "/"
+            "#,
+        );
+        c.heuristic_max_secs = MAX_TTL_SECS + 1;
+        let want = [
+            "cache.max_ttl_secs: must be between 1 and 31536000, got 0",
+            "cache.heuristic_max_secs: must be at most 31536000, got 31536001",
+            "cache.routes[0].host: must not be empty",
+            "cache.routes[0].path_prefix: must start with \"/\", got \"static\"",
+            "cache.routes[0].max_object_bytes: must be between 1 and 8388608, got 0",
+            "cache.routes[0].max_variants: must be between 1 and 8, got 9",
+            "cache.routes[0].heuristic_max_secs: must be between 0 and 31536000, got 99999999999",
+            "cache.routes[0].max_ttl_secs: must be between 1 and 31536000, got 99999999999",
+            "cache.routes[1].max_object_bytes: must be between 1 and 8388608, got 8388609",
+            "cache.routes[2].max_ttl_secs: must be between 1 and 31536000, got 0",
+            "cache.routes[2]: names the same route as cache.routes[1]",
+        ];
+        assert_eq!(paths(&c.route_errors()), want);
+        let errs = c.resolve(&proxy_routes()).unwrap_err();
+        let mut all = want.map(String::from).to_vec();
+        all.push("cache.routes[0]: no route has host \"\" and path_prefix \"static\"".into());
+        all.push(
+            "cache.routes[3]: no route has host \"nowhere.example\" and path_prefix \"/\"".into(),
+        );
+        assert_eq!(paths(&errs), all);
+    }
+
+    #[test]
+    fn hosts_compare_without_case_and_duplicates_are_refused() {
+        let c = cache_section(
+            "[[cache.routes]]\nhost = \"API.example.com\"\npath_prefix = \"/\"\n\
+             [[cache.routes]]\nhost = \"api.EXAMPLE.com\"\npath_prefix = \"/\"",
+        );
+        assert_eq!(
+            paths(&c.route_errors()),
+            ["cache.routes[1]: names the same route as cache.routes[0]"]
+        );
+        // A path prefix is compared exactly.
+        let c = cache_section("[[cache.routes]]\nhost = \"*\"\npath_prefix = \"/Static/\"");
+        assert_eq!(
+            paths(&c.resolve(&proxy_routes()).unwrap_err()),
+            ["cache.routes[0]: no route has host \"*\" and path_prefix \"/Static/\""]
+        );
+    }
+
+    #[test]
+    fn errors_are_capped_and_entries_are_bounded() {
+        let c = CacheConfig {
+            routes: (0..=limits::MAX_ROUTES)
+                .map(|_| RouteCacheConfig {
+                    host: "*".into(),
+                    path_prefix: "/".into(),
+                    enabled: None,
+                    max_object_bytes: None,
+                    max_variants: None,
+                    heuristic_max_secs: None,
+                    max_ttl_secs: None,
+                })
+                .collect(),
+            ..CacheConfig::default()
+        };
+        let errs = c.route_errors();
+        assert_eq!(errs.len(), limits::MAX_ERRORS);
+        assert_eq!(errs[0].path, "cache.routes");
+        assert_eq!(errs[0].message, "at most 1024 entries, got 1025");
+        assert_eq!(errs[1].path, "cache.routes[1]");
+    }
+
+    #[test]
+    fn the_cachet_validator_reports_the_first_route_error() {
+        let err = with("[[cache.routes]]\nhost = \"*\"\npath_prefix = \"/\"\nmax_variants = 0")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "cache.routes[0].max_variants: must be between 1 and 8, got 0"
+        );
+        let err = with("[[cache.routes]]\nhost = \"*\"\npath_prefix = \"/\"\nttl = 1").unwrap_err();
+        assert!(err.contains("unknown field `ttl`"), "{err}");
+        let err = with("[cache]\nmax_ttl_secs = 0").unwrap_err();
+        assert!(err.starts_with("cache.max_ttl_secs:"), "{err}");
     }
 }

@@ -106,6 +106,12 @@ It is a single binary with no external services. A node keeps its cache in memor
 
 It does not terminate TLS, speak HTTP/2 or HTTP/3, run edge code, rewrite cache keys, or fetch from other nodes before the origin. Each of these is real work that a production edge needs, and each would hide the parts this project is about.
 
+## Cache settings per route
+
+The cache is becoming a layer that each proxy route turns on, so its settings are per route too. The `[cache]` section is the global block: besides the store's sizes it holds `max_object_bytes`, `max_variants`, `heuristic_max_secs` and an optional `max_ttl_secs` (a cap on any stored response's freshness lifetime), and every route inherits them. A `[[cache.routes]]` entry names one proxy route by `host` and `path_prefix` and may override any of those four; `enabled = false` keeps the entry but bypasses the cache. A route with no entry bypasses the cache.
+
+`CacheConfig::resolve` ties the entries to the proxy's routes and returns each route's effective `RoutePolicy`, or every problem it found (up to the proxy config's 20), each with its field path in the proxy config's style: `cache.routes[2].max_variants: must be between 1 and 8, got 9`. An override may only tighten what the store allows (`max_object_bytes` and `max_variants` are bounded by the global values the store is built with), lifetimes are capped at a year, hosts compare without case and path prefixes exactly, two entries for one route are refused, and an entry that matches no route is an error, so a typo cannot quietly leave a route uncached. The heuristic cap is held under the route's lifetime cap, so a guessed lifetime never outlasts an explicit one.
+
 ## Following one request
 
 A request is handled in `proxy.rs`. GET and HEAD go through the cache; every other method passes through to the origin. A request with `Cache-Control: no-store` also passes through.
