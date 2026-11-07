@@ -1,5 +1,6 @@
 //! Builds legacy/pacer's differential driver, `tests/diffdrive.c` linked
-//! with libpacer's sources, into OUT_DIR with the system C compiler (`CC`,
+//! with libpacer's sources and pacerd's config reader (`config.c` and the
+//! `util.c` it needs), into OUT_DIR with the system C compiler (`CC`,
 //! or `cc` when unset), and hands its path to the crate as
 //! `EDGEFRONT_PACER_DIFFDRIVE`. The driver runs as a child process that
 //! reads operations on stdin, so no FFI or unsafe code is involved.
@@ -17,7 +18,11 @@ fn main() {
     let pacer = manifest.join("../../legacy/pacer");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("pacer-diffdrive");
 
-    let mut sources = vec![pacer.join("tests/diffdrive.c")];
+    let mut sources = vec![
+        pacer.join("tests/diffdrive.c"),
+        pacer.join("src/pacerd/config.c"),
+        pacer.join("src/pacerd/util.c"),
+    ];
     let mut lib: Vec<PathBuf> = fs::read_dir(pacer.join("src/lib"))
         .unwrap_or_else(|e| panic!("reading {}: {e}", pacer.join("src/lib").display()))
         .map(|entry| entry.expect("directory entry").path())
@@ -34,6 +39,10 @@ fn main() {
     println!(
         "cargo::rerun-if-changed={}",
         pacer.join("src/lib").display()
+    );
+    println!(
+        "cargo::rerun-if-changed={}",
+        pacer.join("src/pacerd").display()
     );
     for source in &sources {
         println!("cargo::rerun-if-changed={}", source.display());

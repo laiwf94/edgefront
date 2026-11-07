@@ -51,10 +51,27 @@
  *
  * A malformed line is a bug in the generator, not a decision to compare:
  * the driver names it on stderr and exits with status 2.
+ *
+ * Parse mode, `diffdrive config [PATH]`, runs pacerd's config reader
+ * (pd_config_load) on PATH, or on stdin when PATH is absent, and prints
+ * either one line "error MESSAGE" or "ok" followed by every parsed field:
+ *
+ *   workers=N admin_socket=HEX|- drain_timeout_ns=N log_level=NAME listeners=N
+ *   listener NAME listen=ADDR upstream=ADDR max_conns=N buffer=N
+ *     connect_timeout_ns=N idle_timeout_ns=N min_rate=BYTES/WINDOW_NS|off
+ *     per_ip_max_conns=N ipv6_prefix=N per_ip_conn_rate=RATE
+ *     per_ip_bandwidth=RATE bandwidth=RATE table_size=N table_full=deny|evict
+ *
+ * (each listener on one line). ADDR is 4:HEX8:PORT or
+ * 6:HEX32:PORT:FLOWINFO:SCOPE_ID and RATE is TOKENS/PERIOD_NS/BURST or off,
+ * so the output never depends on how an address or path would be printed.
+ * The exit status is 0 either way: rejecting a config is an answer.
  */
 #include "lib/table_check.h"
 #include "pacer.h"
+#include "pacerd/config.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -529,9 +546,106 @@ static void run_line(char *line)
     }
 }
 
-int main(void)
+static void print_hex(const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) {
+        printf("%02x", b[i]);
+    }
+}
+
+static void print_addr(const char *key, const struct pd_addr *a)
+{
+    printf(" %s=", key);
+    if (a->ss.ss_family == AF_INET) {
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)&a->ss;
+        printf("4:");
+        print_hex(&v4->sin_addr, sizeof v4->sin_addr);
+        printf(":%u", ntohs(v4->sin_port));
+    } else if (a->ss.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)&a->ss;
+        printf("6:");
+        print_hex(&v6->sin6_addr, sizeof v6->sin6_addr);
+        printf(":%u:%lu:%lu", ntohs(v6->sin6_port), (unsigned long)ntohl(v6->sin6_flowinfo),
+               (unsigned long)v6->sin6_scope_id);
+    } else {
+        printf("none");
+    }
+}
+
+static void print_rate_opt(const char *key, const struct pd_rate_opt *r)
+{
+    if (r->on) {
+        printf(" %s=%llu/%llu/%llu", key, (unsigned long long)r->rate.tokens,
+               (unsigned long long)r->rate.period_ns, (unsigned long long)r->rate.burst);
+    } else {
+        printf(" %s=off", key);
+    }
+}
+
+static void print_listener(const struct pd_listener_conf *l)
+{
+    printf("listener %s", l->name);
+    print_addr("listen", &l->listen);
+    print_addr("upstream", &l->upstream);
+    printf(" max_conns=%lu buffer=%lu connect_timeout_ns=%llu idle_timeout_ns=%llu",
+           (unsigned long)l->max_conns, (unsigned long)l->buffer_size,
+           (unsigned long long)l->connect_timeout_ns, (unsigned long long)l->idle_timeout_ns);
+    if (l->min_rate_bytes == 0) {
+        printf(" min_rate=off");
+    } else {
+        printf(" min_rate=%llu/%llu", (unsigned long long)l->min_rate_bytes,
+               (unsigned long long)l->min_rate_window_ns);
+    }
+    printf(" per_ip_max_conns=%lu ipv6_prefix=%lu", (unsigned long)l->per_ip_max_conns,
+           (unsigned long)l->ipv6_prefix);
+    print_rate_opt("per_ip_conn_rate", &l->per_ip_conn_rate);
+    print_rate_opt("per_ip_bandwidth", &l->per_ip_bandwidth);
+    print_rate_opt("bandwidth", &l->bandwidth);
+    printf(" table_size=%lu table_full=%s\n", (unsigned long)l->table_size,
+           l->table_full == PACER_FULL_EVICT ? "evict" : "deny");
+}
+
+/* Parse mode: one config in, its parsed form or its error out. */
+static int config_mode(const char *path)
+{
+    static const char *levels[] = {"debug", "info", "warn", "error"};
+    static struct pd_config cfg;
+    char err[PD_ERR_MAX];
+    if (pd_config_load(path, &cfg, err, sizeof err) != 0) {
+        printf("error %s\n", err);
+    } else {
+        printf("ok\nworkers=%lu admin_socket=", (unsigned long)cfg.workers);
+        if (cfg.admin_socket[0] == '\0') {
+            printf("-");
+        } else {
+            print_hex(cfg.admin_socket, strlen(cfg.admin_socket));
+        }
+        printf(" drain_timeout_ns=%llu log_level=%s listeners=%lu\n",
+               (unsigned long long)cfg.drain_timeout_ns,
+               cfg.log_level >= 0 && cfg.log_level < 4 ? levels[cfg.log_level] : "?",
+               (unsigned long)cfg.nlisteners);
+        for (uint32_t i = 0; i < cfg.nlisteners; i++) {
+            print_listener(&cfg.listeners[i]);
+        }
+    }
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "diffdrive: write error\n");
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     static char line[MAX_LINE];
+    if (argc > 1 && strcmp(argv[1], "config") == 0 && argc <= 3) {
+        return config_mode(argc == 3 ? argv[2] : "/dev/stdin");
+    }
+    if (argc > 1) {
+        fprintf(stderr, "usage: diffdrive < OPS, or diffdrive config [PATH]\n");
+        return 2;
+    }
     while (fgets(line, sizeof line, stdin)) {
         line_no++;
         size_t n = strlen(line);

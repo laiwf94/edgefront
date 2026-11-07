@@ -98,11 +98,15 @@ $(BUILD)/itest: $(IT_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^
 
 # The differential driver: operations on stdin, decisions on stdout. Each
-# tests/diffdrive/NAME.ops script must print exactly NAME.out.
-$(BUILD)/diffdrive: $(BUILD)/tests/diffdrive.o $(BUILD)/libpacer.a
+# tests/diffdrive/NAME.ops script must print exactly NAME.out. In parse mode
+# (`diffdrive config`), each tests/diffdrive/config/NAME.conf must print
+# exactly NAME.out.
+$(BUILD)/diffdrive: $(BUILD)/tests/diffdrive.o $(BUILD)/src/pacerd/config.o \
+                    $(BUILD)/src/pacerd/util.o $(BUILD)/libpacer.a
 	$(CC) $(LDFLAGS) -o $@ $^
 
-DIFF_OPS := $(wildcard tests/diffdrive/*.ops)
+DIFF_OPS  := $(wildcard tests/diffdrive/*.ops)
+DIFF_CONF := $(wildcard tests/diffdrive/config/*.conf)
 
 # LeakSanitizer is part of ASan on Linux only.
 ifeq ($(UNAME),Linux)
@@ -144,6 +148,9 @@ run-diffdrive: $(BUILD)/diffdrive
 	set -e; for f in $(DIFF_OPS); do \
 	  $(TEST_ENV) $(BUILD)/diffdrive < $$f | diff -u $${f%.ops}.out - ; \
 	done; echo "diffdrive: $(words $(DIFF_OPS)) transcripts match"
+	set -e; for f in $(DIFF_CONF); do \
+	  $(TEST_ENV) $(BUILD)/diffdrive config < $$f | diff -u $${f%.conf}.out - ; \
+	done; echo "diffdrive config: $(words $(DIFF_CONF)) transcripts match"
 
 test:
 	$(MAKE) VARIANT=asan run-tests

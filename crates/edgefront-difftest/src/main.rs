@@ -6,6 +6,8 @@
 //! edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
 //! edgefront-difftest pacer-script [--ops N] [--seed N]
 //! edgefront-difftest pacer-rust-driver
+//! edgefront-difftest pacer-config [--mutants N] [--seed N] [-- DRIVER [ARGS...]]
+//! edgefront-difftest pacer-config-mutant [--seed N]
 //! ```
 //!
 //! `steer` diffs the Rust crates against steer's driver, started as
@@ -25,12 +27,21 @@
 //! divergence. `pacer-script` prints the script a seed generates, to feed
 //! a driver by hand, and `pacer-rust-driver` serves the pacer protocol from
 //! edgefront-limiter, like the C driver.
+//!
+//! `pacer-config` diffs pacerd's config reader against edgefront-limiter's:
+//! every config in legacy/pacer and `--mutants` seeded mutants of them
+//! (default 2,000) go through `diffdrive config` (or `DRIVER ARGS...
+//! config`) and the Rust parser, and every input on which the accept or
+//! reject, the error message and line, or a parsed value differ is
+//! printed. It exits 1 on a divergence. `pacer-config-mutant` writes the
+//! mutant a seed gives to stdout, to replay one.
 
-use std::io;
+use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgefront_difftest::pacer::{self, DriverCommand, Script};
+use edgefront_difftest::pacer_config;
 use edgefront_difftest::steer::{self, Driver, Plan};
 
 const USAGE: &str = "usage:
@@ -38,7 +49,9 @@ const USAGE: &str = "usage:
   edgefront-difftest rust-driver
   edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
   edgefront-difftest pacer-script [--ops N] [--seed N]
-  edgefront-difftest pacer-rust-driver";
+  edgefront-difftest pacer-rust-driver
+  edgefront-difftest pacer-config [--mutants N] [--seed N] [-- DRIVER [ARGS...]]
+  edgefront-difftest pacer-config-mutant [--seed N]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -80,7 +93,83 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("pacer-config") => match parse_pacer_config(&args[1..], true) {
+            Ok((plan, driver)) => run_pacer_config(plan, &driver),
+            Err(e) => usage(&e),
+        },
+        Some("pacer-config-mutant") => match parse_pacer_config(&args[1..], false) {
+            Ok((plan, _)) => {
+                let written = pacer_config::mutant(&pacer_config::pacer_root(), plan.seed)
+                    .and_then(|bytes| io::stdout().lock().write_all(&bytes));
+                match written {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("edgefront-difftest: {e}");
+                        ExitCode::from(2)
+                    }
+                }
+            }
+            Err(e) => usage(&e),
+        },
         _ => usage("expected a command"),
+    }
+}
+
+fn parse_pacer_config(
+    args: &[String],
+    driver: bool,
+) -> Result<(pacer_config::Plan, DriverCommand), String> {
+    let mut plan = pacer_config::Plan {
+        mutants: 2_000,
+        seed: clock_seed(),
+    };
+    let mut command = DriverCommand::c_driver();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" && driver {
+            let rest: Vec<String> = it.cloned().collect();
+            let Some((program, args)) = rest.split_first() else {
+                return Err("no driver command after --".into());
+            };
+            command = DriverCommand {
+                program: program.into(),
+                args: args.to_vec(),
+            };
+            break;
+        }
+        let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
+        let number = |v: &str| {
+            v.parse::<u64>()
+                .map_err(|_| format!("{arg}: {v:?} is not a number"))
+        };
+        match arg.as_str() {
+            "--mutants" if driver => plan.mutants = number(value)? as usize,
+            "--seed" => plan.seed = number(value)?,
+            _ => return Err(format!("unknown option {arg}")),
+        }
+    }
+    Ok((plan, command))
+}
+
+fn run_pacer_config(plan: pacer_config::Plan, driver: &DriverCommand) -> ExitCode {
+    let started = Instant::now();
+    let report = match pacer_config::run(driver, &pacer_config::pacer_root(), plan) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!(
+                "edgefront-difftest: driver {}: {e} (seed {})",
+                driver.program.display(),
+                plan.seed
+            );
+            return ExitCode::from(2);
+        }
+    };
+    println!("{report}");
+    println!("took {:.1}s", started.elapsed().as_secs_f64());
+    if report.divergences.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

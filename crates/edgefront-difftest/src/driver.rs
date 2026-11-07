@@ -41,6 +41,11 @@ pub fn run(program: &Path, script: &str) -> io::Result<Transcript> {
 
 /// [`run`] with arguments for the program.
 pub fn run_with_args(program: &Path, args: &[String], script: &str) -> io::Result<Transcript> {
+    run_with_input(program, args, script.as_bytes())
+}
+
+/// [`run_with_args`] with any bytes on stdin, not only text.
+pub fn run_with_input(program: &Path, args: &[String], input: &[u8]) -> io::Result<Transcript> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -48,7 +53,7 @@ pub fn run_with_args(program: &Path, args: &[String], script: &str) -> io::Resul
         .stderr(Stdio::piped())
         .spawn()?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
-    let input = script.as_bytes().to_vec();
+    let input = input.to_vec();
     let writer = thread::spawn(move || match stdin.write_all(&input) {
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         other => other,

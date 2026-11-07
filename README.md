@@ -184,7 +184,7 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 
 While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus two comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary.
 
-While `legacy/pacer` exists, its gate runs as well (format, lint, the tests under ASan+UBSan and TSan with coverage, short fuzzing, its demo and its image), and the pacer differential test needs only a C compiler: `make test` already runs a million operations through it, and `make difftest-pacer` runs ten times more from a clock seed.
+While `legacy/pacer` exists, its gate runs as well (format, lint, the tests under ASan+UBSan and TSan with coverage, short fuzzing, its demo and its image), and the pacer differential test needs only a C compiler: `make test` already runs a million operations through it, and `make difftest-pacer` runs ten times more from a clock seed. pacerd's config reader is diffed the same way: `make test` puts every file under legacy/pacer's `tests`, `examples` and `fuzz/corpus`, every string literal in its tests and 3,000 seeded mutants through `diffdrive config` and the Rust parser, comparing accept or reject, the error message and line, and every parsed value, and `make difftest-pacer-config` adds 2,000 mutants from a clock seed (`DIFFTEST_ARGS="--mutants N"` for more).
 
 ## License
 

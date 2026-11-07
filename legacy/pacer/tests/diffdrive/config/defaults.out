@@ -1,0 +1,3 @@
+ok
+workers=1 admin_socket=- drain_timeout_ns=30000000000 log_level=info listeners=1
+listener a listen=4:7f000001:1 upstream=4:7f000001:2 max_conns=1024 buffer=16384 connect_timeout_ns=5000000000 idle_timeout_ns=300000000000 min_rate=off per_ip_max_conns=0 ipv6_prefix=64 per_ip_conn_rate=off per_ip_bandwidth=off bandwidth=off table_size=16384 table_full=deny

@@ -1,0 +1,4 @@
+ok
+workers=4 admin_socket=2f72756e2f7061636572642e736f636b drain_timeout_ns=10000000000 log_level=debug listeners=2
+listener web listen=4:00000000:8080 upstream=6:00000000000000000000000000000001:9000:0:0 max_conns=5000 buffer=32768 connect_timeout_ns=250000000 idle_timeout_ns=120000000000 min_rate=64/10000000000 per_ip_max_conns=20 ipv6_prefix=56 per_ip_conn_rate=10/1000000000/20 per_ip_bandwidth=1048576/1000000000/262144 bandwidth=600/60000000000/600 table_size=4096 table_full=evict
+listener ssh listen=6:00000000000000000000ffff0a000001:2222:0:0 upstream=4:0a000002:22 max_conns=1024 buffer=16384 connect_timeout_ns=5000000000 idle_timeout_ns=300000000000 min_rate=off per_ip_max_conns=0 ipv6_prefix=64 per_ip_conn_rate=off per_ip_bandwidth=off bandwidth=off table_size=16384 table_full=deny

@@ -15,12 +15,16 @@
 //!   [`PACER_DIFFDRIVE`] is the path of the binary. [`driver::run`] feeds
 //!   it a script and collects the transcript, and [`pacer::Interpreter`]
 //!   answers the same script from edgefront-limiter.
+//! - [`pacer_config`]: pacerd's config reader, against the same driver's
+//!   parse mode (`diffdrive config`), on every config in legacy/pacer and
+//!   seeded mutants of them.
 //!
 //! Every run is seeded, and the seed is printed with its report, so a
 //! divergence found in CI can be replayed locally with `--seed`.
 
 pub mod driver;
 pub mod pacer;
+pub mod pacer_config;
 pub mod rng;
 pub mod steer;
 

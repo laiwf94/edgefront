@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-pacer e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-pacer difftest-pacer-config e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -95,3 +95,10 @@ e2e-steer:
 # command that replays it.
 difftest-pacer:
 	cargo run --release --locked -p edgefront-difftest -- pacer $(DIFFTEST_ARGS)
+
+# Diff pacerd's config reader against edgefront-limiter's: every file under
+# legacy/pacer's tests, examples and fuzz/corpus, every string literal in its
+# tests, and 2,000 seeded mutants (more with DIFFTEST_ARGS="--mutants N"),
+# through `diffdrive config` and the Rust parser.
+difftest-pacer-config:
+	cargo run --release --locked -p edgefront-difftest -- pacer-config $(DIFFTEST_ARGS)
