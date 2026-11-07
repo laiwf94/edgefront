@@ -34,6 +34,7 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ### Limiter
 
+- `edgefront_limiter::config`: pacerd's config in Rust. `parse_pacerd` accepts and rejects pacerd.conf files as pacerd does, with the same message and line number. `LimiterConfig` also loads through serde as a TOML section that uses pacerd's directive names and value syntax, and writes back out in either syntax. serde becomes the crate's one dependency. (#82)
 - New crate `edgefront-limiter`, libpacer's algorithms in safe Rust with no dependencies (#79):
   - `Gcra`: an exact, lock-free token bucket whose arrival time is one `AtomicU64`, with `take`, `take_upto`, `take_range`, `refund`, `remaining` and `reconfigure`, and retry-after times exact to the nanosecond.
   - `Table`: per-key buckets in fixed memory, sharded, with idle reclaim, deny or evict when full, holds, sweeps and stats. Keys are hashed with SipHash-1-3 by default, or SipHash-2-4 to place keys as libpacer does.

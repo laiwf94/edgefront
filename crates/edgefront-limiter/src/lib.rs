@@ -6,11 +6,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod gcra;
 pub mod siphash;
 pub mod table;
 pub mod window;
 
+pub use config::{LimiterConfig, ListenerConfig, LogLevel, MinRate, parse_pacerd};
 pub use gcra::{Decision, Error, Gcra, Rate};
 pub use siphash::KeyHash;
 pub use table::{EntryState, FullPolicy, Table, TableConfig, TableStats};

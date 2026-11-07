@@ -8,7 +8,7 @@ edgefront is one Cargo workspace. Every crate lives under `crates/` and takes it
 
 ### Crate map
 
-Each crate and the workspace crates it depends on. There are no cycles: `edgefront-cache` reaches its node through the `cluster::PurgeHost` trait rather than depending on cachet, and `edgefront-limiter` depends on nothing at all.
+Each crate and the workspace crates it depends on. There are no cycles: `edgefront-cache` reaches its node through the `cluster::PurgeHost` trait rather than depending on cachet, and `edgefront-limiter` depends on no workspace crate and on serde alone, for its config.
 
 | Crate | Holds | Workspace dependencies |
 |---|---|---|
@@ -17,7 +17,7 @@ Each crate and the workspace crates it depends on. There are no cycles: `edgefro
 | `crates/edgefront-cache` | Caching policy, Cache-Control and range parsing, objects, request collapsing, purge, cluster gossip, the memory and disk stores, and the cache's config sections | edgefront-core |
 | `crates/edgefront-core` | The accept loop and HTTP/1.1 listener, the pooled client, the clock, request ids, config loading and steer's schema, metrics writers and the admin router | none |
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request ids and the request path ported from steer | edgefront-core |
-| `crates/edgefront-limiter` | pacer's GCRA, keyed table and sliding window | none |
+| `crates/edgefront-limiter` | pacer's GCRA, keyed table and sliding window, and pacerd's config | none |
 | `crates/edgefront-difftest` | Differential drivers against `legacy/steer` and `legacy/pacer` | edgefront-core, edgefront-proxy, edgefront-limiter |
 
 Two tests hold the edgefront binary to cachet's behaviour while both exist. `crates/edgefront/tests/golden.rs` compares the command line's transcripts (usage, config checks, a served request, a purge, shutdown and start failure, log lines included) with `tests/golden/`. `crates/edgefront/tests/e2e_workspace.rs` runs `examples/demo.sh`'s five steps against two edgefront nodes and an origin served by the test, and compares every response's status, `Cache-Status` and body with `tests/fixtures/e2e_workspace.txt` byte for byte. The origin sends no `Date` header and makes objects stale on arrival with `Age`, so no value in the transcript depends on timing and nothing is blanked. The root package's `tests/golden_cli.rs` and `tests/e2e_workspace.rs` run the reference cachet binary against the same files, and CI runs the demo script against both binaries.
@@ -46,7 +46,7 @@ Until the balancer port lands, each cluster takes turns over its endpoints of th
 
 ## Porting pacer: the limiter algorithms
 
-`edgefront-limiter` is libpacer's `gcra.c`, `gcra_math.h`, `siphash.c`, `table.c` and `window.c` in safe Rust, with no dependencies. The port keeps the C's arithmetic and memory layout, not only its behaviour, so that a table holding the same keys holds them in the same slots and evicts the same ones.
+`edgefront-limiter` is libpacer's `gcra.c`, `gcra_math.h`, `siphash.c`, `table.c` and `window.c` in safe Rust, with no dependencies. (The crate's one dependency, serde, serves the config described below.) The port keeps the C's arithmetic and memory layout, not only its behaviour, so that a table holding the same keys holds them in the same slots and evicts the same ones.
 
 - **GCRA.** A limiter's changing state is its theoretical arrival time (TAT), one `AtomicU64` in ticks of 1/64 ns, so high byte rates keep their fractional intervals; the interval and tolerance sit in two more words that only `reconfigure` writes. A decision is a pure function from the TAT, the interval, the tolerance (burst times interval) and the time to a new TAT and a `Decision` (allowed, granted, remaining, retry-after in nanoseconds, rounded up). `Gcra` applies it with a relaxed compare-and-swap loop, and `Table` applies the same function under its shard lock. Times past 2^57 ns, about four and a half years of uptime, are clamped. `reconfigure` changes the rate while takes race with it and keeps debt as time: a client that had to wait 2 s still waits 2 s. A take at the same moment may mix the old interval with the new tolerance, and is then bounded by the larger of the two rates.
 - **Keyed table.** All memory is allocated in `Table::new`: power-of-two shards picked by the top hash bits, each a 64-byte-aligned mutex over a linear-probing array kept at most three quarters full, 64-byte entries aligned to cache lines and an intrusive LRU list. Deletion shifts the probe chain back instead of leaving tombstones. When a shard is full it first reclaims an idle entry (one whose bucket has refilled and that holds nothing), then denies the new key or evicts the coldest of the eight least recent entries that hold nothing. Keys are hashed with SipHash-1-3 under a random key by default; SipHash-2-4, libpacer's choice, is kept so the differential tests can place keys exactly as the C does.
@@ -63,6 +63,21 @@ The generator keeps clear of both (`wraps_in_c`, and a clock at or below 2^60), 
 - **`tests/model_gcra.rs`** holds `Gcra` to a token bucket kept as an exact reduced rational, through seeded scripts and a proptest tape that shrinks to a minimal failing script. A failure prints the seed and a replay command.
 - **`legacy/pacer/tests/diffdrive.c`** reads one operation per line (clock, `gcra`, `table` and `window` operations) and prints the decision and the full state after it: TAT, interval and tolerance, table stats and invariant checks, window start and total. `edgefront-difftest` answers the same protocol from the Rust crate, byte for byte, and generates scripts that mix four limiters, three tables and three windows under one clock that jumps, goes backwards and passes the clamp. Each script ends by dumping every live object. The first differing line is reported with its seed, its step, the eight steps before it and a replay command.
 - **`crates/edgefront-difftest/tests/e2e_limiter_port.rs`** drives the `edgefront-difftest` binary: one million generated operations against the C driver on every push, a divergence that must replay from the command it prints, and a worked example (per-key limits with exact retry times, then an hourly window quota) whose answers are written out in the test.
+
+### pacerd's config
+
+`edgefront_limiter::config` is pacerd's `config.c`. `parse_pacerd` takes the file's bytes and gives a typed `LimiterConfig` (workers, admin socket, drain timeout, log level and up to 16 `ListenerConfig`s), or a `ConfigError` with pacerd's line number and message, word for word: `line 12: per_ip_conn_rate: expected a rate like 10/s, 600/m or 1m/s, got "10/d"`. To keep acceptance identical, it reproduces config.c's limits as well as its grammar:
+
+- The file is at most 1 MiB and each line at most 1,024 bytes. A NUL byte is an error. A line has at most eight words, separated by spaces, tabs and carriage returns only, and `#` starts a comment even in the middle of a word.
+- A number in a size or duration has at most 23 digits, leading zeros included. Sizes and rate counts are at most 2^50, and durations at most 24 hours before each directive's own range applies.
+- Addresses are numeric `a.b.c.d:port` or `[v6]:port`. Leading zeros in an IPv4 octet are refused, as glibc's `inet_pton` refuses them. A port is 1 to 65535 and may have leading zeros.
+- A directive may be set once per scope. Top-level directives keep their scope across listener blocks, so `workers` after a block still counts as a repeat.
+- Tokens quoted in messages show printable ASCII except `"`, replace every other byte with `?`, and are cut at 44 bytes with `...`.
+- Errors found at the end of the file name its last line, and a file over the limit names line 0.
+
+The same directive table serves the serde form, which is how the limiter appears in an edgefront config. Field names are the directive names, and listeners are a `listeners` array with a `name` each. A value is the directive's text as a string (`"10/s burst 20"`, `"512 per 10s"`), or an integer where pacerd takes a bare number or size. Each value goes through the same parser, so a TOML error is the pacerd message with the field's path in place of the line: `listeners[0].max_conns: must be between 1 and 1000000`. The one difference is that the admin socket path is taken whole, so in TOML it may contain spaces.
+
+`LimiterConfig::to_pacerd` and `Serialize` write a config back out, choosing the largest unit that is exact (`2m`, `16k`). `validate` checks a config built in code by writing it and reading it back. A value neither syntax can express is an error naming the field: a duration that is not a whole number of milliseconds, a rate period other than a second, minute or hour, or an IPv6 scope id. Property tests round-trip generated configs through both syntaxes.
 
 ### Speed against libpacer
 
