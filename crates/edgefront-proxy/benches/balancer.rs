@@ -1,6 +1,7 @@
 //! One pick of each balancing policy over 10 and 100 endpoints: a first
 //! attempt (every endpoint a candidate, nothing tried) and a retry (one
-//! endpoint already tried).
+//! endpoint already tried). For Maglev also a full table build at the
+//! default 65,537 slots, and the key hash.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use edgefront_core::clock::MonotonicClock;
 use edgefront_proxy::balancer::Policy;
 use edgefront_proxy::balancer::ewma::{Cost, LeastLoaded, PeakEwma, cost};
+use edgefront_proxy::balancer::maglev::{self, DEFAULT_TABLE_SIZE, Endpoint, Maglev};
 use edgefront_proxy::balancer::rng::SplitMix64;
 use edgefront_proxy::balancer::rr::RoundRobin;
 
@@ -77,5 +79,49 @@ fn peak_ewma(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, round_robin, peak_ewma);
+fn maglev_endpoints(n: usize) -> Vec<Endpoint> {
+    (0..n)
+        .map(|i| {
+            Endpoint::new(
+                format!("10.0.{}.{}:8080", i / 250, i % 250 + 1),
+                1 + (i % 3) as u32,
+            )
+        })
+        .collect()
+}
+
+fn maglev(c: &mut Criterion) {
+    let mut g = c.benchmark_group("maglev");
+    for n in SIZES {
+        let m = Maglev::new(
+            &maglev_endpoints(n),
+            DEFAULT_TABLE_SIZE,
+            Arc::new(SplitMix64::new(n as u64)),
+        )
+        .unwrap();
+        let cands: Vec<usize> = (0..n).collect();
+        let mut key = 0u64;
+        g.bench_with_input(BenchmarkId::new("first", n), &n, |b, _| {
+            b.iter(|| {
+                key = key.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                m.pick(black_box(&cands), black_box(&[]), Some(key))
+            })
+        });
+        g.bench_with_input(BenchmarkId::new("retry", n), &n, |b, _| {
+            b.iter(|| {
+                key = key.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                m.pick(black_box(&cands), black_box(&[n / 2]), Some(key))
+            })
+        });
+        g.bench_with_input(BenchmarkId::new("populate", n), &n, |b, _| {
+            b.iter(|| m.populate(black_box(&cands)))
+        });
+    }
+    g.bench_function("hash_key", |b| {
+        b.iter(|| maglev::hash_key(black_box(b"user-1234567")))
+    });
+    g.finish();
+}
+
+criterion_group!(benches, round_robin, peak_ewma, maglev);
 criterion_main!(benches);

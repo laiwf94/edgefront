@@ -5,11 +5,13 @@
 //! priority level is chosen from the share of healthy hosts in each level,
 //! with an overprovisioning factor and a panic threshold ([`priority`]),
 //! then a [`Policy`] picks a host inside that level: smooth weighted round
-//! robin ([`rr`]) or power of two choices on peak-EWMA cost ([`ewma`]).
+//! robin ([`rr`]), power of two choices on peak-EWMA cost ([`ewma`]) or
+//! Maglev consistent hashing on a request key ([`maglev`]).
 //! Policies that draw at random take an [`rng::Rng`], so a seeded run makes
 //! the same picks as steer's.
 
 pub mod ewma;
+pub mod maglev;
 pub mod priority;
 pub mod rng;
 pub mod rr;

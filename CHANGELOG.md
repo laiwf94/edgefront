@@ -18,6 +18,7 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ### Proxy
 
+- `edgefront_proxy::balancer::maglev`, ported from steer's `balancer.Maglev`: Maglev consistent hashing with weighted turns, a cache of the last 8 lookup tables (one per candidate set), retries that walk forward to the next untried owner and `hash_key` for request keys. Its tables are identical to steer's, checked byte for byte against 143 tables over 50 endpoint sets that `legacy/steer/cmd/diffdrive`'s `TestMaglevVectors` writes from steer, including the 100-endpoint, 65,537-slot table, along with 3,000 keyed and keyless picks. A keyed pick takes about 40 ns over 100 endpoints, and a full table build takes 2.1 ms against steer's 4.0 ms. Candidates that all have weight zero give an empty table instead of steer's division by zero. (#80)
 - `edgefront_core::clock`, ported from steer's `internal/clock`: a `Clock` trait over monotonic time and one-shot timers, `MonotonicClock` on tokio's timer, and `ManualClock`, which moves only when advanced and then fires due timers earliest deadline first, ties in the order they were made. Balancing, health checks and outlier detection take it so tests and the difftest can drive time. (#80)
 - `edgefront proxy --config <file>` runs the HTTP/1.1 proxy ported from steer, from steer's configuration file unchanged (JSON, or the same schema in TOML). `--check-config` validates a file. The request path matches steer:
   - Go's server checks and steer's JSON errors.
