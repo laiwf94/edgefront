@@ -7,6 +7,7 @@
 //! can diff every decision against the Go original before steer is deleted.
 
 pub mod balancer;
+pub mod endpoint;
 pub mod forwarded;
 pub mod path;
 pub mod reqid;
