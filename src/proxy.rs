@@ -806,7 +806,7 @@ impl HttpBody for Prefixed {
     }
 }
 
-impl crate::server::Handler for Proxy {
+impl crate::listener::Handler for Proxy {
     type Body = Body;
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {

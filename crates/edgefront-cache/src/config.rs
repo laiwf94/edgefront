@@ -396,7 +396,19 @@ pub struct TimeoutConfig {
     pub response_ms: u64,
     pub body_ms: u64,
     pub client_header_ms: u64,
+    /// How long a keep-alive client connection may sit silent between
+    /// requests. Unset, it is `client_header_ms`: cachet's accept loop
+    /// used hyper's header read timeout, which also closed idle
+    /// connections after that long.
+    pub idle_ms: Option<u64>,
     pub shutdown_ms: u64,
+}
+
+impl TimeoutConfig {
+    /// The idle timeout for client connections, in milliseconds.
+    pub fn idle_ms(&self) -> u64 {
+        self.idle_ms.unwrap_or(self.client_header_ms)
+    }
 }
 
 impl Default for TimeoutConfig {
@@ -406,6 +418,7 @@ impl Default for TimeoutConfig {
             response_ms: 10_000,
             body_ms: 30_000,
             client_header_ms: 10_000,
+            idle_ms: None,
             shutdown_ms: 10_000,
         }
     }
@@ -529,7 +542,15 @@ impl Config {
             return Err("health interval, timeout, rise and fall must be positive".into());
         }
         let t = &self.timeouts;
-        if [t.connect_ms, t.response_ms, t.body_ms, t.client_header_ms].contains(&0) {
+        if [
+            t.connect_ms,
+            t.response_ms,
+            t.body_ms,
+            t.client_header_ms,
+            t.idle_ms(),
+        ]
+        .contains(&0)
+        {
             return Err("timeouts must be positive".into());
         }
         let g = &self.gossip;
@@ -591,6 +612,8 @@ mod tests {
         assert_eq!(c.health.fall, 3);
         assert_eq!(c.health.path, "/healthz");
         assert_eq!(c.timeouts.shutdown_ms, 10_000);
+        assert_eq!(c.timeouts.idle_ms, None);
+        assert_eq!(c.timeouts.idle_ms(), 10_000);
         assert_eq!(c.limits.max_header_bytes, 64 * 1024);
         assert_eq!(c.gossip.max_age_secs, 600);
         assert!(c.peers.is_empty());
@@ -660,6 +683,15 @@ mod tests {
     }
 
     #[test]
+    fn idle_timeout_follows_the_header_timeout_unless_set() {
+        let c = with("[timeouts]\nclient_header_ms = 2500").unwrap();
+        assert_eq!(c.timeouts.idle_ms(), 2500);
+        let c = with("[timeouts]\nclient_header_ms = 2500\nidle_ms = 60000").unwrap();
+        assert_eq!(c.timeouts.idle_ms(), 60_000);
+        assert_eq!(c.timeouts.client_header_ms, 2500);
+    }
+
+    #[test]
     fn invalid_configs_are_refused() {
         let cases = [
             ("[cache]\nmemory_bytes = 10", "memory_bytes"),
@@ -673,6 +705,7 @@ mod tests {
             ("[health]\npath = \"nope\"", "health.path"),
             ("[health]\nrise = 0", "rise"),
             ("[timeouts]\nconnect_ms = 0", "timeouts"),
+            ("[timeouts]\nidle_ms = 0", "timeouts"),
             ("[limits]\nmax_header_bytes = 10", "max_header_bytes"),
             (
                 "[[peers]]\nname = \"edge-a\"\nurl = \"http://x:1\"",

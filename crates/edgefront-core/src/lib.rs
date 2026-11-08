@@ -10,9 +10,8 @@
 //!   clock for deterministic tests;
 //! - [`ids`]: request identifiers;
 //! - [`listener`] and [`http1`]: the HTTP/1.1 listener with its connection
-//!   limits and graceful drain, and the pooled HTTP/1.1 client;
-//! - [`server`]: cachet's accept loop, kept until the cache moves onto the
-//!   listener;
+//!   limits and graceful drain, which the proxy and the cache both serve
+//!   on, and the pooled HTTP/1.1 client;
 //! - [`body`]: the boxed response body handlers return;
 //! - [`metrics`]: atomic counters and histograms in the Prometheus text
 //!   format;
@@ -26,4 +25,3 @@ pub mod http1;
 pub mod ids;
 pub mod listener;
 pub mod metrics;
-pub mod server;

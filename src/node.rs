@@ -1,5 +1,11 @@
 //! Starting and stopping a whole node: cache, origin pool, health checks,
 //! the proxy listener and the admin listener.
+//!
+//! Both listeners are edgefront-core's [`listener`](crate::listener), the
+//! one the proxy track serves on. Its limits come from `[timeouts]` and
+//! `[limits]`: `client_header_ms` for a request head, `idle_ms` (by
+//! default the same) for a silent keep-alive connection, `max_header_bytes`
+//! for the head, and `shutdown_ms` for the drain.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,9 +18,9 @@ use tokio::task::JoinHandle;
 use crate::admin::Admin;
 use crate::cluster::Cluster;
 use crate::config::{Config, Secrets, Settings, parse_base_url};
+use crate::listener::{ServeReport, ServerLimits, serve};
 use crate::origin::{self, Origin, OriginPool};
 use crate::proxy::{Proxy, SystemClock};
-use crate::server::{ServerLimits, serve};
 use crate::store::Cache;
 
 pub struct Node {
@@ -22,7 +28,7 @@ pub struct Node {
     pub admin_addr: SocketAddr,
     pub proxy: Arc<Proxy>,
     stop: watch::Sender<bool>,
-    servers: Vec<JoinHandle<()>>,
+    servers: Vec<JoinHandle<ServeReport>>,
     background: Vec<JoinHandle<()>>,
 }
 
@@ -66,11 +72,7 @@ pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
     let proxy_addr = proxy_listener.local_addr().map_err(|e| e.to_string())?;
     let admin_addr = admin_listener.local_addr().map_err(|e| e.to_string())?;
 
-    let limits = ServerLimits {
-        header_read: Duration::from_millis(t.client_header_ms),
-        max_header_bytes: config.limits.max_header_bytes,
-        drain: Duration::from_millis(t.shutdown_ms),
-    };
+    let limits = listener_limits(config);
     let (stop, rx) = watch::channel(false);
     let mut background = vec![pool.spawn_health_checks()];
     let cluster = match &secrets.cluster_secret {
@@ -115,13 +117,36 @@ pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
     })
 }
 
+/// The listener limits a config asks for. The header count limit is
+/// hyper's default of 100, which cachet's accept loop also had.
+pub fn listener_limits(config: &Config) -> ServerLimits {
+    let t = &config.timeouts;
+    ServerLimits {
+        header_read_timeout: Duration::from_millis(t.client_header_ms),
+        idle_timeout: Duration::from_millis(t.idle_ms()),
+        max_header_bytes: config.limits.max_header_bytes,
+        max_headers: ServerLimits::default().max_headers,
+        drain_timeout: Duration::from_millis(t.shutdown_ms),
+    }
+}
+
 impl Node {
-    /// Stops accepting, lets open requests finish, then writes out any
-    /// queued disk writes.
+    /// Stops accepting, closes idle connections, lets open requests finish
+    /// (each answered with `Connection: close`) for up to `shutdown_ms`,
+    /// closes whatever is left, then writes out any queued disk writes.
     pub async fn shutdown(self) {
         let _ = self.stop.send(true);
+        let mut forced = 0;
         for server in self.servers {
-            let _ = server.await;
+            if let Ok(report) = server.await {
+                forced += report.forced;
+            }
+        }
+        if forced > 0 {
+            tracing::warn!(
+                forced,
+                "closed connections still open after the drain timeout"
+            );
         }
         for task in self.background {
             task.abort();

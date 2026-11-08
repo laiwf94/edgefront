@@ -6,7 +6,7 @@
 pub use edgefront_cache::{
     cache_control, cluster, collapse, headers, object, policy, purge, range, respond, store,
 };
-pub use edgefront_core::{ids, server};
+pub use edgefront_core::{ids, listener};
 
 pub mod admin;
 pub mod config;

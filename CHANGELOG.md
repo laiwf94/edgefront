@@ -6,6 +6,7 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ### Cache
 
+- cachet's node serves its proxy and admin listeners on `edgefront_core::listener`, the listener the proxy track uses, and cachet's own accept loop (`edgefront_core::server`) is deleted, along with hyper-util's `server` and `server-graceful` features. What a client sees is unchanged: a request head still gets `client_header_ms`, a silent keep-alive connection is still closed after that long unless the new `timeouts.idle_ms` sets another idle timeout, heads over `max_header_bytes` or 100 fields get 431, and shutdown stops accepting, closes idle connections and lets open requests finish with `Connection: close`. Two things differ: the header timer of a later request on a keep-alive connection starts at its first byte rather than when the previous response ends, and connections still open when `shutdown_ms` runs out are now closed instead of left running. (#81)
 - cachet is split into the edgefront workspace with no change a client can see (#78):
   - `edgefront-core` holds the accept loop, config loading (`config::loader`), the metrics writers, the admin router with bearer tokens, request ids and the response body type.
   - `edgefront-cache` holds the caching policy, Cache-Control and range parsing, objects, request collapsing, purge, cluster gossip (through a `PurgeHost` trait, so the crate never depends on cachet), the memory and disk stores, and the cache's config sections.

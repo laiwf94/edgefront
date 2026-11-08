@@ -15,7 +15,7 @@ Each crate and the workspace crates it depends on. There are no cycles: `edgefro
 | `crates/edgefront` | The binary: cachet's command line (`--config`, `--check-config`, `--version`, the `CACHET_*` variables, exit codes and JSON log) and `edgefront proxy` | cachet, edgefront-core, edgefront-proxy |
 | `.` (`cachet`) | The node runtime still to move: the cache's request path (`proxy`), origins and health checks (`origin`), node start-up (`node`), metric families and the admin routes; and the reference `cachet` binary | edgefront-cache, edgefront-core |
 | `crates/edgefront-cache` | Caching policy, Cache-Control and range parsing, objects, request collapsing, purge, cluster gossip, the memory and disk stores, and the cache's config sections | edgefront-core |
-| `crates/edgefront-core` | The accept loop and HTTP/1.1 listener, the pooled client, the clock, request ids, config loading and steer's schema, metrics writers and the admin router | none |
+| `crates/edgefront-core` | The HTTP/1.1 listener the proxy and the cache both serve on, the pooled client, the clock, request ids, config loading and steer's schema, metrics writers and the admin router | none |
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request ids and the request path ported from steer | edgefront-core |
 | `crates/edgefront-limiter` | pacer's GCRA, keyed table and sliding window, and pacerd's config | none |
 | `crates/edgefront-difftest` | Differential drivers against `legacy/steer` and `legacy/pacer` | edgefront-core, edgefront-proxy, edgefront-limiter |
@@ -194,7 +194,7 @@ Health comes from active probes (`GET /healthz` every 2 seconds by default) and 
 
 ## Input limits and secrets
 
-Clients get 10 seconds to send their request head, which may be at most 64 KiB; larger heads get 431. Request targets over 8 KiB get 414. Request bodies over 10 MiB get 413, checked against Content-Length before reading and enforced while streaming otherwise. A request whose `Via` names this node gets 508. Origin bodies are buffered only up to the per-object limit (8 MiB); the declared length is checked before reading, and a body that turns out larger streams through to the one client that asked, uncached, without buffering the rest. Only the first 64 surrogate keys of a response are kept, keys over 128 bytes are dropped, and a URL keeps at most eight Vary variants, so an origin varying on something like User-Agent cannot fill the cache with one URL.
+Both of a node's listeners are edgefront-core's `listener`, the one the proxy track serves on. Clients get 10 seconds (`timeouts.client_header_ms`) to send a request head, timed from the accept for the first request and from its first byte for later ones; the head may be at most 64 KiB and 100 fields, and a larger one gets 431. A keep-alive connection may then sit silent for `timeouts.idle_ms`, which defaults to the header timeout because cachet's own accept loop closed silent connections after that long. A request counts as open until its response is fully written, so neither timer cuts a slow origin or a long download. Request targets over 8 KiB get 414. Request bodies over 10 MiB get 413, checked against Content-Length before reading and enforced while streaming otherwise. A request whose `Via` names this node gets 508. Origin bodies are buffered only up to the per-object limit (8 MiB); the declared length is checked before reading, and a body that turns out larger streams through to the one client that asked, uncached, without buffering the rest. Only the first 64 surrogate keys of a response are kept, keys over 128 bytes are dropped, and a URL keeps at most eight Vary variants, so an origin varying on something like User-Agent cannot fill the cache with one URL.
 
 The admin listener binds to localhost by default. Without `CACHET_ADMIN_TOKEN` the purge API is off. Without `CACHET_CLUSTER_SECRET` (at least 32 bytes) the peer endpoint is off, and a config with peers refuses to start. Secrets come only from the environment and are redacted from `Debug` output.
 
@@ -214,7 +214,7 @@ The admin listener binds to localhost by default. Without `CACHET_ADMIN_TOKEN` t
 | Peer down for longer than the window | It misses the purge. Objects it still holds expire normally. |
 | Forged, replayed or stale purge message | Refused before or after parsing, counted. |
 | Purge races a fetch | The fetched response is not kept. |
-| Shutdown | Stops accepting, waits up to 10 s for open requests, flushes the disk queue. Queued purge deliveries are lost. |
+| Shutdown | Stops accepting and closes idle connections at once. Open requests get up to 10 s (`shutdown_ms`) to finish, each answered with `Connection: close`; connections still open after that are closed. Then the disk queue is flushed. Queued purge deliveries are lost. |
 
 ## What it does not do well
 

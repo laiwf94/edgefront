@@ -207,6 +207,149 @@ async fn shutdown_lets_open_requests_finish() {
     );
 }
 
+/// Reads one response from a keep-alive connection: the head up to the
+/// blank line, then a `content-length` body.
+async fn read_response(s: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        assert_eq!(s.read(&mut byte).await.unwrap(), 1, "closed mid-head");
+        buf.push(byte[0]);
+    }
+    let head = String::from_utf8(buf).unwrap();
+    let len = head
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).await.unwrap();
+    head + &String::from_utf8(body).unwrap()
+}
+
+/// How long a connection that has just had a response takes to be closed
+/// by the node, if it is closed within `limit`.
+async fn closed_within(s: &mut TcpStream, limit: Duration) -> Option<Duration> {
+    let started = std::time::Instant::now();
+    let mut rest = Vec::new();
+    match tokio::time::timeout(limit, s.read_to_end(&mut rest)).await {
+        Ok(_) => {
+            assert!(rest.is_empty(), "unexpected bytes: {rest:?}");
+            Some(started.elapsed())
+        }
+        Err(_) => None,
+    }
+}
+
+const GET_KEEP_ALIVE: &[u8] = b"GET /k HTTP/1.1\r\nhost: example.com\r\n\r\n";
+
+#[tokio::test]
+async fn silent_keep_alive_connections_close_after_the_header_timeout() {
+    let o = TestOrigin::start(handler(|_, _| reply(200, &[], "k"))).await;
+    let mut c = node_config("edge-a", &[o.addr], "");
+    c.timeouts.client_header_ms = 300;
+    let n = node::start(&c, &secrets()).await.unwrap();
+
+    // As in cachet's accept loop: with no idle_ms, a keep-alive connection
+    // that stays silent for client_header_ms is closed.
+    let mut s = TcpStream::connect(n.proxy_addr).await.unwrap();
+    s.write_all(GET_KEEP_ALIVE).await.unwrap();
+    assert!(read_response(&mut s).await.ends_with("\r\n\r\nk"));
+    let waited = closed_within(&mut s, Duration::from_secs(5)).await.unwrap();
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+
+    // Half a head, then silence: closed without a response.
+    let mut s = TcpStream::connect(n.proxy_addr).await.unwrap();
+    s.write_all(b"GET /k HTTP/1.1\r\nhost").await.unwrap();
+    let waited = closed_within(&mut s, Duration::from_secs(5)).await.unwrap();
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+    n.shutdown().await;
+}
+
+#[tokio::test]
+async fn idle_ms_keeps_connections_open_longer_than_the_header_timeout() {
+    let o = TestOrigin::start(handler(|_, _| reply(200, &[], "k"))).await;
+    let mut c = node_config("edge-a", &[o.addr], "");
+    c.timeouts.client_header_ms = 200;
+    c.timeouts.idle_ms = Some(5_000);
+    let n = node::start(&c, &secrets()).await.unwrap();
+    let mut s = TcpStream::connect(n.proxy_addr).await.unwrap();
+    s.write_all(GET_KEEP_ALIVE).await.unwrap();
+    read_response(&mut s).await;
+    // Well past the header timeout, the idle connection is still served.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    s.write_all(GET_KEEP_ALIVE).await.unwrap();
+    assert!(read_response(&mut s).await.ends_with("\r\n\r\nk"));
+    // A head that starts and stalls still gets only the header timeout.
+    s.write_all(b"GET /k HTTP/1.1\r\n").await.unwrap();
+    let waited = closed_within(&mut s, Duration::from_secs(3)).await.unwrap();
+    assert!(waited < Duration::from_secs(2), "{waited:?}");
+    n.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_closes_idle_connections_and_ends_busy_ones_after_their_request() {
+    let o = TestOrigin::start(handler(|_, _| reply(200, &[], "slow"))).await;
+    o.set_delay(Duration::from_millis(400));
+    let n = node::start(&node_config("edge-a", &[o.addr], ""), &secrets())
+        .await
+        .unwrap();
+    let mut idle = TcpStream::connect(n.proxy_addr).await.unwrap();
+    let mut busy = TcpStream::connect(n.proxy_addr).await.unwrap();
+    busy.write_all(GET_KEEP_ALIVE).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    let shutdown = tokio::spawn(n.shutdown());
+
+    // The idle connection is closed at once, the busy one gets its response
+    // with `Connection: close` and is then closed.
+    let waited = closed_within(&mut idle, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(waited < Duration::from_millis(300), "{waited:?}");
+    let resp = read_response(&mut busy).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(
+        resp.to_ascii_lowercase().contains("connection: close"),
+        "{resp}"
+    );
+    assert!(resp.ends_with("\r\n\r\nslow"), "{resp}");
+    assert!(
+        closed_within(&mut busy, Duration::from_secs(1))
+            .await
+            .is_some()
+    );
+    shutdown.await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn shutdown_closes_requests_still_open_after_shutdown_ms() {
+    let o = TestOrigin::start(handler(|_, _| reply(200, &[], "late"))).await;
+    o.set_delay(Duration::from_secs(10));
+    let mut c = node_config("edge-a", &[o.addr], "");
+    c.timeouts.shutdown_ms = 300;
+    c.timeouts.response_ms = 30_000;
+    let n = node::start(&c, &secrets()).await.unwrap();
+    let mut s = TcpStream::connect(n.proxy_addr).await.unwrap();
+    s.write_all(GET_KEEP_ALIVE).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    n.shutdown().await;
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    // The hung request's connection was closed, not left running.
+    assert!(
+        closed_within(&mut s, Duration::from_secs(1))
+            .await
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn startup_failures_are_reported() {
     let o = TestOrigin::start(handler(|_, _| reply(200, &[], "x"))).await;

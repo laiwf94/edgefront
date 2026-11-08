@@ -1,4 +1,4 @@
-//! The admin router and cachet's accept loop, exercised over real TCP
+//! The admin router on the core listener, exercised over real TCP
 //! connections with hand-written HTTP/1.1.
 
 use std::net::SocketAddr;
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use edgefront_core::admin::{BearerToken, Router, json, read_body};
 use edgefront_core::body::text;
-use edgefront_core::server::{ServerLimits, serve};
+use edgefront_core::listener::{ServerLimits, serve};
 use http::{Method, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -57,9 +57,11 @@ fn router() -> Router<State> {
 }
 
 const LIMITS: ServerLimits = ServerLimits {
-    header_read: Duration::from_millis(300),
+    header_read_timeout: Duration::from_millis(300),
+    idle_timeout: Duration::from_millis(300),
     max_header_bytes: 8192,
-    drain: Duration::from_secs(2),
+    max_headers: 100,
+    drain_timeout: Duration::from_secs(2),
 };
 
 struct Server {
@@ -73,9 +75,12 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(serve(listener, Arc::new(router()), limits, async {
-            let _ = rx.await;
-        }));
+        let task = tokio::spawn(async move {
+            serve(listener, Arc::new(router()), limits, async {
+                let _ = rx.await;
+            })
+            .await;
+        });
         Server {
             addr,
             stop: Some(tx),
@@ -200,8 +205,8 @@ async fn slow_and_oversized_heads_are_refused() {
     let server = Server::start(LIMITS).await;
     let a = server.addr;
 
-    // Half a head, then silence: hyper closes the connection without a
-    // response after the header read timeout.
+    // Half a head, then silence: the listener closes the connection
+    // without a response after the header read timeout.
     let started = Instant::now();
     let r = exchange(a, b"GET /healthz HTTP/1.1\r\nhost").await;
     let waited = started.elapsed();
@@ -237,7 +242,7 @@ async fn shutdown_lets_open_requests_finish() {
 #[tokio::test]
 async fn shutdown_gives_up_after_the_drain_timeout() {
     let limits = ServerLimits {
-        drain: Duration::from_millis(200),
+        drain_timeout: Duration::from_millis(200),
         ..LIMITS
     };
     let server = Server::start(limits).await;
