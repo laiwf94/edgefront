@@ -29,6 +29,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt;
 
+use edgefront_limiter::clock::{EPOCH_NS, epoch_of};
 use edgefront_limiter::gcra::MAX_TOL_TICKS;
 use edgefront_limiter::{Decision, Error, Gcra, Rate};
 use proptest::prelude::*;
@@ -340,8 +341,30 @@ fn gen_rate(s: &mut impl Source) -> Rate {
     r
 }
 
+/// Where a script's clock runs: from `start` (plus up to a second) to
+/// `horizon`, and whether it sometimes jumps ahead by up to three epochs.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: u64,
+    horizon: u64,
+    jumps: bool,
+}
+
+/// The span every seeded and proptest script used before the moving epoch:
+/// well inside libpacer's clamp at 2^57.
+const PACER_SPAN: Span = Span {
+    start: 0,
+    horizon: HORIZON_NS,
+    jumps: false,
+};
+
 /// A time step that keeps the bucket moving between empty and full.
-fn gen_step(s: &mut impl Source, m: &RefBucket, steps_left: usize) -> u64 {
+fn gen_step(s: &mut impl Source, m: &RefBucket, steps_left: usize, span: Span) -> u64 {
+    if span.jumps && s.below(64) == 0 {
+        // Idle for anything up to three epochs.
+        let room = (span.horizon - m.now) / (steps_left as u64 + 1);
+        return s.below(3 * EPOCH_NS).min(room);
+    }
     let token_ns = Rat::int(1).div(m.rate).ceil_nonneg();
     let dt = match s.below(8) {
         // Several operations at the same instant.
@@ -352,7 +375,7 @@ fn gen_step(s: &mut impl Source, m: &RefBucket, steps_left: usize) -> u64 {
         6 => s.below(token_ns * 4 + 1),
         _ => s.below(token_ns * m.burst.min(64) * 2 + 1),
     };
-    let room = (HORIZON_NS - m.now) / (steps_left as u64 + 1);
+    let room = (span.horizon - m.now) / (steps_left as u64 + 1);
     dt.min(room)
 }
 
@@ -398,6 +421,10 @@ impl fmt::Display for Divergence {
 /// draws and uses one token per nanosecond, so a tape of zeros still makes
 /// a script.
 fn run(s: &mut impl Source, steps: usize) -> Result<(), String> {
+    run_in(s, steps, PACER_SPAN)
+}
+
+fn run_in(s: &mut impl Source, steps: usize, span: Span) -> Result<(), String> {
     let mut r = gen_rate(s);
     let mut tries = 0;
     while ref_rate(&r).is_none() {
@@ -408,7 +435,7 @@ fn run(s: &mut impl Source, steps: usize) -> Result<(), String> {
             Rate::new(1, 1, 1)
         };
     }
-    let mut m = RefBucket::new(&r, 1 + s.below(1_000_000_000)).expect("valid rate");
+    let mut m = RefBucket::new(&r, span.start + 1 + s.below(1_000_000_000)).expect("valid rate");
     let g = match Gcra::new(&r) {
         Ok(g) if rate_within_contract(&r, m.rate) => g,
         _ => {
@@ -431,7 +458,7 @@ fn run(s: &mut impl Source, steps: usize) -> Result<(), String> {
     );
 
     for step in 0..steps {
-        let now = m.now + gen_step(s, &m, steps - step);
+        let now = m.now + gen_step(s, &m, steps - step, span);
         let b = m.burst;
         let kind = s.below(100);
         let (op, want, got): (String, Outcome, Outcome) = if kind < 35 {
@@ -538,6 +565,70 @@ fn model_gcra_matches_reference_bucket() {
         .take(3)
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Nanoseconds in a Julian year.
+const YEAR: u64 = 31_557_600_000_000_000;
+
+/// The spans for one uptime: starting there; starting just before the next
+/// epoch boundary, so the script crosses it; and starting there with idle
+/// jumps across up to 24 epochs.
+fn spans_at(uptime: u64) -> [Span; 3] {
+    let boundary = (epoch_of(uptime) + 1) * EPOCH_NS;
+    [
+        Span {
+            start: uptime,
+            horizon: uptime + HORIZON_NS,
+            jumps: false,
+        },
+        Span {
+            start: boundary - 1_000_000_001,
+            horizon: boundary + HORIZON_NS,
+            jumps: false,
+        },
+        Span {
+            start: uptime,
+            horizon: uptime + 24 * EPOCH_NS,
+            jumps: true,
+        },
+    ]
+}
+
+/// libpacer's clock stopped at 2^57 ns, about 4.57 years. The library must
+/// match the reference at 4.5, 10 and 100 years of synthetic uptime, across
+/// epoch boundaries and across long idle gaps, as it does from zero.
+#[test]
+fn model_gcra_matches_reference_at_long_uptimes() {
+    let seeds = env_u64("EDGEFRONT_MODEL_SEEDS").unwrap_or(DEFAULT_SEEDS / 3);
+    let mut failures = Vec::new();
+    for uptime in [45 * YEAR / 10, 10 * YEAR, 100 * YEAR] {
+        for (i, span) in spans_at(uptime).into_iter().enumerate() {
+            for seed in 1..=seeds {
+                if let Err(e) = run_in(&mut SplitMix(seed), STEPS, span) {
+                    failures.push(format!(
+                        "model_gcra: uptime {uptime} ns, span {i} {span:?}, seed {seed}: {e}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures[..failures.len().min(3)].join("\n")
+    );
+}
+
+#[test]
+fn long_uptime_spans_cross_epochs() {
+    for uptime in [45 * YEAR / 10, 10 * YEAR, 100 * YEAR] {
+        let [at, straddle, idle] = spans_at(uptime);
+        assert!(at.start < at.horizon);
+        assert_eq!(epoch_of(straddle.start) + 1, epoch_of(straddle.horizon));
+        assert!(epoch_of(idle.horizon) >= epoch_of(idle.start) + 24);
+        assert!(idle.jumps && !at.jumps);
+    }
+    assert_eq!(epoch_of(100 * YEAR), 43);
 }
 
 proptest! {

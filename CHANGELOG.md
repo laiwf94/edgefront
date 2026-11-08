@@ -36,6 +36,7 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ### Limiter
 
+- `Gcra` has no 4.5-year horizon any more. It stores its arrival time as an offset from a moving epoch of 2^56 ns and rebases it lock-free when the time it has to store moves on, so every `u64` timestamp is valid and decisions equal exact arithmetic on absolute time. `Gcra::tat` now returns `u128`, and `Gcra::base_epoch` is new. New module `edgefront_limiter::clock`: the epoch arithmetic, a `Clock` trait, `MonotonicClock` and `ManualClock`. The reference model checks the limiter at 4.5, 10 and 100 years of uptime, across epoch boundaries and idle gaps. Below libpacer's horizon nothing changes, and the difftest applies pacer's clamp before calling `Gcra`. (#82)
 - `edgefront_limiter::config`: pacerd's config in Rust. `parse_pacerd` accepts and rejects pacerd.conf files as pacerd does, with the same message and line number. `LimiterConfig` also loads through serde as a TOML section that uses pacerd's directive names and value syntax, and writes back out in either syntax. serde becomes the crate's one dependency. (#82)
 - New crate `edgefront-limiter`, libpacer's algorithms in safe Rust with no dependencies (#79):
   - `Gcra`: an exact, lock-free token bucket whose arrival time is one `AtomicU64`, with `take`, `take_upto`, `take_range`, `refund`, `remaining` and `reconfigure`, and retry-after times exact to the nanosecond.

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clock;
 pub mod config;
 pub mod gcra;
 pub mod siphash;

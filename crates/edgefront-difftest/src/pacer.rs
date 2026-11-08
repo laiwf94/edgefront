@@ -25,6 +25,13 @@
 //! - libpacer's window compares `now < head_start + slot_ns`, which wraps
 //!   for a window near the top of the clock; edgefront-limiter compares the
 //!   difference. The generated clock stays below [`generate::CLOCK_MAX`].
+//!
+//! One more difference is reconciled here rather than avoided: libpacer
+//! clamps a lone limiter's timestamps at 2^57 ns, where its absolute
+//! arrival times run out, while `Gcra` keeps them in a moving epoch and has
+//! no horizon. The interpreter applies libpacer's clamp before calling
+//! `Gcra`, so the generated clock still crosses it. (The keyed table keeps
+//! the clamp itself.)
 
 pub mod generate;
 
@@ -33,6 +40,7 @@ use std::fmt::{self, Write as _};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+use edgefront_limiter::gcra::MAX_NOW_NS;
 use edgefront_limiter::table::KEY_MAX;
 use edgefront_limiter::{
     Decision, Error, FullPolicy, Gcra, KeyHash, Rate, Table, TableConfig, Window,
@@ -158,7 +166,10 @@ impl Interpreter {
             return Err("usage: gcra I OP ...".into());
         }
         let i = parse_index(argv[1])?;
-        let (op, now) = (argv[2], self.now);
+        // libpacer clamps a lone limiter's clock at 2^57 ns; edgefront's
+        // `Gcra` has no horizon, so the clamp is applied here, as the C
+        // driver's library applies it.
+        let (op, now) = (argv[2], self.now.min(MAX_NOW_NS - 1));
         let mut out = String::new();
         if op == "init" {
             need(argv, 6, "gcra I init T P B")?;
