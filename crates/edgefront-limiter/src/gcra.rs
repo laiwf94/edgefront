@@ -27,8 +27,9 @@ use crate::clock::{self, EPOCH_TICKS};
 /// Bits of sub-nanosecond precision: one tick is 1/64 ns.
 pub const TICK_SHIFT: u32 = 6;
 /// libpacer's horizon, about 4.5 years: its absolute arrival times stopped
-/// here. The keyed table still clamps timestamps at or past it to one
-/// nanosecond before; [`Gcra`] has no horizon (see [`crate::clock`]).
+/// here, and it clamped timestamps at or past it to one nanosecond before.
+/// Neither [`Gcra`] nor [`crate::Table`] has a horizon (see
+/// [`crate::clock`]); the differential tests apply the clamp themselves.
 pub const MAX_NOW_NS: u64 = 1 << 57;
 /// The largest tolerance (burst times interval) a rate may have, in ticks.
 pub const MAX_TOL_TICKS: u64 = 1 << 62;
@@ -253,16 +254,9 @@ macro_rules! decision_steps {
 
 #[allow(clippy::useless_conversion)]
 pub(crate) mod step {
-    use super::{Decision, MAX_NOW_NS, TICK_SHIFT};
+    use super::{Decision, TICK_SHIFT};
 
     decision_steps!(u64);
-
-    /// Nanoseconds to absolute ticks, clamping past libpacer's horizon. For
-    /// the keyed table, which still keeps absolute arrival times.
-    #[inline]
-    pub(crate) fn ticks(now_ns: u64) -> u64 {
-        now_ns.min(MAX_NOW_NS - 1) << TICK_SHIFT
-    }
 }
 
 #[allow(clippy::useless_conversion)]
@@ -850,8 +844,6 @@ mod tests {
             g.tat(),
             clock::ticks_wide(u64::MAX) + u128::from(g.interval())
         );
-        // The keyed table still clamps at libpacer's horizon.
-        assert_eq!(step::ticks(MAX_NOW_NS), step::ticks(MAX_NOW_NS - 1));
     }
 
     #[test]
@@ -1075,7 +1067,7 @@ mod tests {
         assert!(allowed(&g, SEC, 1));
         // A fresh bucket is based at now: one token moves the arrival time
         // one interval past it.
-        assert_eq!(g.tat(), u128::from(step::ticks(SEC) + g.interval()));
+        assert_eq!(g.tat(), clock::ticks_wide(SEC) + u128::from(g.interval()));
         assert_eq!(g.tolerance(), 10 * g.interval());
     }
 

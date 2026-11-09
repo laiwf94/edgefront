@@ -27,11 +27,12 @@
 //!   difference. The generated clock stays below [`generate::CLOCK_MAX`].
 //!
 //! One more difference is reconciled here rather than avoided: libpacer
-//! clamps a lone limiter's timestamps at 2^57 ns, where its absolute
-//! arrival times run out, while `Gcra` keeps them in a moving epoch and has
-//! no horizon. The interpreter applies libpacer's clamp before calling
-//! `Gcra`, so the generated clock still crosses it. (The keyed table keeps
-//! the clamp itself.)
+//! clamps the timestamps of lone limiters and keyed tables at 2^57 ns,
+//! where its absolute arrival times run out, while `Gcra` and `Table` keep
+//! them in a moving epoch and have no horizon. The interpreter applies
+//! libpacer's clamp before calling either, so the generated clock still
+//! crosses it. Below the clamp neither moves its base epoch, so arrival
+//! times are absolute ticks that fit in 64 bits, as in the C.
 
 pub mod generate;
 
@@ -234,7 +235,8 @@ impl Interpreter {
             return Err("usage: table I OP ...".into());
         }
         let i = parse_index(argv[1])?;
-        let (op, now) = (argv[2], self.now);
+        // libpacer's table clamps at 2^57 ns too; `Table` does not.
+        let (op, now) = (argv[2], self.now.min(MAX_NOW_NS - 1));
         let mut out = String::new();
         if op == "create" {
             need(

@@ -14,11 +14,21 @@
 //! is identical to a fresh entry, so dropping it changes no decision),
 //! looking at the eight least recently used. If none is idle, the
 //! [`FullPolicy`] decides.
+//!
+//! libpacer kept each entry's arrival time as absolute ticks and clamped
+//! timestamps at 2^57 ns, so past about 4.5 years of uptime its keyed
+//! limits stopped refilling. Here each shard has a *base epoch* (see
+//! [`crate::clock`]) and its entries keep their arrival times as offsets
+//! from the start of it. The base follows the newest timestamp the shard
+//! has seen, one epoch behind it, and moves under the shard lock, so any
+//! `u64` timestamp works and decisions equal exact arithmetic on absolute
+//! time.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use crate::gcra::{Decision, Error, Rate, step};
+use crate::clock::{self, EPOCH_SHIFT, EPOCH_TICKS};
+use crate::gcra::{Decision, Error, Rate, TICK_SHIFT, step};
 use crate::siphash::{KEY_LEN, KeyHash, random_key};
 
 /// The longest key a table stores, in bytes. An IPv6 address with a port
@@ -108,8 +118,11 @@ pub struct TableStats {
 /// One key's state, as reported by [`Table::get`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EntryState {
-    /// The theoretical arrival time in ticks.
-    pub tat: u64,
+    /// The theoretical arrival time in ticks since the clock's start. It
+    /// needs more than 64 bits after about 9 years of uptime. An arrival
+    /// time before the start of the shard's base epoch, which is idle, reads
+    /// as that start (see [`Table`]).
+    pub tat: u128,
     /// Holds currently open.
     pub holds: u32,
 }
@@ -123,6 +136,7 @@ pub struct EntryState {
 #[repr(align(64))]
 struct Entry {
     hash: u64,
+    /// The arrival time in ticks from the start of the shard's base epoch.
     tat: u64,
     /// LRU neighbours, as slot indexes in the same shard.
     prev: u32,
@@ -169,6 +183,9 @@ struct ShardStats {
 
 struct Shard {
     slots: Box<[Entry]>,
+    /// The base epoch: entries' arrival times count from its start. It is
+    /// one epoch behind the newest timestamp the shard has seen, or 0.
+    base: u64,
     /// Slot count - 1; the count is a power of two.
     mask: u32,
     /// Most keys this shard may hold.
@@ -187,6 +204,43 @@ struct Shard {
 struct Padded(Mutex<Shard>);
 
 impl Shard {
+    /// `now_ns` in ticks from the start of the base epoch, after moving the
+    /// base up when `now_ns` is two or more epochs past it. The result is
+    /// below two epochs, 2^63 ticks, so an arrival time up to the deepest
+    /// tolerance past it still fits in 64 bits. A timestamp before the
+    /// base epoch's start counts as that start.
+    #[inline]
+    fn now(&mut self, now_ns: u64) -> u64 {
+        let epoch = clock::epoch_of(now_ns);
+        if epoch > self.base + 1 {
+            self.rebase(epoch - 1);
+        }
+        now_ns.saturating_sub(self.base << EPOCH_SHIFT) << TICK_SHIFT
+    }
+
+    /// Move the base epoch up to `base`, shifting every arrival time down
+    /// by the epochs it moved. One pass over the slots, at most once every
+    /// 2^56 ns (about 2.28 years) per shard. An arrival time that falls
+    /// before the new start becomes the start: it is at least an epoch
+    /// before any timestamp the shard will accept, so the entry was idle
+    /// and stays idle, and no decision changes.
+    #[cold]
+    #[inline(never)]
+    fn rebase(&mut self, base: u64) {
+        let shift = u128::from(base - self.base) * u128::from(EPOCH_TICKS);
+        for e in self.slots.iter_mut().filter(|e| e.keylen != 0) {
+            // Never larger than the old offset, so it fits.
+            e.tat = u128::from(e.tat).saturating_sub(shift) as u64;
+        }
+        self.base = base;
+    }
+
+    /// An entry's arrival time in ticks since the clock's start.
+    #[inline]
+    fn absolute(&self, tat: u64) -> u128 {
+        clock::epoch_start(self.base) + u128::from(tat)
+    }
+
     #[inline]
     fn home(&self, hash: u64) -> u32 {
         hash as u32 & self.mask
@@ -369,7 +423,8 @@ impl Shard {
     }
 
     /// Remove every idle entry in one pass and return how many went.
-    fn sweep(&mut self, now: u64) -> usize {
+    fn sweep(&mut self, now_ns: u64) -> usize {
+        let now = self.now(now_ns);
         let mut removed = 0;
         let mut i = 0;
         while i <= self.mask {
@@ -416,6 +471,15 @@ impl Shard {
 
 /// A fixed-memory, sharded table of per-key GCRA limiters. Every method is
 /// thread-safe; keys are copied.
+///
+/// Arrival times count from each shard's base epoch, which a timestamp two
+/// or more epochs past it moves up to the epoch before that timestamp's,
+/// under the shard lock, in one pass over the shard's slots. Any `u64`
+/// timestamp works, and decisions are exact arithmetic on absolute time.
+/// As with [`crate::Gcra`], callers sharing a table must use timestamps
+/// within one epoch (2^56 ns, about 2.28 years) of each other, which any
+/// monotonic clock gives: a timestamp before the start of a shard's base
+/// epoch counts as that start.
 pub struct Table {
     shards: Box<[Padded]>,
     /// The top bits of a hash pick the shard; 64 for a single shard.
@@ -489,6 +553,7 @@ impl Table {
                     slots: vec![Entry::EMPTY; slots_per_shard as usize].into_boxed_slice(),
                     mask: slots_per_shard - 1,
                     limit: base + u32::from(i < extra),
+                    base: 0,
                     count: 0,
                     head: NIL,
                     tail: NIL,
@@ -541,8 +606,8 @@ impl Table {
         if cost > tol / iv {
             return Err(Error::CostExceedsBurst);
         }
-        let now = step::ticks(now_ns);
         let (hash, mut s) = self.lock(key);
+        let now = s.now(now_ns);
         let e = s
             .find_or_insert(self.policy, now, hash, key)
             .ok_or(Error::TableFull)?;
@@ -571,8 +636,8 @@ impl Table {
     ) -> Result<Decision, Error> {
         check_key(key)?;
         let (iv, tol) = self.rate();
-        let now = step::ticks(now_ns);
         let (hash, mut s) = self.lock(key);
+        let now = s.now(now_ns);
         let e = s
             .find_or_insert(self.policy, now, hash, key)
             .ok_or(Error::TableFull)?;
@@ -590,8 +655,8 @@ impl Table {
             return;
         }
         let iv = self.interval.load(Ordering::Relaxed);
-        let now = step::ticks(now_ns);
         let (hash, mut s) = self.lock(key);
+        let now = s.now(now_ns);
         if let Some(e) = s.find(hash, key) {
             e.tat = step::refund(e.tat, now, tokens, iv);
         }
@@ -607,8 +672,8 @@ impl Table {
     pub fn hold(&self, key: &[u8], now_ns: u64, max_holds: u32) -> Result<Decision, Error> {
         check_key(key)?;
         let (iv, tol) = self.rate();
-        let now = step::ticks(now_ns);
         let (hash, mut s) = self.lock(key);
+        let now = s.now(now_ns);
         let e = s
             .find_or_insert(self.policy, now, hash, key)
             .ok_or(Error::TableFull)?;
@@ -658,9 +723,10 @@ impl Table {
     pub fn get(&self, key: &[u8]) -> Option<EntryState> {
         check_key(key).ok()?;
         let (hash, mut s) = self.lock(key);
-        s.find(hash, key).map(|e| EntryState {
-            tat: e.tat,
-            holds: e.holds,
+        let (tat, holds) = s.find(hash, key).map(|e| (e.tat, e.holds))?;
+        Some(EntryState {
+            tat: s.absolute(tat),
+            holds,
         })
     }
 
@@ -679,12 +745,11 @@ impl Table {
     /// reclaim idle entries on their own; sweeping keeps `entries` honest
     /// and room ready.
     pub fn sweep(&self, now_ns: u64, nshards: u32) -> usize {
-        let now = step::ticks(now_ns);
         let n = self.shards.len();
         let mut removed = 0;
         for _ in 0..(nshards as usize).min(n) {
             let idx = self.sweep_cursor.fetch_add(1, Ordering::Relaxed) as usize;
-            removed += lock(&self.shards[idx & (n - 1)]).sweep(now);
+            removed += lock(&self.shards[idx & (n - 1)]).sweep(now_ns);
         }
         removed
     }
@@ -738,6 +803,8 @@ mod tests {
     //! reference-model comparison and threaded checks.
 
     use super::*;
+    use crate::clock::EPOCH_NS;
+    use crate::gcra::wide;
     use crate::siphash;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
@@ -1203,7 +1270,7 @@ mod tests {
         let st = t.get(key_name(0).as_bytes()).unwrap();
         assert_eq!(
             st.tat,
-            step::ticks(SEC) + t.interval.load(Ordering::Relaxed)
+            clock::ticks_wide(SEC) + u128::from(t.interval.load(Ordering::Relaxed))
         );
         assert_eq!(st.holds, 0);
         assert_eq!(take_key(&t, 100, SEC), Ok(true));
@@ -1259,18 +1326,51 @@ mod tests {
     }
 
     /// A one-shard table written the obvious way: a map of states and a
-    /// recency queue, coldest first. It knows nothing of slots, probing or
-    /// intrusive links, so agreeing with it checks those.
+    /// recency queue, coldest first, with arrival times as exact absolute
+    /// ticks in 128 bits. It knows nothing of slots, probing, intrusive
+    /// links or epochs, so agreeing with it checks those.
     struct Model {
         limit: usize,
         policy: FullPolicy,
-        iv: u64,
-        tol: u64,
+        iv: u128,
+        tol: u128,
         states: HashMap<Vec<u8>, EntryState>,
         lru: VecDeque<Vec<u8>>,
+        /// The newest epoch the shard has been given a timestamp in.
+        newest_epoch: u64,
     }
 
     impl Model {
+        fn new(limit: u32, policy: FullPolicy, rate: Rate) -> Self {
+            let (iv, tol) = rate.ticks().unwrap();
+            Self {
+                limit: limit as usize,
+                policy,
+                iv: u128::from(iv),
+                tol: u128::from(tol),
+                states: HashMap::new(),
+                lru: VecDeque::new(),
+                newest_epoch: 0,
+            }
+        }
+
+        /// `now_ns` in absolute ticks, noting its epoch.
+        fn at(&mut self, now_ns: u64) -> u128 {
+            self.newest_epoch = self.newest_epoch.max(clock::epoch_of(now_ns));
+            clock::ticks_wide(now_ns)
+        }
+
+        /// What [`Table::get`] reports: the exact state, except that an
+        /// arrival time before the shard's base epoch, one behind the
+        /// newest, reads as its start.
+        fn get(&self, key: &[u8]) -> Option<EntryState> {
+            let floor = clock::epoch_start(self.newest_epoch.saturating_sub(1));
+            self.states.get(key).map(|e| EntryState {
+                tat: e.tat.max(floor),
+                holds: e.holds,
+            })
+        }
+
         fn touch(&mut self, key: &[u8]) {
             let pos = self.lru.iter().position(|k| k == key).unwrap();
             let k = self.lru.remove(pos).unwrap();
@@ -1290,7 +1390,7 @@ mod tests {
             found.is_some()
         }
 
-        fn entry(&mut self, key: &[u8], now: u64) -> Option<&mut EntryState> {
+        fn entry(&mut self, key: &[u8], now: u128) -> Option<&mut EntryState> {
             if self.states.contains_key(key) {
                 self.touch(key);
             } else {
@@ -1300,114 +1400,320 @@ mod tests {
                 {
                     return None;
                 }
+                // A fresh entry is a full bucket: any arrival time not
+                // after `now` will do, and the start of time is one.
                 self.states.insert(key.to_vec(), EntryState::default());
                 self.lru.push_back(key.to_vec());
             }
             self.states.get_mut(key)
         }
 
-        fn take(&mut self, key: &[u8], now: u64, cost: u64) -> Result<Decision, Error> {
+        fn take(&mut self, key: &[u8], now_ns: u64, cost: u64) -> Result<Decision, Error> {
             let (iv, tol) = (self.iv, self.tol);
-            if cost > tol / iv {
+            if u128::from(cost) > tol / iv {
                 return Err(Error::CostExceedsBurst);
             }
+            let now = self.at(now_ns);
             let e = self.entry(key, now).ok_or(Error::TableFull)?;
             let mut d = Decision::default();
-            if let Some(next) = step::take(e.tat, now, cost, iv, tol, &mut d) {
+            if let Some(next) = wide::take(e.tat, now, cost, iv, tol, &mut d) {
                 e.tat = next;
             }
             Ok(d)
         }
 
-        fn hold(&mut self, key: &[u8], now: u64, max: u32) -> Result<Decision, Error> {
+        fn take_range(
+            &mut self,
+            key: &[u8],
+            now_ns: u64,
+            min: u64,
+            max: u64,
+        ) -> Result<Decision, Error> {
             let (iv, tol) = (self.iv, self.tol);
+            let now = self.at(now_ns);
+            let e = self.entry(key, now).ok_or(Error::TableFull)?;
+            let mut d = Decision::default();
+            if let Some((_, next)) = wide::range(e.tat, now, min, max, iv, tol, &mut d) {
+                e.tat = next;
+            }
+            Ok(d)
+        }
+
+        fn hold(&mut self, key: &[u8], now_ns: u64, max: u32) -> Result<Decision, Error> {
+            let (iv, tol) = (self.iv, self.tol);
+            let now = self.at(now_ns);
             let e = self.entry(key, now).ok_or(Error::TableFull)?;
             if e.holds >= max {
                 return Err(Error::HoldLimit);
             }
             let mut d = Decision::default();
-            if let Some(next) = step::take(e.tat, now, 1, iv, tol, &mut d) {
+            if let Some(next) = wide::take(e.tat, now, 1, iv, tol, &mut d) {
                 e.tat = next;
                 e.holds += 1;
             }
             Ok(d)
         }
+
+        fn refund(&mut self, key: &[u8], now_ns: u64, tokens: u64) {
+            let now = self.at(now_ns);
+            let iv = self.iv;
+            if let Some(e) = self.states.get_mut(key) {
+                e.tat = wide::refund(e.tat, now, tokens, iv);
+            }
+        }
+    }
+
+    /// Nanoseconds in a Julian year.
+    const YEAR: u64 = 31_557_600_000_000_000;
+
+    /// How a reference-model run moves its clock.
+    #[derive(Clone, Copy, Debug)]
+    enum Uptime {
+        /// From `start`, in steps of up to 200 ms.
+        From(u64),
+        /// From 10 s before the end of the epoch `start` is in, so the run
+        /// (about 27 s of clock) crosses an epoch boundary with keys in
+        /// debt.
+        AcrossBoundary(u64),
+        /// From `start`, now and then idling for up to three epochs.
+        WithIdleJumps(u64),
+    }
+
+    /// Run one seeded script of 3,000 operations against the table and the
+    /// model, checking every result and the touched key's state after each
+    /// step.
+    fn run_against_model(seed: u64, uptime: Uptime) {
+        let mut rng = Rng(seed);
+        let policy = if seed.is_multiple_of(2) {
+            FullPolicy::Deny
+        } else {
+            FullPolicy::Evict
+        };
+        let limit = 1 + rng.below(40) as u32;
+        let rate = Rate::new(1 + rng.below(20), SEC, 1 + rng.below(4));
+        let t = Table::new(&config(limit, 1, rate, policy)).unwrap();
+        let mut m = Model::new(limit, policy, rate);
+        let nkeys = 1 + rng.below(3 * u64::from(limit));
+        let (mut now_ns, jumps) = match uptime {
+            Uptime::From(start) => (start, false),
+            Uptime::AcrossBoundary(start) => {
+                let end = (clock::epoch_of(start) + 1) << EPOCH_SHIFT;
+                (end - 10 * SEC, false)
+            }
+            Uptime::WithIdleJumps(start) => (start, true),
+        };
+        for step_no in 0..3000 {
+            let key = key_name(rng.below(nkeys) as u32);
+            let key = key.as_bytes();
+            let ctx = format!("seed {seed} {uptime:?} step {step_no} at {now_ns} ns");
+            match rng.below(11) {
+                0..=4 => {
+                    let cost = rng.below(4);
+                    assert_eq!(
+                        t.take(key, now_ns, cost),
+                        m.take(key, now_ns, cost),
+                        "{ctx}"
+                    );
+                }
+                5 => assert_eq!(t.hold(key, now_ns, 2), m.hold(key, now_ns, 2), "{ctx}"),
+                6 => {
+                    let want = match m.states.get_mut(key) {
+                        Some(e) if e.holds > 0 => {
+                            e.holds -= 1;
+                            Ok(())
+                        }
+                        _ => Err(Error::NoSuchKey),
+                    };
+                    assert_eq!(t.release(key), want, "{ctx}");
+                }
+                7 => {
+                    let want = match m.states.remove(key) {
+                        Some(_) => {
+                            m.lru.retain(|k| k != key);
+                            Ok(())
+                        }
+                        None => Err(Error::NoSuchKey),
+                    };
+                    assert_eq!(t.remove(key), want, "{ctx}");
+                }
+                8 => {
+                    let tokens = rng.below(3);
+                    t.refund(key, now_ns, tokens);
+                    m.refund(key, now_ns, tokens);
+                }
+                9 => {
+                    let (min, max) = (rng.below(4), rng.below(5));
+                    assert_eq!(
+                        t.take_range(key, now_ns, min, max),
+                        m.take_range(key, now_ns, min, max),
+                        "{ctx}"
+                    );
+                }
+                _ if jumps && rng.below(20) == 0 => {
+                    now_ns = now_ns.saturating_add(rng.below(3 * EPOCH_NS));
+                }
+                _ => now_ns += rng.below(SEC / 5),
+            }
+            assert_eq!(t.get(key), m.get(key), "{ctx}");
+        }
+        t.check_invariants().unwrap();
+        let st = t.stats();
+        assert_eq!(st.entries, m.states.len() as u64, "seed {seed} {uptime:?}");
+        let holds: u64 = m.states.values().map(|e| u64::from(e.holds)).sum();
+        assert_eq!(st.holds, holds, "seed {seed} {uptime:?}");
+        for k in m.lru.clone() {
+            assert_eq!(t.get(&k), m.get(&k), "seed {seed} {uptime:?}");
+        }
+        // Sweeping far in the future leaves only the held keys.
+        let held = m.states.values().filter(|e| e.holds > 0).count();
+        t.sweep(now_ns + 100 * SEC, 1);
+        assert_eq!(t.stats().entries, held as u64, "seed {seed} {uptime:?}");
     }
 
     #[test]
     fn matches_a_reference_model() {
         for seed in 0..40u64 {
-            let mut rng = Rng(seed);
-            let policy = if seed % 2 == 0 {
-                FullPolicy::Deny
-            } else {
-                FullPolicy::Evict
-            };
-            let limit = 1 + rng.below(40) as u32;
-            let rate = Rate::new(1 + rng.below(20), SEC, 1 + rng.below(4));
-            let t = Table::new(&config(limit, 1, rate, policy)).unwrap();
-            let (iv, tol) = rate.ticks().unwrap();
-            let mut m = Model {
-                limit: limit as usize,
-                policy,
-                iv,
-                tol,
-                states: HashMap::new(),
-                lru: VecDeque::new(),
-            };
-            let nkeys = 1 + rng.below(3 * u64::from(limit));
-            let mut now_ns = SEC;
-            for step_no in 0..3000 {
-                let key = key_name(rng.below(nkeys) as u32);
-                let key = key.as_bytes();
-                let now = step::ticks(now_ns);
-                let ctx = format!("seed {seed} step {step_no}");
-                match rng.below(10) {
-                    0..=4 => {
-                        let cost = rng.below(4);
-                        assert_eq!(t.take(key, now_ns, cost), m.take(key, now, cost), "{ctx}");
-                    }
-                    5 => assert_eq!(t.hold(key, now_ns, 2), m.hold(key, now, 2), "{ctx}"),
-                    6 => {
-                        let want = match m.states.get_mut(key) {
-                            Some(e) if e.holds > 0 => {
-                                e.holds -= 1;
-                                Ok(())
-                            }
-                            _ => Err(Error::NoSuchKey),
-                        };
-                        assert_eq!(t.release(key), want, "{ctx}");
-                    }
-                    7 => {
-                        let want = match m.states.remove(key) {
-                            Some(_) => {
-                                m.lru.retain(|k| k != key);
-                                Ok(())
-                            }
-                            None => Err(Error::NoSuchKey),
-                        };
-                        assert_eq!(t.remove(key), want, "{ctx}");
-                    }
-                    8 => {
-                        let tokens = rng.below(3);
-                        t.refund(key, now_ns, tokens);
-                        if let Some(e) = m.states.get_mut(key) {
-                            e.tat = step::refund(e.tat, now, tokens, iv);
-                        }
-                    }
-                    _ => now_ns += rng.below(SEC / 5),
-                }
-                assert_eq!(t.get(key), m.states.get(key).copied(), "{ctx}");
+            run_against_model(seed, Uptime::From(SEC));
+        }
+    }
+
+    #[test]
+    fn matches_the_reference_model_at_years_of_uptime() {
+        // libpacer's table stopped refilling at 4.5 years; the epoch keeps
+        // decisions exact at 4.5, 10 and 100 years, across epoch boundaries
+        // with keys in debt, and after idling for up to three epochs.
+        for start in [45 * YEAR / 10, 10 * YEAR, 100 * YEAR] {
+            for seed in 0..12u64 {
+                run_against_model(seed, Uptime::From(start));
+                run_against_model(seed, Uptime::AcrossBoundary(start));
+                run_against_model(seed, Uptime::WithIdleJumps(start));
             }
+        }
+    }
+
+    #[test]
+    fn keyed_limits_refill_past_libpacers_horizon() {
+        // 10/s with a burst of 2, drained at 100 years: libpacer's clamp
+        // would have frozen this key at 4.5 years and denied it forever.
+        let t = make_table(100, 1, 2);
+        let t0 = 100 * YEAR;
+        assert!(t.take(b"k", t0, 2).unwrap().allowed);
+        let d = t.take(b"k", t0, 1).unwrap();
+        assert!(!d.allowed);
+        // One token is 100 ms away.
+        assert_eq!(d.retry_after_ns, SEC / 10);
+        assert!(!t.take(b"k", t0 + SEC / 10 - 1, 1).unwrap().allowed);
+        assert!(t.take(b"k", t0 + SEC / 10, 1).unwrap().allowed);
+        let iv = u128::from(t.interval.load(Ordering::Relaxed));
+        assert_eq!(t.get(b"k").unwrap().tat, clock::ticks_wide(t0) + 3 * iv);
+        assert_eq!(lock(&t.shards[0]).base, clock::epoch_of(t0) - 1);
+        // Every u64 timestamp works.
+        assert!(t.take(b"k", u64::MAX - SEC, 2).unwrap().allowed);
+        let d = t.take(b"k", u64::MAX - SEC + SEC / 20, 1).unwrap();
+        assert_eq!((d.allowed, d.retry_after_ns), (false, SEC / 20));
+        assert!(t.take(b"k", u64::MAX, 1).unwrap().allowed);
+        t.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn debt_carries_across_a_rebase_exactly() {
+        // 10/s, burst 5, drained 250 ms before the end of epoch 1; the next
+        // timestamp is in epoch 2, which moves the base from 0 to 1.
+        let t = make_table(100, 1, 5);
+        let edge = 2 * EPOCH_NS;
+        let t0 = edge - SEC / 4;
+        assert!(t.take(b"a", t0, 5).unwrap().allowed);
+        assert!(t.take(b"idle", SEC, 1).unwrap().allowed);
+        assert_eq!(lock(&t.shards[0]).base, 0);
+        // 300 ms later, across the edge: 3 tokens back, 2 short of a full
+        // bucket, and the fourth is 100 ms away.
+        let d = t.take(b"a", edge + SEC / 20, 4).unwrap();
+        assert_eq!(
+            (d.allowed, d.remaining, d.retry_after_ns),
+            (false, 3, SEC / 10)
+        );
+        assert_eq!(lock(&t.shards[0]).base, 1);
+        let iv = u128::from(t.interval.load(Ordering::Relaxed));
+        assert_eq!(t.get(b"a").unwrap().tat, clock::ticks_wide(t0) + 5 * iv);
+        // The key drained in epoch 0 is long idle: it reads as the start of
+        // the new base epoch and still counts as a full bucket.
+        let idle = t.get(b"idle").unwrap();
+        assert_eq!(idle.tat, clock::epoch_start(1));
+        let d = t.take(b"idle", edge, 1).unwrap();
+        assert_eq!((d.allowed, d.remaining), (true, 4));
+        t.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_shard_idle_for_a_century_catches_up_in_one_call() {
+        let t = make_table(1000, 4, 3);
+        for i in 0..200 {
+            assert_eq!(take_key(&t, i, SEC), Ok(true));
+        }
+        let later = SEC + 100 * YEAR;
+        // Every key is idle: a sweep removes them all, in every shard.
+        assert_eq!(t.sweep(later, 4), 200);
+        assert_eq!(t.stats().entries, 0);
+        for p in t.shards.iter() {
+            assert_eq!(lock(p).base, clock::epoch_of(later) - 1);
+        }
+        // And a key in debt that idles for a century comes back full.
+        assert!(t.take(b"k", later, 3).unwrap().allowed);
+        let much_later = later + 100 * YEAR;
+        let d = t.take(b"k", much_later, 3).unwrap();
+        assert_eq!((d.allowed, d.remaining), (true, 0));
+        t.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn a_timestamp_before_the_base_epoch_counts_as_its_start() {
+        // A caller more than an epoch behind breaks the contract; it is
+        // served as if at the start of the base epoch, not wrapped.
+        let t = make_table(100, 1, 1);
+        let late = 10 * EPOCH_NS + SEC;
+        assert!(t.take(b"k", late, 1).unwrap().allowed);
+        assert_eq!(lock(&t.shards[0]).base, 9);
+        let d = t.take(b"k", SEC, 1).unwrap();
+        assert!(!d.allowed);
+        // At the start of epoch 9 the key's next token is an epoch and a
+        // bit away: one interval (100 ms) past the take at `late`.
+        assert_eq!(d.retry_after_ns, late - 9 * EPOCH_NS + SEC / 10);
+        // A refund of everything moves the arrival time back to that start.
+        t.refund(b"k", SEC, u64::MAX);
+        assert_eq!(t.get(b"k").unwrap().tat, clock::epoch_start(9));
+        t.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn concurrent_takes_across_a_rebase_never_exceed_the_burst() {
+        // Eight threads race on 64 keys, last written in epoch 0, at the
+        // start of epoch 3: whichever thread moves each shard's base, every
+        // key grants exactly its burst.
+        for round in 0..10u64 {
+            let t = Arc::new(make_table(1024, 4, 5));
+            for i in 0..64 {
+                assert!(t.take(key_name(i).as_bytes(), SEC, 5).unwrap().allowed);
+            }
+            let now = 3 * EPOCH_NS + round;
+            let threads: Vec<_> = (0..8)
+                .map(|n| {
+                    let t = Arc::clone(&t);
+                    std::thread::spawn(move || {
+                        let mut granted = 0u64;
+                        for i in 0..640u32 {
+                            let k = key_name((i + n * 7) % 64);
+                            granted += t.take(k.as_bytes(), now, 1).unwrap().granted;
+                        }
+                        granted
+                    })
+                })
+                .collect();
+            let total: u64 = threads.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(total, 64 * 5, "round {round}");
             t.check_invariants().unwrap();
-            let st = t.stats();
-            assert_eq!(st.entries, m.states.len() as u64, "seed {seed}");
-            let holds: u64 = m.states.values().map(|e| u64::from(e.holds)).sum();
-            assert_eq!(st.holds, holds, "seed {seed}");
-            // Sweeping far in the future leaves only the held keys.
-            let held = m.states.values().filter(|e| e.holds > 0).count();
-            t.sweep(now_ns + 100 * SEC, 1);
-            assert_eq!(t.stats().entries, held as u64, "seed {seed}");
+            for p in t.shards.iter() {
+                assert_eq!(lock(p).base, 2, "round {round}");
+            }
         }
     }
 
