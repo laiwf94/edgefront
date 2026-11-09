@@ -18,7 +18,7 @@ Each crate and the workspace crates it depends on. There are no cycles: `edgefro
 | `crates/edgefront-core` | The HTTP/1.1 listener the proxy and the cache both serve on, the pooled client, the clock, request ids, config loading and steer's schema, metrics writers and the admin router | none |
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request ids, the balancers and endpoint state, and the request path ported from steer | edgefront-core |
 | `crates/edgefront-limiter` | pacer's GCRA, keyed table and sliding window, and pacerd's config | none |
-| `crates/edgefront-difftest` | Differential drivers against `legacy/steer` and `legacy/pacer` | edgefront-core, edgefront-proxy, edgefront-limiter |
+| `crates/edgefront-difftest` | Differential drivers against `legacy/steer`, `legacy/pacer` and cachet 0.1 | edgefront-core, edgefront-proxy, edgefront-limiter |
 
 Two tests hold the edgefront binary to cachet's behaviour while both exist. `crates/edgefront/tests/golden.rs` compares the command line's transcripts (usage, config checks, a served request, a purge, shutdown and start failure, log lines included) with `tests/golden/`. `crates/edgefront/tests/e2e_workspace.rs` runs `examples/demo.sh`'s five steps against two edgefront nodes and an origin served by the test, and compares every response's status, `Cache-Status` and body with `tests/fixtures/e2e_workspace.txt` byte for byte. The origin sends no `Date` header and makes objects stale on arrival with `Age`, so no value in the transcript depends on timing and nothing is blanked. The root package's `tests/golden_cli.rs` and `tests/e2e_workspace.rs` run the reference cachet binary against the same files, and CI runs the demo script against both binaries.
 
@@ -142,6 +142,33 @@ It does not terminate TLS, speak HTTP/2 or HTTP/3, run edge code, rewrite cache 
 The cache is becoming a layer that each proxy route turns on, so its settings are per route too. The `[cache]` section is the global block: besides the store's sizes it holds `max_object_bytes`, `max_variants`, `heuristic_max_secs` and an optional `max_ttl_secs` (a cap on any stored response's freshness lifetime), and every route inherits them. A `[[cache.routes]]` entry names one proxy route by `host` and `path_prefix` and may override any of those four; `enabled = false` keeps the entry but bypasses the cache. A route with no entry bypasses the cache.
 
 `CacheConfig::resolve` ties the entries to the proxy's routes and returns each route's effective `RoutePolicy`, or every problem it found (up to the proxy config's 20), each with its field path in the proxy config's style: `cache.routes[2].max_variants: must be between 1 and 8, got 9`. An override may only tighten what the store allows (`max_object_bytes` and `max_variants` are bounded by the global values the store is built with), lifetimes are capped at a year, hosts compare without case and path prefixes exactly, two entries for one route are refused, and an entry that matches no route is an error, so a typo cannot quietly leave a route uncached. The heuristic cap is held under the route's lifetime cap, so a guessed lifetime never outlasts an explicit one.
+
+## Checking the cache against cachet 0.1
+
+Moving the cache onto the shared runtime must not change anything a client sees, so `edgefront-difftest cache` (`make difftest-cache`, in CI on every push) replays a request log against cachet 0.1 and the edgefront binary and diffs every answer. cachet 0.1 is commit `ed77c32`, the last one before the workspace split: the repository has no release tags, so the Makefile pins the commit, exports it under `target/` and builds its `cachet` binary there.
+
+The log is JSON lines, one request each, with a logical time in seconds, a target (a node's proxy or admin listener, or an origin event) and the method, path, headers and body. `cache-record` writes the log a seed generates. The 50,000 generated requests of a run cover about six logical hours across 16 route families, chosen by a skewed popularity:
+
+- Fresh and stale hits, ETag and Last-Modified revalidation, and heuristic freshness.
+- `Vary` on two headers, `no-store`, `private`, `no-cache`, `s-maxage`, `Expires` and `Set-Cookie`.
+- Objects over the size limit, redirects and errors.
+- Byte ranges, valid and not; client conditionals; client `Cache-Control` and `Pragma`.
+- `Authorization` and cookies; HEAD and unsafe methods; three spellings of the host.
+- Purges by tag and URL, refused purges, origin content changes, and origin outages that `stale-if-error` covers.
+
+Each node runs the same config against its own copy of a deterministic origin, whose answers depend only on the request, the log's clock and the events so far. For each request the runner compares:
+
+- the status;
+- every header except `Date`, with the values of a repeated header in order (a request id the node made up is compared only as "generated");
+- the body's SHA-256;
+- how many requests the node sent its origin to answer it, which catches a revalidation or collapsing change that the response alone would hide.
+
+Two things make a divergence a behaviour change and never noise:
+
+- **Time.** Ages, lifetimes and `ttl=` are whole seconds measured on the wall clock, so two nodes a few microseconds apart could disagree near a second boundary. Each node runs with libfaketime preloaded, reading a frozen wall-clock time from a file that the runner rewrites when the log's clock moves. Monotonic time is left real, so timeouts and health checks behave normally.
+- **Eviction.** The memory store picks shards and eviction candidates with a per-process hash seed. The nodes get a budget whose single shard holds the whole generated working set, so nothing is ever evicted.
+
+Requests go one at a time, and a store completes before its response is sent, so the order is fixed too. `crates/edgefront/tests/difftest_cache.rs` runs the harness against the binary itself and must find nothing. It also runs it against a wrapper that sets `max_variants = 1` and a one-minute heuristic cap, and must catch that change, naming the lines and differences. A node that is not on the logical clock is refused before the run starts.
 
 ## Following one request
 

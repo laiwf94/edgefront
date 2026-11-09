@@ -276,6 +276,7 @@ version = "0.1.0"
 dependencies = [
  "cachet",
  "edgefront-core",
+ "edgefront-difftest",
  "edgefront-proxy",
  "serde_json",
  "tokio",
@@ -325,11 +326,19 @@ dependencies = [
 name = "edgefront-difftest"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "edgefront-core",
  "edgefront-limiter",
  "edgefront-proxy",
+ "http",
+ "http-body-util",
+ "httpdate",
+ "hyper",
  "serde",
  "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

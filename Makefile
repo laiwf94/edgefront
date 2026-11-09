@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-pacer difftest-pacer-config e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-pacer difftest-pacer-config difftest-cache e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -115,3 +115,21 @@ difftest-pacer:
 # through `diffdrive config` and the Rust parser.
 difftest-pacer-config:
 	cargo run --release --locked -p edgefront-difftest -- pacer-config $(DIFFTEST_ARGS)
+
+# Diff the cache node against cachet 0.1: replay 50,000 generated requests
+# (or DIFFTEST_ARGS="--log FILE", a recorded log) against cachet as it was
+# before the workspace split and against the edgefront binary, on one
+# logical clock, and diff status, headers but Date, body SHA-256 and origin
+# fetches. cachet 0.1 is the last commit before the split (the repository
+# has no release tags). It is fetched when a shallow clone lacks it,
+# exported once into a directory named after it and built there. Needs
+# libfaketime (apt install libfaketime). The seed comes from the clock and
+# is printed; replay a run with DIFFTEST_ARGS="--seed N".
+CACHET_0_1_REV := ed77c3212eb61fdfb442fae654b382df53a798f1
+CACHET_0_1_DIR := target/cachet-0.1-$(CACHET_0_1_REV)
+difftest-cache:
+	git cat-file -e $(CACHET_0_1_REV)^{commit} 2>/dev/null || git fetch --quiet --depth=1 origin $(CACHET_0_1_REV)
+	test -f $(CACHET_0_1_DIR)/Cargo.lock || { mkdir -p $(CACHET_0_1_DIR) && git archive $(CACHET_0_1_REV) | tar -x -C $(CACHET_0_1_DIR); }
+	cd $(CACHET_0_1_DIR) && cargo build --release --locked --bin cachet
+	cargo build --release --locked -p edgefront -p edgefront-difftest
+	target/release/edgefront-difftest cache $(DIFFTEST_ARGS) -- $(CACHET_0_1_DIR)/target/release/cachet target/release/edgefront

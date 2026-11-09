@@ -9,6 +9,9 @@
 
 [workspace]
 members = ["crates/*"]
+# The reference cachet 0.1 checkout that `make difftest-cache` builds under
+# target/ is a package of its own, not a member.
+exclude = ["target"]
 # Plain cargo commands at the root (the gate) cover every crate.
 default-members = [".", "crates/*"]
 resolver = "3"
@@ -26,6 +29,7 @@ repository = "https://github.com/laiwf94/edgefront"
 cachet = { path = ".", version = "0.1.0" }
 edgefront-cache = { path = "crates/edgefront-cache", version = "0.1.0" }
 edgefront-core = { path = "crates/edgefront-core", version = "0.1.0" }
+edgefront-difftest = { path = "crates/edgefront-difftest", version = "0.1.0" }
 edgefront-limiter = { path = "crates/edgefront-limiter", version = "0.1.0" }
 edgefront-proxy = { path = "crates/edgefront-proxy", version = "0.1.0" }
 

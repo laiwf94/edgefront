@@ -10,6 +10,8 @@
 //! edgefront-difftest pacer-rust-driver
 //! edgefront-difftest pacer-config [--mutants N] [--seed N] [-- DRIVER [ARGS...]]
 //! edgefront-difftest pacer-config-mutant [--seed N]
+//! edgefront-difftest cache [--log FILE | --requests N --seed N] [--faketime LIB] [--dir DIR] [--keep N] -- REFERENCE CANDIDATE
+//! edgefront-difftest cache-record [--requests N] [--seed N]
 //! ```
 //!
 //! `steer` diffs the Rust crates against steer's driver, started as
@@ -46,12 +48,22 @@
 //! reject, the error message and line, or a parsed value differ is
 //! printed. It exits 1 on a divergence. `pacer-config-mutant` writes the
 //! mutant a seed gives to stdout, to replay one.
+//!
+//! `cache` replays a request log against two cache binaries, cachet 0.1
+//! (`REFERENCE`) and the binary under test (`CANDIDATE`), on one logical
+//! clock through libfaketime (`--faketime`, by default Debian's
+//! `libfaketimeMT.so.1`), and diffs status, headers without `Date`, body
+//! SHA-256 and origin fetches on every request. The log is `--log FILE`,
+//! or `--requests` generated requests (default 50,000) from `--seed`. It
+//! prints the first `--keep` divergences (default 20) and exits 1 if there
+//! was any. `cache-record` writes the log a seed generates to stdout.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgefront_difftest::balancer;
+use edgefront_difftest::cache;
 use edgefront_difftest::pacer::{self, DriverCommand, Script};
 use edgefront_difftest::pacer_config;
 use edgefront_difftest::steer::{self, Driver, Plan};
@@ -65,7 +77,9 @@ const USAGE: &str = "usage:
   edgefront-difftest pacer-script [--ops N] [--seed N]
   edgefront-difftest pacer-rust-driver
   edgefront-difftest pacer-config [--mutants N] [--seed N] [-- DRIVER [ARGS...]]
-  edgefront-difftest pacer-config-mutant [--seed N]";
+  edgefront-difftest pacer-config-mutant [--seed N]
+  edgefront-difftest cache [--log FILE | --requests N --seed N] [--faketime LIB] [--dir DIR] [--keep N] -- REFERENCE CANDIDATE
+  edgefront-difftest cache-record [--requests N] [--seed N]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -137,6 +151,17 @@ fn main() -> ExitCode {
             }
             Err(e) => usage(&e),
         },
+        Some(command @ ("cache" | "cache-record")) => {
+            let replay = command == "cache";
+            match cache::cli::parse(&args[1..], replay, clock_seed()) {
+                Ok(plan) => ExitCode::from(cache::cli::run(
+                    &plan,
+                    &mut io::stdout().lock(),
+                    &mut io::stderr().lock(),
+                )),
+                Err(e) => usage(&e),
+            }
+        }
         _ => usage("expected a command"),
     }
 }

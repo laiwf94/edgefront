@@ -20,11 +20,16 @@
 //! - [`pacer_config`]: pacerd's config reader, against the same driver's
 //!   parse mode (`diffdrive config`), on every config in legacy/pacer and
 //!   seeded mutants of them.
+//! - [`cache`]: the cache node as a client sees it, against cachet 0.1, the
+//!   binary from before the workspace split. A recorded request log is
+//!   replayed against both binaries on one logical clock, and status,
+//!   headers, body digest and origin fetches are diffed per request.
 //!
 //! Every run is seeded, and the seed is printed with its report, so a
 //! divergence found in CI can be replayed locally with `--seed`.
 
 pub mod balancer;
+pub mod cache;
 pub mod driver;
 pub mod pacer;
 pub mod pacer_config;

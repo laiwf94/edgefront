@@ -28,6 +28,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
+      # crates/edgefront/tests/difftest_cache.rs runs nodes on a logical clock.
+      - name: Install libfaketime
+        run: sudo apt-get update -q && sudo apt-get install -y -q libfaketime
       # The same three steps as `make check`.
       - name: Format
         run: make fmt
@@ -37,6 +40,17 @@ jobs:
         run: make cov
       - name: Benchmarks compile
         run: cargo bench --workspace --no-run
+
+  difftest-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libfaketime
+        run: sudo apt-get update -q && sudo apt-get install -y -q libfaketime
+      - name: Diff 50,000 requests against cachet 0.1
+        run: make difftest-cache
 
   msrv:
     runs-on: ubuntu-latest

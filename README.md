@@ -19,7 +19,7 @@ All three keep their full history. The plan for the next year, three tracks in p
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request IDs and the HTTP/1.1 request path ported from steer |
 | `crates/edgefront-cache` | cachet's caching policy, storage and purge |
 | `crates/edgefront-limiter` | pacer's rate limiting algorithms |
-| `crates/edgefront-difftest` | Differential tests against `legacy/steer` and `legacy/pacer` |
+| `crates/edgefront-difftest` | Differential tests against `legacy/steer`, `legacy/pacer` and cachet 0.1 |
 | `.` (`cachet`) | The cache node's runtime still to move into the crates, and the reference `cachet` binary |
 
 Which crate depends on which is in [docs/DESIGN.md](docs/DESIGN.md#crate-map).
@@ -184,6 +184,8 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 ## Checking a change
 
 `make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests under cargo-llvm-cov, where `scripts/coverage.sh` holds every crate to at least 90% line coverage on its own sources, and the workspace too. `make audit` runs cargo deny on the workspace and on each fuzz crate, cargo audit on every lockfile, and `scripts/direct-deps.sh`, which requires exact pins and allows at most 14 direct runtime dependencies across the workspace. `make fuzz` runs every cargo-fuzz target in `crates/edgefront-cache/fuzz` and `crates/edgefront-core/fuzz` (nightly; CI gives each target 10 minutes). `make tsan` runs each crate's unit tests and its concurrency tests under ThreadSanitizer, one crate at a time (`make tsan-<crate>` for one; nightly with rust-src). `scripts/verify-history.sh` runs `make check` on every commit of the branch and prints each one's lowest crate coverage. CI runs all of these, with one ThreadSanitizer job per crate, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
+
+`make difftest-cache` holds the cache to cachet 0.1, the binary from before the workspace split. It replays 50,000 generated requests against both binaries on one logical clock, and diffs each response's status, headers except `Date` and body SHA-256, and the origin requests it took. `DIFFTEST_ARGS="--log FILE"` replays a recorded log instead, and `edgefront-difftest cache-record --seed N` writes the log a seed generates. The run and `make test` need libfaketime (`apt install libfaketime`). See [docs/DESIGN.md](docs/DESIGN.md#checking-the-cache-against-cachet-01).
 
 While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus three comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, `make difftest-balancer` diffs the pick sequences of 1,000 seeded balancing scenarios of 10,000 requests each (health changes, ejections, priority spill and panic included) between steer's `balancer.LB` and `edgefront_proxy::balancer::Balancer`, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary, and the end-to-end balancing run against steer's balancer.
 
