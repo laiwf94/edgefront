@@ -3,6 +3,8 @@
 //! ```text
 //! edgefront-difftest steer [--configs N] [--requests N] [--seed N] -- DRIVER [ARGS...]
 //! edgefront-difftest rust-driver
+//! edgefront-difftest balancer [--scenarios N] [--requests N] [--seed N] -- DRIVER [ARGS...]
+//! edgefront-difftest balancer-scenario [--requests N] [--seed N]
 //! edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
 //! edgefront-difftest pacer-script [--ops N] [--seed N]
 //! edgefront-difftest pacer-rust-driver
@@ -18,6 +20,15 @@
 //!
 //! `rust-driver` serves the same protocol from the Rust crates on stdin and
 //! stdout, to check the harness itself.
+//!
+//! `balancer` diffs edgefront's load balancer against steer's through the
+//! same driver: `--scenarios` seeded scenarios (default 1,000) of
+//! `--requests` requests each (default 10,000), with health changes,
+//! ejections, clock moves and latency samples between them. Scenario `i`
+//! comes from seed `seed + i`. It stops at the first pick or state line
+//! that differs, prints it with the scenario's seed, the step and a replay
+//! command, and exits 1. `balancer-scenario` prints the `picks` query a
+//! seed generates, to feed a driver by hand.
 //!
 //! `pacer` diffs edgefront-limiter against libpacer: it generates `--scripts`
 //! scripts of `--ops` random operations (default 100 of 10,000), runs each
@@ -40,6 +51,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use edgefront_difftest::balancer;
 use edgefront_difftest::pacer::{self, DriverCommand, Script};
 use edgefront_difftest::pacer_config;
 use edgefront_difftest::steer::{self, Driver, Plan};
@@ -47,6 +59,8 @@ use edgefront_difftest::steer::{self, Driver, Plan};
 const USAGE: &str = "usage:
   edgefront-difftest steer [--configs N] [--requests N] [--seed N] -- DRIVER [ARGS...]
   edgefront-difftest rust-driver
+  edgefront-difftest balancer [--scenarios N] [--requests N] [--seed N] -- DRIVER [ARGS...]
+  edgefront-difftest balancer-scenario [--requests N] [--seed N]
   edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
   edgefront-difftest pacer-script [--ops N] [--seed N]
   edgefront-difftest pacer-rust-driver
@@ -69,6 +83,18 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("balancer") => match parse_balancer(&args[1..], true) {
+            Ok((plan, Some(driver))) => run_balancer(plan, &driver),
+            Ok((_, None)) => usage("missing -- DRIVER"),
+            Err(e) => usage(&e),
+        },
+        Some("balancer-scenario") => match parse_balancer(&args[1..], false) {
+            Ok((plan, _)) => {
+                println!("{}", balancer::generate(plan.seed, plan.requests).to_line());
+                ExitCode::SUCCESS
+            }
+            Err(e) => usage(&e),
+        },
         Some("pacer") => match parse_pacer(&args[1..], true) {
             Ok((plan, driver)) => run_pacer(plan, &driver),
             Err(e) => usage(&e),
@@ -206,6 +232,63 @@ fn parse_steer(args: &[String]) -> Result<(Plan, Vec<String>), String> {
         }
     }
     Err("missing -- DRIVER".into())
+}
+
+fn parse_balancer(
+    args: &[String],
+    driver: bool,
+) -> Result<(balancer::Plan, Option<Vec<String>>), String> {
+    let mut plan = balancer::Plan {
+        scenarios: 1_000,
+        requests: 10_000,
+        seed: clock_seed(),
+    };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" && driver {
+            let command: Vec<String> = it.cloned().collect();
+            if command.is_empty() {
+                return Err("no driver command after --".into());
+            }
+            return Ok((plan, Some(command)));
+        }
+        let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
+        let number = |v: &str| {
+            v.parse::<u64>()
+                .map_err(|_| format!("{arg}: {v:?} is not a number"))
+        };
+        match arg.as_str() {
+            "--scenarios" if driver => plan.scenarios = number(value)? as usize,
+            "--requests" => plan.requests = number(value)? as usize,
+            "--seed" => plan.seed = number(value)?,
+            _ => return Err(format!("unknown option {arg}")),
+        }
+    }
+    Ok((plan, None))
+}
+
+fn run_balancer(plan: balancer::Plan, driver: &[String]) -> ExitCode {
+    let started = Instant::now();
+    let result =
+        Driver::spawn(&driver[0], &driver[1..]).and_then(|mut d| balancer::run(&mut d, plan));
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!(
+                "edgefront-difftest: driver {:?}: {e} (seed {})",
+                driver.join(" "),
+                plan.seed
+            );
+            return ExitCode::from(2);
+        }
+    };
+    println!("{report}");
+    println!("took {:.1}s", started.elapsed().as_secs_f64());
+    if report.divergence.is_some() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn parse_pacer(args: &[String], driver: bool) -> Result<(pacer::Plan, DriverCommand), String> {

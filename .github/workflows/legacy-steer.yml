@@ -51,5 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Diff 10,000 configs and 100,000 requests against steer
         run: make difftest
+      - name: Diff 1,000 balancer scenarios of 10,000 requests against steer
+        run: make difftest-balancer
       - name: End-to-end HTTP/1.1 against a live steer
         run: make e2e-steer

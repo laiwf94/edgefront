@@ -6,15 +6,19 @@
 //! with an overprovisioning factor and a panic threshold ([`priority`]),
 //! then a [`Policy`] picks a host inside that level: smooth weighted round
 //! robin ([`rr`]), power of two choices on peak-EWMA cost ([`ewma`]) or
-//! Maglev consistent hashing on a request key ([`maglev`]).
+//! Maglev consistent hashing on a request key ([`maglev`]). [`lb::Balancer`]
+//! puts the two steps together over a cluster's live endpoints.
 //! Policies that draw at random take an [`rng::Rng`], so a seeded run makes
 //! the same picks as steer's.
 
 pub mod ewma;
+pub mod lb;
 pub mod maglev;
 pub mod priority;
 pub mod rng;
 pub mod rr;
+
+pub use lb::{Balancer, Options};
 
 /// Picks one endpoint among candidates, steer's `balancer.Policy`.
 pub trait Policy: Send + Sync {

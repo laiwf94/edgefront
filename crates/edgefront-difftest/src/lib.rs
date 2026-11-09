@@ -8,6 +8,8 @@
 //!
 //! - [`steer`]: configuration acceptance and route choice, against
 //!   `legacy/steer/cmd/diffdrive`.
+//! - [`balancer`]: pick sequences of steer's load balancer, scenario by
+//!   scenario, against the same driver's `picks` query.
 //! - [`pacer`]: libpacer's GCRA, keyed table and sliding window, against
 //!   `legacy/pacer/tests/diffdrive.c`. The driver reads one operation per
 //!   line on stdin and prints one line per operation; this crate's build
@@ -22,6 +24,7 @@
 //! Every run is seeded, and the seed is printed with its report, so a
 //! divergence found in CI can be replayed locally with `--seed`.
 
+pub mod balancer;
 pub mod driver;
 pub mod pacer;
 pub mod pacer_config;

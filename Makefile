@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-pacer difftest-pacer-config e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-pacer difftest-pacer-config e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -80,6 +80,15 @@ DIFFTEST_ARGS ?=
 difftest:
 	cd legacy/steer && go build -o $(CURDIR)/target/diffdrive ./cmd/diffdrive
 	cargo run --release --locked -p edgefront-difftest -- steer $(DIFFTEST_ARGS) -- target/diffdrive
+
+# Diff edgefront-proxy's balancer against steer's, pick for pick: 1,000
+# seeded scenarios of 10,000 requests each, with health changes, ejections,
+# clock moves and latency samples between them, through the same driver.
+# Needs Go. The seed comes from the clock and is printed; a divergence
+# prints the command that replays it.
+difftest-balancer:
+	cd legacy/steer && go build -o $(CURDIR)/target/diffdrive ./cmd/diffdrive
+	cargo run --release --locked -p edgefront-difftest -- balancer $(DIFFTEST_ARGS) -- target/diffdrive
 
 # Run the end-to-end HTTP/1.1 cases against a live steer as well as the
 # edgefront binary, and check steer still matches the recorded transcript.

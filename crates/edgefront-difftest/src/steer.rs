@@ -210,12 +210,22 @@ pub fn answer(q: &Query) -> Answer {
 
 /// Serves the diffdrive protocol from edgefront's crates: one answer line
 /// per query line, until `input` ends. This is the Rust twin of
-/// `cmd/diffdrive`, used to test the harness end to end.
+/// `cmd/diffdrive`, used to test the harness end to end. `picks` queries,
+/// written by [`Scenario::to_line`](crate::balancer::Scenario::to_line),
+/// are answered by [`balancer::answer_line`](crate::balancer::answer_line).
 pub fn serve(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     for (n, line) in input.lines().enumerate() {
-        let q = Query::from_line(&line?).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("line {}: {e}", n + 1))
-        })?;
+        let line = line?;
+        let bad =
+            |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("line {}: {e}", n + 1));
+        if line.starts_with(r#"{"op":"picks""#) {
+            let a = crate::balancer::answer_line(&line).map_err(bad)?;
+            serde_json::to_writer(&mut output, &a)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
+            continue;
+        }
+        let q = Query::from_line(&line).map_err(bad)?;
         serde_json::to_writer(&mut output, &answer(&q))?;
         output.write_all(b"\n")?;
         output.flush()?;
@@ -256,10 +266,11 @@ impl Driver {
     }
 }
 
-impl Oracle for Driver {
-    fn ask(&mut self, q: &Query) -> io::Result<Answer> {
+impl Driver {
+    /// Sends one query line and returns the answer line, with its newline.
+    pub fn ask_line(&mut self, query: &str) -> io::Result<String> {
         let stdin = self.stdin.as_mut().expect("stdin is open until drop");
-        stdin.write_all(q.to_line().as_bytes())?;
+        stdin.write_all(query.as_bytes())?;
         stdin.write_all(b"\n")?;
         stdin.flush()?;
         self.line.clear();
@@ -269,6 +280,13 @@ impl Oracle for Driver {
                 "the driver exited without answering",
             ));
         }
+        Ok(std::mem::take(&mut self.line))
+    }
+}
+
+impl Oracle for Driver {
+    fn ask(&mut self, q: &Query) -> io::Result<Answer> {
+        self.line = self.ask_line(&q.to_line())?;
         serde_json::from_str(&self.line).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,

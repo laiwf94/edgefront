@@ -1,5 +1,5 @@
-// Command diffdrive answers configuration and routing queries with steer's
-// own code, so edgefront's Rust port can be diffed against it.
+// Command diffdrive answers configuration, routing and balancing queries with
+// steer's own code, so edgefront's Rust port can be diffed against it.
 //
 // It reads one JSON query per line on stdin and writes one JSON answer per
 // line on stdout, in order. Byte strings (configuration documents and request
@@ -21,6 +21,9 @@
 // configuration's routes. Callers send origin-form targets and "*": an
 // absolute-form target (one with a scheme) is parsed for its path here,
 // which the Rust side leaves to its caller, so it is not a useful query.
+//
+// A picks query runs a balancing scenario through steer's balancer.LB and
+// answers one line per script operation; balance.go documents it.
 //
 // The class of a rejection is "size" (over config.MaxFileBytes), "json" (the
 // decoder refused the document) or "invalid" (validation found problems; the
@@ -53,6 +56,13 @@ type query struct {
 	Op       string    `json:"op"`
 	Config   hexBytes  `json:"config"`
 	Requests []request `json:"requests"`
+	// A picks query.
+	Policy         string         `json:"policy"`
+	PanicThreshold int            `json:"panic_threshold"`
+	Seed           uint64         `json:"seed"`
+	TableSize      int            `json:"table_size"`
+	Endpoints      []endpointSpec `json:"endpoints"`
+	Script         string         `json:"script"`
 }
 
 type request struct {
@@ -65,6 +75,7 @@ type answer struct {
 	Class   string   `json:"class,omitempty"`
 	Error   string   `json:"error,omitempty"`
 	Results []result `json:"results,omitempty"`
+	Lines   []string `json:"lines,omitempty"`
 }
 
 type result struct {
@@ -144,6 +155,8 @@ func handle(q *query) (answer, error) {
 			a.Results = append(a.Results, decide(router, req))
 		}
 		return a, nil
+	case "picks":
+		return picks(q)
 	default:
 		return answer{}, fmt.Errorf("unknown op %q", q.Op)
 	}
