@@ -1,0 +1,22 @@
+# Recorded from steer's balancer through legacy/steer/cmd/diffdrive by
+# crates/edgefront/tests/e2e_port_balancer.rs (E2E_BLESS=1 make e2e-steer).
+# counts: requests per endpoint in configuration order; levels: per
+# priority; picks: FNV-1a of the pick sequence, one pick per line.
+policy least_loaded
+requests 20000
+counts 2462 1631 128 2568 1386 2746 845 3865 4369
+levels 12145 6882 973
+unavailable 0
+picks ed95f0b3e2cb33d9
+policy maglev
+requests 20000
+counts 1930 1079 530 5295 2389 3013 1669 1557 2538
+levels 12776 5025 2199
+unavailable 0
+picks 13912e8f04a4b5af
+policy round_robin
+requests 20000
+counts 1711 2922 175 4397 1392 3697 829 2507 2370
+levels 12175 6821 1004
+unavailable 0
+picks 34e422b8c07e3ac0

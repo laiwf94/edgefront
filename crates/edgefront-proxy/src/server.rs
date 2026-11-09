@@ -14,7 +14,16 @@
 //!    is routed on its host and cleaned path; no match is `404 no_route`.
 //!    The cluster's `max_requests` is enforced, refusing with
 //!    `503 overloaded` and `X-Steer-Overflow: cluster_max_requests`.
-//! 3. **The upstream request.** Hop-by-hop headers and the headers named in
+//! 3. **The pick.** The cluster's [`Balancer`] picks the endpoint: a
+//!    priority level from the share of available endpoints in each, with
+//!    the panic threshold, then an endpoint inside it by the cluster's
+//!    policy. Maglev hashes the first value of the cluster's `hash_header`
+//!    when the request has a non-empty one. No pick is
+//!    `503 no_healthy_upstream`. The endpoint counts the request in flight
+//!    until its response body is done, and observes the time to the
+//!    response head on the balancer's clock (at least a second when the
+//!    attempt failed or answered 5xx, as steer penalised failures).
+//! 4. **The upstream request.** Hop-by-hop headers and the headers named in
 //!    `Connection` are removed (`TE: trailers` survives), the forwarding
 //!    headers are rewritten (see [`crate::forwarded`]), the request ID is
 //!    set, and the target is the one [`RequestTarget::upstream_target`]
@@ -24,7 +33,7 @@
 //!    `max_body_bytes` is read before the upstream is contacted, as steer
 //!    buffered the bodies it might replay; a failure reading it is
 //!    `400 bad_request`.
-//! 4. **The response.** Hop-by-hop headers are removed and the request ID
+//! 5. **The response.** Hop-by-hop headers are removed and the request ID
 //!    is added; the body streams. The cluster's `timeout` covers the whole
 //!    exchange: before the response head it is `504 upstream_timeout`,
 //!    after it the response is cut. An upstream that cannot be reached or
@@ -34,22 +43,22 @@
 //! `{"error":{"code":...,"message":...,"request_id":...}}`, and steer's
 //! headers. Each request is logged once, as steer's access log was.
 //!
-//! What steer did on top of this arrives with the weeks that port it: the
-//! balancing policies, priority load and panic threshold (W02; until then
-//! each cluster takes turns over its endpoints of the most preferred
-//! priority), and health checks, outlier detection, retries with their
-//! budget and per-try timeout, the admin API and metrics (W03).
+//! What steer did on top of this arrives with W03: health checks, outlier
+//! detection, retries with their budget and per-try timeout, the admin API
+//! and metrics. Until then every endpoint stays healthy and admitted unless
+//! something drives its state through [`Proxy::endpoints`].
 
 use std::future::Future as _;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use edgefront_core::body::{self, Body, BoxError};
+use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
 use edgefront_core::http1::{Client, ClientError, ClientLimits};
 use edgefront_core::listener::Handler;
@@ -59,6 +68,10 @@ use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
 use tokio::time::{Instant, Sleep};
 
+use crate::balancer::maglev::hash_key;
+use crate::balancer::rng::{Rng, SplitMix64};
+use crate::balancer::{Balancer, Options};
+use crate::endpoint::{Endpoint, InFlight};
 use crate::forwarded;
 use crate::path::RequestTarget;
 use crate::reqid;
@@ -66,6 +79,11 @@ use crate::route::Router;
 
 /// The header naming the limit that refused a request with `503`.
 pub const OVERFLOW_HEADER: HeaderName = HeaderName::from_static("x-steer-overflow");
+
+/// The least latency a failed attempt is recorded with, steer's
+/// `failurePenalty`: without it an endpoint that refuses connections or
+/// answers 503 at once would look fastest to the least-loaded policy.
+pub const FAILURE_PENALTY: Duration = Duration::from_secs(1);
 
 /// The methods steer's `405` lists in `Allow`.
 const ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
@@ -95,9 +113,10 @@ pub struct Proxy {
 
 struct Cluster {
     name: String,
-    /// The endpoints of the most preferred priority, taken in turn.
-    endpoints: Vec<Box<str>>,
-    next: AtomicUsize,
+    balancer: Balancer,
+    /// The header Maglev hashes, when the policy is Maglev.
+    hash_header: Option<HeaderName>,
+    clock: Arc<dyn Clock>,
     client: Client<Body>,
     timeout: Option<Duration>,
     in_flight: Arc<AtomicU32>,
@@ -107,14 +126,20 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn new(cfg: &ClusterConfig) -> Self {
-        let top = cfg.endpoints.iter().map(|e| e.priority).min().unwrap_or(0);
-        let endpoints = cfg
+    fn new(cfg: &ClusterConfig, clock: &Arc<dyn Clock>, rng: &Arc<dyn Rng>) -> Self {
+        let epoch = clock.now();
+        let endpoints: Vec<Endpoint> = cfg
             .endpoints
             .iter()
-            .filter(|e| e.priority == top)
-            .map(|e| e.address.as_str().into())
+            .map(|e| Endpoint::new(&e.address, e.weight, e.priority.into(), epoch))
             .collect();
+        let opts = Options::new(cfg.policy)
+            .panic_threshold(cfg.panic_threshold_percent)
+            .clock(Arc::clone(clock))
+            .rng(Arc::clone(rng));
+        // Validation keeps every weight in 1..=1000, every priority at most
+        // 7 and at most 1,024 endpoints, below Maglev's default table size.
+        let balancer = Balancer::new(endpoints, opts).expect("a validated cluster");
         let limits = ClientLimits {
             connect_timeout: cfg.connect_timeout,
             // The cluster timeout bounds the whole exchange instead.
@@ -123,8 +148,12 @@ impl Cluster {
         };
         Cluster {
             name: cfg.name.clone(),
-            endpoints,
-            next: AtomicUsize::new(0),
+            balancer,
+            hash_header: cfg
+                .hash_header
+                .as_deref()
+                .and_then(|h| HeaderName::from_bytes(h.as_bytes()).ok()),
+            clock: Arc::clone(clock),
             client: Client::new(&limits),
             timeout: Some(cfg.timeout).filter(|t| !t.is_zero()),
             in_flight: Arc::new(AtomicU32::new(0)),
@@ -137,10 +166,11 @@ impl Cluster {
         }
     }
 
-    fn pick(&self) -> &str {
-        // Validation gives every cluster at least one endpoint.
-        let n = self.next.fetch_add(1, Ordering::Relaxed);
-        &self.endpoints[n % self.endpoints.len()]
+    /// The request's hash key: steer's `HashKey` of the first value of the
+    /// hash header, when there is a non-empty one.
+    fn key(&self, headers: &HeaderMap) -> Option<u64> {
+        let value = headers.get(self.hash_header.as_ref()?)?;
+        (!value.is_empty()).then(|| hash_key(value.as_bytes()))
     }
 
     fn acquire(&self) -> Option<Permit> {
@@ -164,10 +194,27 @@ impl Drop for Permit {
 }
 
 impl Proxy {
-    /// Builds the proxy for a validated configuration. Must be called
+    /// Builds the proxy for a validated configuration, balancing on the
+    /// monotonic clock with a generator seeded from entropy. Must be called
     /// inside a tokio runtime, which runs the clients' pools.
     pub fn new(cfg: &Config) -> Self {
-        let clusters: Vec<Cluster> = cfg.clusters.iter().map(Cluster::new).collect();
+        Proxy::with_sources(
+            cfg,
+            MonotonicClock::shared(),
+            Arc::new(SplitMix64::from_entropy()),
+        )
+    }
+
+    /// Builds the proxy with the clock its balancers read availability and
+    /// latency on, and the generator every cluster's random draws come
+    /// from. A manual clock and a seeded generator make the picks
+    /// repeatable, which is how they are diffed against steer.
+    pub fn with_sources(cfg: &Config, clock: Arc<dyn Clock>, rng: Arc<dyn Rng>) -> Self {
+        let clusters: Vec<Cluster> = cfg
+            .clusters
+            .iter()
+            .map(|c| Cluster::new(c, &clock, &rng))
+            .collect();
         let index = |name: &str| {
             clusters
                 .iter()
@@ -184,6 +231,24 @@ impl Proxy {
             clusters,
             trusted: cfg.trusted_proxies.clone(),
         }
+    }
+
+    /// The live endpoints of the cluster named `name`, in configuration
+    /// order, or `None` when there is no such cluster. Their state is what
+    /// the balancer reads on every pick.
+    pub fn endpoints(&self, name: &str) -> Option<&[Endpoint]> {
+        self.clusters
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.balancer.endpoints())
+    }
+
+    /// The balancer of the cluster named `name`.
+    pub fn balancer(&self, name: &str) -> Option<&Balancer> {
+        self.clusters
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.balancer)
     }
 
     /// Answers one request from `peer`.
@@ -254,9 +319,7 @@ impl Proxy {
             log(&access, started, &resp, "overflow");
             return resp;
         };
-        let endpoint = cluster.pick();
-        let access = access.endpoint(endpoint);
-
+        let key = cluster.key(&parts.headers);
         let mut headers = parts.headers;
         let length = request_length(&headers, &incoming);
         strip_hop_by_hop(&mut headers, true);
@@ -277,13 +340,22 @@ impl Proxy {
         }
 
         let deadline = cluster.timeout.map(|t| started + t);
+        let mut picked = None;
         let exchange = async {
+            // steer reads a body it may replay before it picks.
             let Ok(body) = upstream_body(incoming, length, cluster.replay_limit).await else {
                 return Err(Failure::ClientBody);
             };
+            let Some(i) = cluster.balancer.pick(key, &[]) else {
+                return Err(Failure::NoHealthyUpstream);
+            };
+            picked = Some(i);
+            let endpoint = &cluster.balancer.endpoints()[i];
+            let in_flight = endpoint.state.track();
             set_framing(&mut headers, &parts.method, length);
             let uri = format!(
-                "http://{endpoint}{}",
+                "http://{}{}",
+                endpoint.address,
                 String::from_utf8_lossy(&target.upstream_target())
             );
             let mut out = Request::new(body);
@@ -291,7 +363,21 @@ impl Proxy {
             *out.uri_mut() = Uri::try_from(uri).map_err(|_| Failure::Proxy)?;
             *out.version_mut() = Version::HTTP_11;
             *out.headers_mut() = headers;
-            cluster.client.send(out).await.map_err(Failure::Upstream)
+            let began = cluster.clock.now();
+            let result = cluster.client.send(out).await;
+            // A cancelled exchange (the cluster timeout) observes nothing,
+            // as steer skipped requests whose context ended.
+            let now = cluster.clock.now();
+            let elapsed = now.saturating_duration_since(began);
+            let sample = match &result {
+                Ok(r) if !r.status().is_server_error() => elapsed,
+                _ => elapsed.max(FAILURE_PENALTY),
+            };
+            endpoint.state.observe_latency(sample, now);
+            match result {
+                Ok(resp) => Ok((resp, in_flight)),
+                Err(e) => Err(Failure::Upstream(e)),
+            }
         };
         let result = match deadline {
             Some(at) => tokio::time::timeout_at(at, exchange)
@@ -299,9 +385,13 @@ impl Proxy {
                 .unwrap_or(Err(Failure::Timeout)),
             None => exchange.await,
         };
+        let access = match picked {
+            Some(i) => access.endpoint(&cluster.balancer.endpoints()[i].address),
+            None => access,
+        };
 
         let resp = match result {
-            Ok(resp) => {
+            Ok((resp, in_flight)) => {
                 let (mut head, incoming) = resp.into_parts();
                 strip_hop_by_hop(&mut head.headers, false);
                 // Go writes the standard reason phrase whatever the
@@ -312,6 +402,7 @@ impl Proxy {
                     inner: incoming,
                     deadline: deadline.map(|at| Box::pin(tokio::time::sleep_until(at))),
                     _permit: permit,
+                    _in_flight: in_flight,
                 };
                 let resp = Response::from_parts(head, BodyExt::boxed(body));
                 log(&access, started, &resp, "");
@@ -320,6 +411,12 @@ impl Proxy {
             Err(f) => f,
         };
         let (status, code, message, failure) = match resp {
+            Failure::NoHealthyUpstream => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_healthy_upstream",
+                "no healthy upstream is available",
+                "no_healthy_upstream",
+            ),
             Failure::Timeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream_timeout",
@@ -365,6 +462,7 @@ impl Handler for Proxy {
 
 /// Why the proxy answered instead of an upstream.
 enum Failure {
+    NoHealthyUpstream,
     Timeout,
     ClientBody,
     Upstream(ClientError),
@@ -594,11 +692,13 @@ impl HttpBody for Prefixed {
 
 /// The upstream's response body on its way to the client: cut when the
 /// cluster's timeout passes, and holding the request's place under
-/// `max_requests` until it is dropped.
+/// `max_requests` and in its endpoint's in-flight count until it is
+/// dropped.
 struct Proxied {
     inner: Incoming,
     deadline: Option<Pin<Box<Sleep>>>,
     _permit: Permit,
+    _in_flight: InFlight,
 }
 
 /// The error that cuts a response body at the cluster's timeout.

@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 /// A proxy listening on a free port, stopped when dropped.
 struct Running {
     addr: SocketAddr,
+    proxy: Arc<Proxy>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -28,13 +29,17 @@ async fn start(config: &str) -> Running {
     let proxy = Arc::new(Proxy::new(&cfg));
     tokio::spawn(serve(
         listener,
-        proxy,
+        Arc::clone(&proxy),
         ServerLimits::default(),
         async move {
             let _ = stopped.await;
         },
     ));
-    Running { addr, _stop: stop }
+    Running {
+        addr,
+        proxy,
+        _stop: stop,
+    }
 }
 
 /// One cluster `web` behind `routes`, with `extra` cluster fields.
@@ -116,6 +121,22 @@ async fn read_all(conn: &mut TcpStream) -> String {
     let mut out = Vec::new();
     let _ = tokio::time::timeout(Duration::from_secs(5), conn.read_to_end(&mut out)).await;
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Waits for an endpoint's in-flight count to come back to zero: the
+/// response body is dropped as the connection finishes.
+async fn settled(ep: &edgefront_proxy::endpoint::Endpoint) {
+    for _ in 0..500 {
+        if ep.state.in_flight() == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!(
+        "{} still has {} in flight",
+        ep.address,
+        ep.state.in_flight()
+    );
 }
 
 fn request_id(resp: &str) -> &str {
@@ -365,6 +386,124 @@ async fn endpoints_of_the_preferred_priority_take_turns() {
         assert!(seen.try_recv().is_err());
     }
     assert!(seen_c.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn traffic_spills_to_the_next_priority_and_stops_when_nothing_is_left() {
+    let (a, mut seen_a) = upstream(OK, Duration::ZERO).await;
+    let (b, mut seen_b) = upstream(OK, Duration::ZERO).await;
+    let cfg = format!(
+        "{{\"listen\":\"127.0.0.1:0\",\"routes\":[{ALL}],\"clusters\":[{{\"name\":\"web\",\"panic_threshold_percent\":0,\"endpoints\":[\
+         {{\"address\":\"{a}\",\"priority\":0}},{{\"address\":\"{b}\",\"priority\":1}}]}}]}}"
+    );
+    let proxy = start(&cfg).await;
+    let get = b"GET / HTTP/1.1\r\nHost: x\r\nX-Request-Id: rid-9\r\nConnection: close\r\n\r\n";
+    let eps = proxy.proxy.endpoints("web").expect("the cluster");
+    assert!(proxy.proxy.endpoints("nope").is_none());
+    assert!(proxy.proxy.balancer("nope").is_none());
+    assert_eq!(proxy.proxy.balancer("web").unwrap().levels(), 2);
+
+    // The preferred level is down: everything goes to priority 1.
+    eps[0].state.set_healthy(false);
+    for _ in 0..3 {
+        assert!(exchange(proxy.addr, get).await.ends_with("ok"));
+    }
+    for _ in 0..3 {
+        seen_b.recv().await.unwrap();
+    }
+    assert!(seen_a.try_recv().is_err());
+
+    // Nothing is available and panic is off: steer's 503.
+    eps[1].state.set_healthy(false);
+    let resp = exchange(proxy.addr, get).await;
+    assert!(
+        resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+        "{resp}"
+    );
+    assert!(resp.ends_with(
+        "{\"error\":{\"code\":\"no_healthy_upstream\",\"message\":\"no healthy upstream is available\",\"request_id\":\"rid-9\"}}\n"
+    ));
+    assert!(!resp.contains("x-steer-overflow"), "{resp}");
+    assert!(seen_a.try_recv().is_err() && seen_b.try_recv().is_err());
+
+    // Back up: the preferred level takes the traffic again.
+    eps[0].state.set_healthy(true);
+    assert!(exchange(proxy.addr, get).await.ends_with("ok"));
+    seen_a.recv().await.unwrap();
+}
+
+#[tokio::test]
+async fn maglev_keeps_a_hash_header_on_its_endpoint() {
+    let mut ups = Vec::new();
+    for _ in 0..4 {
+        ups.push(upstream(OK, Duration::ZERO).await);
+    }
+    let eps: Vec<String> = ups
+        .iter()
+        .map(|(a, _)| format!("{{\"address\":\"{a}\"}}"))
+        .collect();
+    let cfg = format!(
+        "{{\"listen\":\"127.0.0.1:0\",\"routes\":[{ALL}],\"clusters\":[{{\"name\":\"web\",\"policy\":\"maglev\",\"hash_header\":\"x-user\",\"endpoints\":[{}]}}]}}",
+        eps.join(",")
+    );
+    let proxy = start(&cfg).await;
+    let mut owner = Vec::new();
+    for user in ["alice", "bob", "carol", "dave", "erin", "frank"] {
+        let mut hit = None;
+        for round in 0..4 {
+            let req =
+                format!("GET / HTTP/1.1\r\nHost: x\r\nX-User: {user}\r\nConnection: close\r\n\r\n");
+            assert!(exchange(proxy.addr, req.as_bytes()).await.ends_with("ok"));
+            let mut got = None;
+            for (i, (_, seen)) in ups.iter_mut().enumerate() {
+                if tokio::time::timeout(Duration::from_millis(1), seen.recv())
+                    .await
+                    .is_ok()
+                {
+                    got = Some(i);
+                }
+            }
+            let got = got.expect("one upstream saw it");
+            if round > 0 {
+                assert_eq!(Some(got), hit, "{user} moved");
+            }
+            hit = Some(got);
+        }
+        owner.push(hit.unwrap());
+    }
+    // An empty header value is no key: those requests still go through.
+    let req = b"GET / HTTP/1.1\r\nHost: x\r\nX-User:\r\nConnection: close\r\n\r\n";
+    assert!(exchange(proxy.addr, req).await.ends_with("ok"));
+    assert!(owner.iter().any(|&o| o != owner[0]), "{owner:?}");
+}
+
+#[tokio::test]
+async fn an_endpoint_counts_its_requests_and_penalises_failures() {
+    let (ok, _) = upstream(OK, Duration::ZERO).await;
+    let (bad, _) = upstream(
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        Duration::ZERO,
+    )
+    .await;
+    let proxy = start(&config(&[&ok], ALL, "")).await;
+    let eps = proxy.proxy.endpoints("web").unwrap();
+    let get = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    assert!(exchange(proxy.addr, get).await.ends_with("ok"));
+    let now = std::time::Instant::now();
+    // A quick success on loopback stays far below the penalty.
+    assert!(
+        eps[0].state.latency(now) < 0.5,
+        "{}",
+        eps[0].state.latency(now)
+    );
+    settled(&eps[0]).await;
+
+    let proxy = start(&config(&[&bad], ALL, "")).await;
+    let eps = proxy.proxy.endpoints("web").unwrap();
+    assert!(exchange(proxy.addr, get).await.starts_with("HTTP/1.1 503"));
+    let latency = eps[0].state.latency(std::time::Instant::now());
+    assert!(latency >= 0.9, "{latency}");
+    settled(&eps[0]).await;
 }
 
 #[tokio::test]

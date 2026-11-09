@@ -91,11 +91,15 @@ difftest-balancer:
 	cargo run --release --locked -p edgefront-difftest -- balancer $(DIFFTEST_ARGS) -- target/diffdrive
 
 # Run the end-to-end HTTP/1.1 cases against a live steer as well as the
-# edgefront binary, and check steer still matches the recorded transcript.
-# Needs Go. E2E_BLESS=1 rewrites the recording from steer.
+# edgefront binary, and the end-to-end balancing run (20,000 requests per
+# policy over three priority levels) against steer's balancer through
+# diffdrive, and check steer still matches both recordings. Needs Go.
+# E2E_BLESS=1 rewrites the recordings from steer.
 e2e-steer:
 	cd legacy/steer && go build -o $(CURDIR)/target/steer ./cmd/steer
+	cd legacy/steer && go build -o $(CURDIR)/target/diffdrive ./cmd/diffdrive
 	STEER_BIN=$(CURDIR)/target/steer cargo test --locked -p edgefront --test e2e_port_http1
+	STEER_DIFFDRIVE=$(CURDIR)/target/diffdrive cargo test --locked -p edgefront --test e2e_port_balancer
 
 # Diff edgefront-limiter against libpacer: 100 generated scripts of 10,000
 # operations each through legacy/pacer/tests/diffdrive.c (built by

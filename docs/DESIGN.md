@@ -16,7 +16,7 @@ Each crate and the workspace crates it depends on. There are no cycles: `edgefro
 | `.` (`cachet`) | The node runtime still to move: the cache's request path (`proxy`), origins and health checks (`origin`), node start-up (`node`), metric families and the admin routes; and the reference `cachet` binary | edgefront-cache, edgefront-core |
 | `crates/edgefront-cache` | Caching policy, Cache-Control and range parsing, objects, request collapsing, purge, cluster gossip, the memory and disk stores, and the cache's config sections | edgefront-core |
 | `crates/edgefront-core` | The HTTP/1.1 listener the proxy and the cache both serve on, the pooled client, the clock, request ids, config loading and steer's schema, metrics writers and the admin router | none |
-| `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request ids and the request path ported from steer | edgefront-core |
+| `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request ids, the balancers and endpoint state, and the request path ported from steer | edgefront-core |
 | `crates/edgefront-limiter` | pacer's GCRA, keyed table and sliding window, and pacerd's config | none |
 | `crates/edgefront-difftest` | Differential drivers against `legacy/steer` and `legacy/pacer` | edgefront-core, edgefront-proxy, edgefront-limiter |
 
@@ -32,7 +32,8 @@ The HTTP/1.1 request path is `edgefront_proxy::server::Proxy`, a handler for the
 2. Route on the host and the cleaned path.
 3. Take a place under the cluster's `max_requests`.
 4. Remove hop-by-hop headers and the headers `Connection` names, rewrite the forwarding headers, and set the request ID.
-5. Send the upstream target: the client's own encoding when cleaning changed nothing, Go's encoding of the cleaned path otherwise.
+5. Pick the endpoint with the cluster's balancer (below). No pick is `503 no_healthy_upstream`.
+6. Send the upstream target: the client's own encoding when cleaning changed nothing, Go's encoding of the cleaned path otherwise.
 
 The body keeps the client's framing, because Go's transport copied `TransferEncoding`: a chunked body stays chunked even after steer buffered it for replay. The cluster's `timeout` covers the whole exchange, so it answers `504` before the response head and cuts the body after it. The place under `max_requests` is held until the response body is dropped, which is when steer's handler returned.
 
@@ -41,9 +42,24 @@ Three layers check the port:
 - **Unit and property tests** use Go's own test vectors and, for the trickier functions, fixtures recorded by running steer's Go code.
 - **`edgefront-difftest`** (`make difftest`, in CI on every push) feeds 10,000 generated configs and 100,000 generated requests to `legacy/steer/cmd/diffdrive` and to the Rust crates. It fails on any difference in acceptance, error text, route choice or cleaned path.
 - **`edgefront-difftest balancer`** (`make difftest-balancer`, in CI on every push) sends 1,000 seeded scenarios to diffdrive's `picks` query and to `edgefront_proxy::balancer::Balancer`. Each scenario has a policy, a panic threshold, endpoints over up to eight priority levels and 10,000 requests, mixed with health flips, ejections, clock moves, in-flight changes and latency samples. Both sides use SplitMix64 from the scenario's seed and a manual clock, and answer one line per operation: the picks of each request, retries included, and the priority state. The first differing line is reported with the scenario's seed, the step, the eight operations before it and a replay command.
+- **`crates/edgefront/tests/e2e_port_balancer.rs`** sends 20,000 HTTP requests per policy through a proxy built with a manual clock and a seeded generator, to nine origins over three priority levels, while a seeded script walks the cluster through ten phases: spill from level 0 to 1 to 2, panic, ejections that run out, and recovery, with random health flips, latency samples and requests held in flight on top. Each event and request becomes a line of a diffdrive `picks` script. The origins' counts must equal what the responses name, and the per-endpoint counts and a digest of all 60,000 picks must equal a fixture recorded from steer. `make e2e-steer` also runs the script through steer live and reports the first request where the picks differ.
 - **`crates/edgefront/tests/e2e_port_http1.rs`** starts the binary with `legacy/steer/examples/steer.json` and three recording fake upstreams. It sends 30 raw requests: the README's traffic, path cleaning, spoofed forwarding headers, request IDs, hop-by-hop headers both ways, body framing, upstream errors and the requests Go refuses. It then compares the response and the upstream's view of each request with a transcript recorded from steer. `make e2e-steer`, also in CI, runs steer live on the same cases and requires it to still produce that transcript.
 
-Until the balancer port lands, each cluster takes turns over its endpoints of the most preferred priority. The end-to-end transcript only records which priority level answered, so it holds when steer's `least_loaded` picks either primary.
+The HTTP/1.1 transcript only records which priority level answered, so it does not depend on which of the two primaries `least_loaded` picks; `e2e_port_balancer.rs` checks the picks themselves.
+
+### Balancing
+
+Each cluster has one `edgefront_proxy::balancer::Balancer` (steer's `balancer.LB`) over its endpoints, and a pick takes two steps, as in Envoy:
+
+1. **A priority level.** The balancer counts the available endpoints (healthy and not ejected, at the clock's time) per level, up to eight levels. `priority::priority_load` turns those counts into a load per level: each level's health percentage times the overprovisioning factor of 1.4, capped at 100, with what is left spilling to the next level, in integers exactly as steer computes them. If the normalised total health is below the cluster's `panic_threshold_percent`, the pick is in panic and every endpoint, available or not, is a candidate. A roll in `0..100` chooses the level by its load: drawn from the generator, or for Maglev with a key, taken from the key's high half so a key keeps its level. When every endpoint of the chosen level has been tried, the other levels are tried in priority order.
+2. **An endpoint in the level**, by the cluster's policy:
+   - `round_robin` (`rr.rs`): nginx's smooth weighted round robin. While first attempts keep the same candidate set, one full cycle is recorded and replayed in O(1); any other pick scans. About 27 ns over 100 endpoints.
+   - `least_loaded` (`ewma.rs`): power of two choices on `max(latency, 1 µs) × (in flight + 1)`, with steer's peak-EWMA latency estimate. It walks to its two candidates instead of copying the untried ones, so it never allocates. About 115 ns over 100 endpoints, a third of it the one clock read.
+   - `maglev` (`maglev.rs`): Maglev consistent hashing on the first value of `hash_header` (steer's FNV-1a and SplitMix64 finaliser of the value), with weighted turns and a cache of the last 8 lookup tables, one per candidate set. A retry walks forward to the next untried owner; a request without the header starts from a random slot. About 40 ns per pick, and a 65,537-slot table over 100 endpoints builds in 2.1 ms.
+
+Endpoint state (`endpoint.rs`, steer's `internal/endpoint`) is what the pick reads, so everything it reads is lock-free: the in-flight count, the health verdict, the end of the current ejection and the latency estimate. The probe and failure runs, interval counters and ejection multiplier change together under one mutex that only health checks, outlier detection and snapshots take. In the request path the endpoint counts the request in flight from the pick until the response body is dropped, and observes the time to the response head on the balancer's clock, at least one second when the attempt failed or answered 5xx so that a failing endpoint never looks fastest. Health checks and outlier detection (W03) will drive the verdicts and ejections; `Proxy::endpoints` exposes the same state to tests.
+
+Every random draw (level rolls, the two choices, keyless Maglev starts) comes from one `rng::Rng`, SplitMix64 in production seeded from entropy, and time comes from `edgefront_core::clock::Clock`. `Proxy::with_sources` takes both, so a test or the difftest can build a proxy whose picks are repeatable and draw in exactly steer's order, which is what lets them be diffed pick for pick.
 
 ## Porting pacer: the limiter algorithms
 
