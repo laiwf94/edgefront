@@ -14,6 +14,10 @@ use proptest::prelude::*;
 struct Model {
     healthy: bool,
     ejected_until: i64,
+    /// Whether `ejected_until` holds an ejection's end. steer keeps Unix
+    /// nanoseconds and uses zero for "none", but here times count from the
+    /// epoch, so an ejection that ends at the epoch also stores zero.
+    has_ejection: bool,
     hc_successes: i64,
     hc_failures: i64,
     consecutive_gw: i64,
@@ -62,6 +66,7 @@ impl Model {
         let d = d.min(max_time);
         let until = now + d;
         self.ejected_until = until;
+        self.has_ejection = true;
         self.consecutive_gw = 0;
         self.decay_from = until;
         until
@@ -152,6 +157,7 @@ proptest! {
                 Op::Clear => {
                     s.clear_ejection();
                     m.ejected_until = 0;
+                    m.has_ejection = false;
                     m.times_ejected = 0;
                     m.consecutive_gw = 0;
                 }
@@ -167,7 +173,7 @@ proptest! {
             prop_assert_eq!(s.ejected(t), m.ejected(now));
             prop_assert_eq!(s.available(t), m.healthy && !m.ejected(now));
             prop_assert_eq!(s.times_ejected(), u64::try_from(m.times_ejected).unwrap());
-            let until = (m.ejected_until != 0).then(|| at(epoch, m.ejected_until));
+            let until = m.has_ejection.then(|| at(epoch, m.ejected_until));
             prop_assert_eq!(s.ejected_until(), until);
             let snap = s.snapshot(t);
             prop_assert_eq!(i64::from(snap.consecutive_gateway_failures), m.consecutive_gw);
