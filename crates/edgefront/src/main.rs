@@ -4,8 +4,10 @@
 //! transcripts in tests/golden hold both binaries to that.
 //!
 //! `edgefront proxy` runs the HTTP/1.1 proxy ported from steer instead; see
-//! the `proxy` module.
+//! the `proxy` module, and `edgefront check` lints a limiter config; see
+//! the `check` module.
 
+mod check;
 mod cli;
 mod proxy;
 

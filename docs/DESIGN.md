@@ -112,6 +112,27 @@ The same directive table serves the serde form, which is how the limiter appears
 
 `LimiterConfig::to_pacerd` and `Serialize` write a config back out, choosing the largest unit that is exact (`2m`, `16k`). `validate` checks a config built in code by writing it and reading it back. A value neither syntax can express is an error naming the field: a duration that is not a whole number of milliseconds, a rate period other than a second, minute or hour, or an IPv6 scope id. Property tests round-trip generated configs through both syntaxes.
 
+### Config lints
+
+A config can parse and still not do what it says. `edgefront_limiter::lint` reads a valid `LimiterConfig` and reports what pacerd would actually do with it, and `edgefront check [--allow CLASS]... FILE` prints each finding as `FILE:LINE: warning[CLASS]: listener NAME: MESSAGE`, then a count, exiting 1 when there are findings, 0 with `FILE: ok` when there are none and 2 when the file does not parse. A `.toml` file is the limiter section in the serde form; anything else is a pacerd.conf. The line comes from a `SourceMap`: `parse_pacerd_mapped` records the line of each directive and each `listener NAME {`, and for TOML the binary reads toml's spans for each key and `[[listeners]]` header. A setting left at its default is reported on the line that opens its listener.
+
+Each class is a fact about pacerd's data path, and the unit tests check the facts the messages state against the limiter itself:
+
+| class | reported when | why it matters |
+|---|---|---|
+| `burst-below-read` | `bandwidth` or `per_ip_bandwidth` has a burst below the smaller of 4 KiB and `buffer` | `reserve` asks a byte limiter for at least that much, and the limiter clamps the minimum to the burst. Reads are cut to the burst, not refused, and a busy connection wakes once per burst (a test drives `take_range` the way `reserve` does) |
+| `listen-overlap` | a listener's address and an earlier one share a family and port, and exactly one is a wildcard | pacerd binds every listener with `SO_REUSEPORT`, so both bind and the kernel gives each connection to the most specific socket: the wildcard listener's limits never see that address's clients. IPv6 sockets are `V6ONLY`, so `[::]` and `0.0.0.0` do not overlap |
+| `table-below-max-conns` | `per_ip_max_conns` or `per_ip_conn_rate` is set and `table_size` is below `max_conns` | each connected client holds a table entry, and a held entry is never reclaimed or evicted, so client `table_size + 1` is refused as `table_full` under either policy while the listener has room (tested on a `Table` under both policies) |
+| `per-ip-cap-unreachable` | `per_ip_max_conns` is at least `max_conns` | one client reaches the listener's own cap first |
+| `per-ip-bandwidth-unreachable` | `per_ip_bandwidth` is at least `bandwidth` in rate (compared exactly) and in burst | one client's bytes are a share of the listener's, so the listener limit binds first |
+| `rate-rounding` | a rate is enforced more than 1% slower than written | a bucket's interval rounds up to a whole tick of 1/64 ns. pacerd's byte rates are commonly a little over 0.1% slow (`100m/s` by 0.106%), which is noise for a bandwidth cap; at 16 GiB a second it is 6.9%, and above 64 billion a second the exact interval is below one tick, so the rate enforced is 64 billion a second whatever is written |
+| `unused-table` | `table_size` or `table_full` is written but no per-client limit is set | the client table is never consulted |
+| `ipv6-prefix-unused` | `ipv6_prefix` is written on an IPv4 listener or on one without per-client limits | no client is ever grouped by it |
+| `wide-ipv6-prefix` | per-client limits group an IPv6 listener's clients by a prefix shorter than /48 | /48 is one end site, so a shorter prefix makes several sites, or a provider, share one client's limit |
+| `upstream-loop` | the upstream is a listener's address, or a loopback or unspecified address on a wildcard listener's port | every connection comes back into pacerd. Another address on a wildcard listener's port may be a different host, so it is not reported |
+
+A config built in code has no source map; its findings carry line 0, and the two classes that depend on what was written out (`unused-table` and `ipv6-prefix-unused`) are skipped. pacer's `examples/pacerd.conf` lints clean, and every config pacer's tests and corpus accept lints without a finding outside the file.
+
 ### Rates, units and quotas
 
 pacerd took whole counts per second, minute or hour (`10/s`, `600/m`), so half a request a second or a daily quota could not be written. `edgefront_limiter::rate::RateSpec` reads `COUNT/PERIOD [burst N]`: a count with up to nine decimal places and pacer's `k`, `m` and `g` multipliers, and a period of an optional whole number of units, `s`, `min`, `h` or `day` (with the usual spellings and plurals, and pacer's `m` for minutes). `0.5/s`, `90/min`, `2.5/10s burst 5` and `10000/day` all parse. `parse_pacerd` is unchanged and still refuses `10/d`, so pacerd files read exactly as before; `RateSpec` is the syntax for new configs.

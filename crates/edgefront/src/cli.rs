@@ -53,6 +53,11 @@ pub fn run(args: &[String]) -> ExitCode {
     {
         return crate::proxy::run(rest);
     }
+    if let [command, rest @ ..] = args
+        && command == "check"
+    {
+        return crate::check::run(rest);
+    }
     let (check_only, path) = match args {
         [flag] if flag == "--version" => {
             println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION"));

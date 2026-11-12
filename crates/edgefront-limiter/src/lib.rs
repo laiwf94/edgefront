@@ -9,13 +9,18 @@
 pub mod clock;
 pub mod config;
 pub mod gcra;
+pub mod lint;
 pub mod rate;
 pub mod siphash;
 pub mod table;
 pub mod window;
 
-pub use config::{LimiterConfig, ListenerConfig, LogLevel, MinRate, parse_pacerd};
+pub use config::{
+    LimiterConfig, Lines, ListenerConfig, ListenerLines, LogLevel, MinRate, SourceMap,
+    parse_pacerd, parse_pacerd_mapped,
+};
 pub use gcra::{Decision, Error, Gcra, Rate};
+pub use lint::{Class, Lint, lint};
 pub use rate::{Limiter, Plan, Quota, RateError, RateSpec};
 pub use siphash::KeyHash;
 pub use table::{EntryState, FullPolicy, Table, TableConfig, TableStats};

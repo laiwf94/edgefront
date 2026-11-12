@@ -277,9 +277,11 @@ dependencies = [
  "cachet",
  "edgefront-core",
  "edgefront-difftest",
+ "edgefront-limiter",
  "edgefront-proxy",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

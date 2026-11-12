@@ -197,6 +197,83 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The 1-based line each directive of one scope was set on. A directive
+/// left at its default has no line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lines {
+    lines: Vec<(&'static str, usize)>,
+}
+
+impl Lines {
+    /// Records that `directive` was set on `line`. `directive` must be one
+    /// of the directive names; others are ignored.
+    pub fn set(&mut self, directive: &str, line: usize) {
+        let Some((_, d)) = directive_named(directive) else {
+            return;
+        };
+        match self.lines.iter_mut().find(|(n, _)| *n == d.name) {
+            Some(slot) => slot.1 = line,
+            None => self.lines.push((d.name, line)),
+        }
+    }
+
+    /// The line `directive` was set on, if it was set.
+    pub fn get(&self, directive: &str) -> Option<usize> {
+        self.lines
+            .iter()
+            .find(|(n, _)| *n == directive)
+            .map(|&(_, l)| l)
+    }
+}
+
+/// One listener's lines: its block's opening line and its directives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListenerLines {
+    /// The line that opens the listener (`listener NAME {`, or the
+    /// `[[listeners]]` header).
+    pub line: usize,
+    pub directives: Lines,
+}
+
+impl ListenerLines {
+    pub fn new(line: usize) -> Self {
+        Self {
+            line,
+            directives: Lines::default(),
+        }
+    }
+
+    pub fn set(&mut self, directive: &str, line: usize) {
+        self.directives.set(directive, line);
+    }
+
+    /// The directive's line, or the listener's own line when the directive
+    /// was left at its default.
+    pub fn line_of(&self, directive: &str) -> usize {
+        self.directives.get(directive).unwrap_or(self.line)
+    }
+}
+
+/// Where each value of a config came from, so that [`crate::lint`] can
+/// name a line. [`parse_pacerd_mapped`] fills it from pacerd.conf; a TOML
+/// reader fills it from its spans. `listeners[i]` belongs to the config's
+/// `listeners[i]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceMap {
+    pub top: Lines,
+    pub listeners: Vec<ListenerLines>,
+}
+
+/// The names of every directive, top-level ones first, in config.c's
+/// order.
+pub fn directive_names() -> impl Iterator<Item = &'static str> {
+    DIRECTIVES.iter().map(|d| d.name)
+}
+
+fn directive_named(name: &str) -> Option<(usize, &'static Directive)> {
+    directive(name.as_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // Value parsers, one for one with config.c.
 
@@ -700,6 +777,8 @@ fn tokenize(line: &[u8]) -> Option<Vec<&[u8]>> {
 
 struct Parser {
     cfg: LimiterConfig,
+    map: SourceMap,
+    line_no: usize,
     cur: Option<Pending>,
     /// A bit per directive already set in the current scope.
     seen: u32,
@@ -721,6 +800,7 @@ impl Parser {
                 return Err("expected: listener NAME {".into());
             }
             self.cur = Some(open_listener(&self.cfg.listeners, tok[1])?);
+            self.map.listeners.push(ListenerLines::new(self.line_no));
             self.top_seen = self.seen;
             self.seen = 0;
             return Ok(());
@@ -749,6 +829,10 @@ impl Parser {
             return Err(format!("{} set twice", d.name));
         }
         self.seen |= 1 << i;
+        match self.map.listeners.last_mut().filter(|_| self.cur.is_some()) {
+            Some(l) => l.set(d.name, self.line_no),
+            None => self.map.top.set(d.name, self.line_no),
+        }
         let target = match self.cur.as_mut() {
             Some(p) => Target::Listener(p),
             None => Target::Top(&mut self.cfg),
@@ -759,6 +843,12 @@ impl Parser {
 
 /// Parses pacerd.conf text exactly as pacerd's `pd_config_parse` did.
 pub fn parse_pacerd(buf: &[u8]) -> Result<LimiterConfig, ConfigError> {
+    parse_pacerd_mapped(buf).map(|(cfg, _)| cfg)
+}
+
+/// [`parse_pacerd`], also returning the line of every directive, for
+/// [`crate::lint`].
+pub fn parse_pacerd_mapped(buf: &[u8]) -> Result<(LimiterConfig, SourceMap), ConfigError> {
     let fail = |line: usize, message: String| ConfigError { line, message };
     if buf.len() > MAX_FILE_BYTES {
         return Err(fail(
@@ -768,6 +858,8 @@ pub fn parse_pacerd(buf: &[u8]) -> Result<LimiterConfig, ConfigError> {
     }
     let mut p = Parser {
         cfg: LimiterConfig::default(),
+        map: SourceMap::default(),
+        line_no: 0,
         cur: None,
         seen: 0,
         top_seen: 0,
@@ -785,6 +877,7 @@ pub fn parse_pacerd(buf: &[u8]) -> Result<LimiterConfig, ConfigError> {
         if line.contains(&0) {
             return Err(fail(line_no, "unexpected NUL byte".into()));
         }
+        p.line_no = line_no;
         p.line(line).map_err(|m| fail(line_no, m))?;
     }
     if let Some(open) = p.cur {
@@ -796,19 +889,24 @@ pub fn parse_pacerd(buf: &[u8]) -> Result<LimiterConfig, ConfigError> {
     if p.cfg.listeners.is_empty() {
         return Err(fail(line_no, "no listener defined".into()));
     }
-    Ok(p.cfg)
+    Ok((p.cfg, p.map))
 }
 
 /// Reads a pacerd.conf of at most [`MAX_FILE_BYTES`] and parses it. The
 /// message names the file for I/O errors and gives the line otherwise.
 pub fn read_pacerd(path: &Path) -> Result<LimiterConfig, String> {
+    read_pacerd_mapped(path).map(|(cfg, _)| cfg)
+}
+
+/// [`read_pacerd`], also returning the line of every directive.
+pub fn read_pacerd_mapped(path: &Path) -> Result<(LimiterConfig, SourceMap), String> {
     let io = |e: std::io::Error| format!("{}: {e}", path.display());
     let file = std::fs::File::open(path).map_err(io)?;
     let mut buf = Vec::new();
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut buf)
         .map_err(io)?;
-    parse_pacerd(&buf).map_err(|e| e.to_string())
+    parse_pacerd_mapped(&buf).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
