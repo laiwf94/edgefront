@@ -48,6 +48,7 @@ Still to come from steer: health checks, outlier detection, retries, the admin A
 - `clock`: the epoch arithmetic and the clocks that give `now_ns`: `MonotonicClock`, and `ManualClock` for tests and simulations.
 - `Table`: a fixed-memory map from keys (an API key, an address) to their own bucket, in power-of-two shards, keyed by SipHash with a random key. When it is full it reclaims idle entries, then denies new keys or evicts the coldest of eight, and it never drops a key that holds a concurrency slot (`hold`/`release`). Each shard keeps its arrival times from its own moving epoch, so keyed limits also work past 4.5 years of uptime.
 - `Window`: a sliding-window counter of up to 16 buckets, for quotas such as 1,000 requests an hour, that weights the oldest bucket by the part of it still inside the window.
+- `rate::RateSpec`: rates as operators write them, with fractions and units up to days: `0.5/s`, `90/min`, `2.5/10s burst 5`, `10000/day`. Each is held as an exact fraction and enforced within 0.1% of it, or refused with the reason. Periods of an hour or more without a burst become window quotas (`rate::Quota`, at most N in any window); shorter ones are token buckets.
 - `config::LimiterConfig`: pacerd's listeners and limits. `parse_pacerd` reads an existing pacerd.conf with pacerd's own messages and line numbers, and the same settings load through serde as a TOML section, with each value written as in pacerd (`per_ip_conn_rate = "10/s burst 20"`).
 
 Every call takes the time in nanoseconds from the caller, so the library reads no clock and its answers are exact:
@@ -66,7 +67,7 @@ if !d.allowed {
 
 `edgefront-difftest` holds the port to libpacer through `legacy/pacer/tests/diffdrive.c`, a C driver that reads one operation per line and prints each decision with the full state after it. `make difftest-pacer` diffs 100 generated scripts of 10,000 operations against the Rust crate and prints the seed, step and replay command of the first difference. `crates/edgefront-difftest/tests/e2e_limiter_port.rs` runs one million of those operations in CI on every push, plus a worked example of per-key limits, retry times and an hourly quota that both sides must answer exactly. How the port was checked and where it deliberately differs from the C is in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
 
-Still to come from pacer: the rest of week 2 (the config difftest, a clock that runs past 4.5 years, fractional rates and longer units, and lints), the L4 data path with connection limits and shaping (week 3), and `pacerctl` with the published C-versus-Rust benchmark (week 4), after which `legacy/pacer` is removed.
+Still to come from pacer: the rest of week 2 (config lints, a fuzz target for the config reader, and `RateSpec` in the limiter's config section), the L4 data path with connection limits and shaping (week 3), and `pacerctl` with the published C-versus-Rust benchmark (week 4), after which `legacy/pacer` is removed.
 
 ## Cache (formerly cachet)
 

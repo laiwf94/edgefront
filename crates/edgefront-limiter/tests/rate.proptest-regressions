@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1ece686262ac113fa835ff29dc4e3c41107d6d5aa1c85ade8acc679aff91ebde # shrinks to w = Written { text: "0.2/s", mantissa: 2, scale: 1, period_ns: 1000000000, burst: None }
+cc d3902c6851fc2bc2e55f7784c2c820a9914f884c0f170955259f47b87536d0e8 # shrinks to w = Written { text: "0.1/19s burst 379251", mantissa: 1, scale: 1, period_ns: 19000000000, burst: Some(379251) }

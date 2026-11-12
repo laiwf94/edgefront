@@ -106,6 +106,51 @@ impl Window {
         self.total.wrapping_sub(oldest).wrapping_add(keep as u64)
     }
 
+    /// How long after `now_ns` [`Window::count`] first returns at most `n`,
+    /// if no more events are added: 0 when it already does. The count never
+    /// rises as time passes, so this is the exact wait a caller denied for
+    /// lack of room must sit out. Does not move the window.
+    ///
+    /// After `j` more bucket steps the `j` oldest buckets have gone, and
+    /// within that step the new oldest bucket `b` is weighted by
+    /// `(slot - into) / slot`, rounded down. That is at most `room` exactly
+    /// when `b * (slot - into) < (room + 1) * slot`, which gives the first
+    /// `into` in closed form, so the wait costs one pass over the ring.
+    pub fn until_at_most(&self, now_ns: u64, n: u64) -> u64 {
+        let mut w = self.clone();
+        w.advance(now_ns);
+        let slot = u128::from(w.slot_ns);
+        let mut into = u128::from(now_ns.saturating_sub(w.head_start));
+        if w.clone().count(now_ns) <= n {
+            return 0;
+        }
+        let mut total = w.total;
+        for j in 0..u128::from(w.n) {
+            // j steps on, the bucket after the head is the oldest.
+            let oldest = w.counts[((u128::from(w.head) + 1 + j) % u128::from(w.n)) as usize];
+            let rest = total.wrapping_sub(oldest);
+            if rest <= n {
+                let room = u128::from(n - rest);
+                let oldest = u128::from(oldest);
+                // The first `into` with oldest * (slot - into) < (room + 1) * slot.
+                let first = if oldest * (slot - into) < (room + 1) * slot {
+                    into
+                } else {
+                    (slot + 1).saturating_sub(((room + 1) * slot).div_ceil(oldest))
+                };
+                if first < slot {
+                    let at = u128::from(w.head_start) + j * slot + first.max(into);
+                    return u64::try_from(at - u128::from(now_ns)).unwrap_or(u64::MAX);
+                }
+            }
+            total = rest;
+            into = 0;
+        }
+        // Every bucket has gone by now: the count is 0.
+        let at = u128::from(w.head_start) + u128::from(w.n) * slot;
+        u64::try_from(at - u128::from(now_ns)).unwrap_or(u64::MAX)
+    }
+
     /// The width of one bucket in nanoseconds.
     pub fn slot_ns(&self) -> u64 {
         self.slot_ns
@@ -368,5 +413,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn until_at_most_is_the_exact_wait() {
+        let at = |w: &Window, t: u64| w.clone().count(t);
+        for seed in 1..=300u64 {
+            let mut s = seed;
+            let slots = 1 + (splitmix(&mut s) % u64::from(SLOTS_MAX)) as u32;
+            let window_ns = u64::from(slots) * (1 + splitmix(&mut s) % 1_000);
+            let start = splitmix(&mut s) % 1_000_000;
+            let mut w = Window::new(window_ns, slots, start).unwrap();
+            let slot = w.slot_ns();
+            let mut now = start;
+            for step in 0..200 {
+                now += splitmix(&mut s) % (3 * slot);
+                if !splitmix(&mut s).is_multiple_of(4) {
+                    w.add(now, splitmix(&mut s) % 50);
+                    continue;
+                }
+                // A time just before the head bucket, now and then.
+                let t = if step % 7 == 0 {
+                    now.saturating_sub(slot / 2)
+                } else {
+                    now
+                };
+                let n = splitmix(&mut s) % (w.count(now) + 2);
+                let before = w.clone();
+                let wait = w.until_at_most(t, n);
+                assert_eq!(w, before, "seed {seed} step {step}: the window moved");
+                assert!(
+                    at(&w, t + wait) <= n,
+                    "seed {seed} step {step}: {} > {n} after {wait}",
+                    at(&w, t + wait)
+                );
+                if wait > 0 {
+                    assert!(
+                        at(&w, t + wait - 1) > n,
+                        "seed {seed} step {step}: a wait of {wait} is too long for {n}"
+                    );
+                }
+                // The count never rises with time.
+                let mut last = at(&w, t);
+                for k in 1..=20 {
+                    let c = at(&w, t + k * (window_ns + slot) / 20);
+                    assert!(c <= last, "seed {seed} step {step}: count rose");
+                    last = c;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn until_at_most_past_every_bucket_and_at_the_top_of_the_clock() {
+        // A bucket too large to weight below 1 is only gone with the ring.
+        let mut w = Window::new(4, 4, 0).unwrap();
+        w.add(0, 1_000);
+        assert_eq!(w.until_at_most(0, 0), 5);
+        assert_eq!(w.clone().count(5), 0);
+        assert_eq!(w.clone().count(4), 1_000);
+        assert_eq!(w.until_at_most(0, 1_000), 0);
+        let mut w = Window::new(100, 1, u64::MAX - 150).unwrap();
+        w.add(u64::MAX - 150, 4);
+        assert_eq!(w.until_at_most(u64::MAX - 150, 3), 101);
+        let mut w = Window::new(u64::MAX, 1, u64::MAX - 10).unwrap();
+        w.add(u64::MAX - 10, 4);
+        assert_eq!(w.until_at_most(u64::MAX - 10, 0), u64::MAX);
     }
 }

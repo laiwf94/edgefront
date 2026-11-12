@@ -1,7 +1,8 @@
 //! Single-thread decisions per second, with the workloads of libpacer's
 //! bench/bench_limiter.c so the numbers compare directly: a rate of 10^7
 //! per second with a burst of 1000, time advancing 50 ns per decision, and
-//! a 200,000-entry table under the evict policy.
+//! a 200,000-entry table under the evict policy. The quota rows have no C
+//! counterpart: libpacer had no quota built on its window.
 //!
 //! Run with `cargo bench -p edgefront-limiter`; criterion reports time per
 //! iteration and, through `Throughput::Elements`, decisions per second.
@@ -9,7 +10,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use edgefront_limiter::{FullPolicy, Gcra, KeyHash, Rate, Table, TableConfig};
+use edgefront_limiter::{FullPolicy, Gcra, KeyHash, Quota, Rate, Table, TableConfig};
 
 const SEC: u64 = 1_000_000_000;
 const RATE: Rate = Rate::new(10_000_000, SEC, 1000);
@@ -64,6 +65,27 @@ fn bench(c: &mut Criterion) {
                 let mut allowed = 0u64;
                 for _ in 0..BATCH {
                     allowed += u64::from(t.take(black_box(b"hot"), now, 1).unwrap().allowed);
+                    now += 50;
+                }
+                allowed
+            })
+        });
+    }
+
+    // Window quotas (`10000/day`): one that always has room, and one that
+    // is spent, so every take is denied and computes its exact wait.
+    const DAY: u64 = 86_400 * SEC;
+    for (name, limit) in [("admitted", 1u64 << 50), ("denied", 10_000)] {
+        let mut q = Quota::new(limit, DAY, 0).unwrap();
+        let mut now = SEC;
+        if limit == 10_000 {
+            q.take(now, limit).unwrap();
+        }
+        group.bench_function(format!("quota take, {name}"), |b| {
+            b.iter(|| {
+                let mut allowed = 0u64;
+                for _ in 0..BATCH {
+                    allowed += u64::from(q.take(black_box(now), 1).unwrap().allowed);
                     now += 50;
                 }
                 allowed
