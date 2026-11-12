@@ -36,9 +36,56 @@ async fn stopped(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
 }
 
+/// The proxy and admin listeners a node serves on, already bound.
+///
+/// [`start_with`] takes these instead of binding `listen` and
+/// `admin_listen` itself, so a caller that chose the ports (a test that
+/// tells each node its peers' addresses before any node starts) never has
+/// to release a port and bind it again, which lets any other socket take
+/// it in between.
+pub struct Listeners {
+    pub proxy: TcpListener,
+    pub admin: TcpListener,
+}
+
+impl Listeners {
+    /// Binds the config's `listen` and `admin_listen` addresses.
+    pub async fn bind(config: &Config) -> Result<Self, String> {
+        let bind = |addr: SocketAddr| async move {
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| format!("cannot listen on {addr}: {e}"))
+        };
+        Ok(Listeners {
+            proxy: bind(config.listen).await?,
+            admin: bind(config.admin_listen).await?,
+        })
+    }
+}
+
 /// Builds and starts a node. Fails on invalid config, missing secrets, an
 /// unusable disk directory or a port that cannot be bound.
 pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
+    start_on(config, secrets, None).await
+}
+
+/// Builds and starts a node on listeners that are already bound. The
+/// config's `listen` and `admin_listen` are not used. Fails on invalid
+/// config, missing secrets or an unusable disk directory; the listeners
+/// are dropped then.
+pub async fn start_with(
+    config: &Config,
+    secrets: &Secrets,
+    listeners: Listeners,
+) -> Result<Node, String> {
+    start_on(config, secrets, Some(listeners)).await
+}
+
+async fn start_on(
+    config: &Config,
+    secrets: &Secrets,
+    listeners: Option<Listeners>,
+) -> Result<Node, String> {
     config.validate()?;
     config.validate_secrets(secrets)?;
     let cache = Cache::new(&config.cache_settings())
@@ -62,13 +109,13 @@ pub async fn start(config: &Config, secrets: &Secrets) -> Result<Node, String> {
         Arc::new(SystemClock),
     );
 
-    let bind = |addr: SocketAddr| async move {
-        TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("cannot listen on {addr}: {e}"))
+    let Listeners {
+        proxy: proxy_listener,
+        admin: admin_listener,
+    } = match listeners {
+        Some(l) => l,
+        None => Listeners::bind(config).await?,
     };
-    let proxy_listener = bind(config.listen).await?;
-    let admin_listener = bind(config.admin_listen).await?;
     let proxy_addr = proxy_listener.local_addr().map_err(|e| e.to_string())?;
     let admin_addr = admin_listener.local_addr().map_err(|e| e.to_string())?;
 

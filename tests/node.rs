@@ -382,3 +382,53 @@ async fn startup_failures_are_reported() {
     let err = node::start(&config, &secrets()).await.err().unwrap();
     assert!(err.contains("cannot listen"), "{err}");
 }
+
+#[tokio::test]
+async fn starts_on_listeners_it_is_given() {
+    let o = TestOrigin::start(handler(|_, _| {
+        reply(200, &[("cache-control", "max-age=60")], "page")
+    }))
+    .await;
+    // The config names ports that are taken; the node never binds them.
+    let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = node_config("edge-a", &[o.addr], "");
+    config.listen = taken.local_addr().unwrap();
+    config.admin_listen = taken.local_addr().unwrap();
+    let listeners = node::Listeners {
+        proxy: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    };
+    let (proxy, admin) = (
+        listeners.proxy.local_addr().unwrap(),
+        listeners.admin.local_addr().unwrap(),
+    );
+    let n = node::start_with(&config, &secrets(), listeners)
+        .await
+        .unwrap();
+    assert_eq!((n.proxy_addr, n.admin_addr), (proxy, admin));
+    http("GET", proxy, "/a", &[], "").await;
+    assert!(
+        http("GET", proxy, "/a", &[], "")
+            .await
+            .cache_status()
+            .contains("hit")
+    );
+    assert_eq!(http("GET", admin, "/healthz", &[], "").await.status, 200);
+    n.shutdown().await;
+
+    // A config that fails validation is refused before the listeners serve.
+    let listeners = node::Listeners {
+        proxy: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    };
+    let peers = "[[peers]]\nname = \"edge-b\"\nurl = \"http://127.0.0.1:1\"\n";
+    let err = node::start_with(
+        &node_config("edge-a", &[o.addr], peers),
+        &Secrets::default(),
+        listeners,
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(err.contains("CACHET_CLUSTER_SECRET"), "{err}");
+}

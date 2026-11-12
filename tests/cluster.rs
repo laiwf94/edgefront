@@ -6,14 +6,56 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cachet::cluster::{PurgeMessage, sign};
 use cachet::config::Secrets;
-use cachet::node::{self, Node};
+use std::time::Duration;
+
+use cachet::node::{self, Listeners, Node};
 use common::{Scratch, TOKEN, TestOrigin, eventually, handler, http, node_config, reply, secrets};
+use tokio::net::{TcpListener, TcpSocket};
 
 const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
-async fn free_port() -> SocketAddr {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap()
+/// An admin port held for a node that has not started yet. The socket is
+/// bound, so no other socket in the process can take the port while the
+/// nodes learn each other's addresses, but not listening, so a peer that
+/// connects before the node starts is refused, as by a free port.
+struct Reserved {
+    addr: SocketAddr,
+    socket: TcpSocket,
+}
+
+fn bound(addr: SocketAddr) -> std::io::Result<Reserved> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    let addr = socket.local_addr()?;
+    Ok(Reserved { addr, socket })
+}
+
+fn reserve() -> Reserved {
+    bound("127.0.0.1:0".parse().unwrap()).unwrap()
+}
+
+/// Takes `addr` back right after the node holding it shut down, waiting
+/// out the moment the closing listener still owns it.
+async fn reserve_again(addr: SocketAddr) -> Reserved {
+    for _ in 0..50 {
+        match bound(addr) {
+            Ok(r) => return r,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("cannot reserve {addr}: {e}"),
+        }
+    }
+    panic!("{addr} is still in use");
+}
+
+/// The listeners for a node: a fresh proxy port and the reserved admin port.
+async fn listeners(admin: Reserved) -> Listeners {
+    Listeners {
+        proxy: TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        admin: admin.socket.listen(1024).unwrap(),
+    }
 }
 
 async fn tagged_origin() -> TestOrigin {
@@ -27,15 +69,16 @@ async fn tagged_origin() -> TestOrigin {
     .await
 }
 
-/// Starts a node whose admin listener is at `admin` and whose peers are
-/// the given (name, admin address) pairs.
+/// Starts a node whose admin listener is the reserved `admin` port and
+/// whose peers are the given (name, admin address) pairs.
 async fn start(
     name: &str,
-    admin: SocketAddr,
+    admin: Reserved,
     origin: SocketAddr,
     peers: &[(&str, SocketAddr)],
     extra: &str,
 ) -> Node {
+    let admin_addr = admin.addr;
     let mut text = String::from("[gossip]\nretry_max_ms = 200\n");
     for (peer, addr) in peers {
         text.push_str(&format!(
@@ -43,9 +86,12 @@ async fn start(
         ));
     }
     text.push_str(extra);
-    let mut config = node_config(name, &[origin], &text);
-    config.admin_listen = admin;
-    node::start(&config, &secrets()).await.unwrap()
+    let config = node_config(name, &[origin], &text);
+    let node = node::start_with(&config, &secrets(), listeners(admin).await)
+        .await
+        .unwrap();
+    assert_eq!(node.admin_addr, admin_addr);
+    node
 }
 
 async fn purge(node: &Node, body: &'static str) -> serde_json::Value {
@@ -72,10 +118,11 @@ async fn cached(node: &Node) -> bool {
 #[tokio::test]
 async fn a_purge_reaches_every_node() {
     let o = tagged_origin().await;
-    let (a, b, c) = (free_port().await, free_port().await, free_port().await);
-    let na = start("edge-a", a, o.addr, &[("edge-b", b), ("edge-c", c)], "").await;
-    let nb = start("edge-b", b, o.addr, &[("edge-a", a), ("edge-c", c)], "").await;
-    let nc = start("edge-c", c, o.addr, &[("edge-a", a), ("edge-b", b)], "").await;
+    let (ra, rb, rc) = (reserve(), reserve(), reserve());
+    let (a, b, c) = (ra.addr, rb.addr, rc.addr);
+    let na = start("edge-a", ra, o.addr, &[("edge-b", b), ("edge-c", c)], "").await;
+    let nb = start("edge-b", rb, o.addr, &[("edge-a", a), ("edge-c", c)], "").await;
+    let nc = start("edge-c", rc, o.addr, &[("edge-a", a), ("edge-b", b)], "").await;
     for n in [&na, &nb, &nc] {
         http("GET", n.proxy_addr, "/news", &[], "").await;
         assert!(cached(n).await);
@@ -104,11 +151,12 @@ async fn a_purge_reaches_every_node() {
 #[tokio::test]
 async fn a_purge_spreads_through_a_relay() {
     let o = tagged_origin().await;
-    let (a, b, c) = (free_port().await, free_port().await, free_port().await);
+    let (ra, rb, rc) = (reserve(), reserve(), reserve());
+    let (a, b, c) = (ra.addr, rb.addr, rc.addr);
     // edge-a cannot reach edge-c directly; edge-b knows both.
-    let na = start("edge-a", a, o.addr, &[("edge-b", b)], "").await;
-    let nb = start("edge-b", b, o.addr, &[("edge-a", a), ("edge-c", c)], "").await;
-    let nc = start("edge-c", c, o.addr, &[("edge-b", b)], "").await;
+    let na = start("edge-a", ra, o.addr, &[("edge-b", b)], "").await;
+    let nb = start("edge-b", rb, o.addr, &[("edge-a", a), ("edge-c", c)], "").await;
+    let nc = start("edge-c", rc, o.addr, &[("edge-b", b)], "").await;
     http("GET", nc.proxy_addr, "/news", &[], "").await;
     purge(&na, r#"{"urls": ["http://example.com/news"]}"#).await;
     eventually("purge relayed to edge-c", || {
@@ -124,18 +172,21 @@ async fn a_purge_spreads_through_a_relay() {
 #[tokio::test]
 async fn a_peer_that_was_down_gets_the_purge_when_it_returns() {
     let o = tagged_origin().await;
-    let (a, b) = (free_port().await, free_port().await);
+    let (ra, rb) = (reserve(), reserve());
+    let (a, b) = (ra.addr, rb.addr);
     let dir = Scratch::new("partition");
     let disk = format!(
         "[cache.disk]\npath = \"{}\"\nmax_bytes = 100000000\n",
         dir.0.display()
     );
-    let nb = start("edge-b", b, o.addr, &[("edge-a", a)], &disk).await;
+    let nb = start("edge-b", rb, o.addr, &[("edge-a", a)], &disk).await;
     let b_proxy = nb.proxy_addr;
     http("GET", b_proxy, "/news", &[], "").await;
     nb.shutdown().await;
+    // Hold edge-b's admin port while it is down, so the restart gets it.
+    let rb = reserve_again(b).await;
 
-    let na = start("edge-a", a, o.addr, &[("edge-b", b)], "").await;
+    let na = start("edge-a", ra, o.addr, &[("edge-b", b)], "").await;
     purge(&na, r#"{"tags": ["news"]}"#).await;
     eventually("delivery retried", || {
         na.proxy.metrics.gossip_retries.load(Ordering::Relaxed) >= 2
@@ -143,7 +194,7 @@ async fn a_peer_that_was_down_gets_the_purge_when_it_returns() {
     .await;
 
     // edge-b comes back with its disk tier still holding the purged page.
-    let nb = start("edge-b", b, o.addr, &[("edge-a", a)], &disk).await;
+    let nb = start("edge-b", rb, o.addr, &[("edge-a", a)], &disk).await;
     eventually("purge delivered after the partition", || {
         nb.proxy.metrics.purges_peer.load(Ordering::Relaxed) == 1
     })
@@ -192,7 +243,7 @@ async fn deliver(node: &Node, body: String, key: &[u8]) -> (u16, String) {
 #[tokio::test]
 async fn peer_messages_must_be_signed_fresh_and_new() {
     let o = tagged_origin().await;
-    let n = start("edge-a", free_port().await, o.addr, &[], "").await;
+    let n = start("edge-a", reserve(), o.addr, &[], "").await;
     http("GET", n.proxy_addr, "/news", &[], "").await;
 
     let body = message("m1", now());
@@ -268,19 +319,22 @@ async fn nodes_without_a_cluster_key_refuse_peer_messages() {
 #[tokio::test]
 async fn a_peer_with_another_key_is_not_retried() {
     let o = tagged_origin().await;
-    let (a, b) = (free_port().await, free_port().await);
-    let na = start("edge-a", a, o.addr, &[("edge-b", b)], "").await;
-    let mut config = node_config(
+    let (ra, rb) = (reserve(), reserve());
+    let b = rb.addr;
+    let na = start("edge-a", ra, o.addr, &[("edge-b", b)], "").await;
+    let config = node_config(
         "edge-b",
         &[o.addr],
         "[[peers]]\nname = \"edge-a\"\nurl = \"http://127.0.0.1:1\"\n",
     );
-    config.admin_listen = b;
     let other = Secrets {
         admin_token: None,
         cluster_secret: Some(b"another key another key another k".to_vec()),
     };
-    let nb = node::start(&config, &other).await.unwrap();
+    let nb = node::start_with(&config, &other, listeners(rb).await)
+        .await
+        .unwrap();
+    assert_eq!(nb.admin_addr, b);
     purge(&na, r#"{"tags": ["news"]}"#).await;
     eventually("refused delivery dropped", || {
         na.proxy.metrics.gossip_dropped.load(Ordering::Relaxed) == 1
