@@ -6,7 +6,9 @@
 //! and `Join` for slash-separated paths.
 //!
 //! [`split_host_port`] and [`parse_addr`] are public because the proxy's
-//! client address handling (`X-Forwarded-For`) needs Go's rules too.
+//! client address handling (`X-Forwarded-For`) needs Go's rules too, and
+//! [`parse_duration`] and [`format_duration`] because the proxy's fake
+//! upstream reads and writes durations the way steer's did.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -20,7 +22,7 @@ const MAX_MAGNITUDE: u64 = 1 << 63;
 /// `m`, `h`), such as `"300ms"`, `"-1.5h"` or `"2h45m"`; a lone `"0"` is
 /// also accepted. Values beyond the range of an `i64` are rejected, except
 /// that the negative range reaches `i64::MIN` as in Go.
-pub(crate) fn parse_duration(text: &str) -> Option<i64> {
+pub fn parse_duration(text: &str) -> Option<i64> {
     let mut s = text.as_bytes();
     let mut neg = false;
     if let Some(&c) = s.first()
@@ -137,7 +139,7 @@ fn leading_fraction(s: &[u8]) -> (u64, f64, &[u8]) {
 }
 
 /// Go's `time.Duration.String`: `"0s"`, `"1.5ms"`, `"2m30s"`, `"1h0m0s"`.
-pub(crate) fn format_duration(nanos: i64) -> String {
+pub fn format_duration(nanos: i64) -> String {
     let mut u = nanos.unsigned_abs();
     let mut out = String::new();
     if u < NANOS_PER_SECOND {

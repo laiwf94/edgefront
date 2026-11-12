@@ -8,7 +8,9 @@
 
 pub mod balancer;
 pub mod endpoint;
+pub mod fakeupstream;
 pub mod forwarded;
+pub mod health;
 pub mod path;
 pub mod reqid;
 pub mod route;

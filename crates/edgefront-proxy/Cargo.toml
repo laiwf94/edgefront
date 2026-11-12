@@ -14,6 +14,8 @@ bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
