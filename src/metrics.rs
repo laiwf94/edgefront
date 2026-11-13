@@ -13,48 +13,9 @@ use crate::origin::OriginPool;
 use crate::policy::NotStorable;
 use crate::store::Cache;
 
-/// How a request was answered, for the requests counter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    /// Fresh from the cache.
-    Hit,
-    /// Stale from the cache while a refresh runs, or accepted by max-stale.
-    Stale,
-    /// Stale from the cache because the origin failed.
-    StaleIfError,
-    /// Fetched from the origin and possibly stored.
-    Miss,
-    /// Revalidated with a 304.
-    Revalidated,
-    /// Not cacheable: passed through to the origin.
-    Pass,
-    /// Answered with an error the proxy generated.
-    Error,
-}
-
-impl Outcome {
-    const ALL: [Outcome; 7] = [
-        Outcome::Hit,
-        Outcome::Stale,
-        Outcome::StaleIfError,
-        Outcome::Miss,
-        Outcome::Revalidated,
-        Outcome::Pass,
-        Outcome::Error,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Outcome::Hit => "hit",
-            Outcome::Stale => "stale",
-            Outcome::StaleIfError => "stale_if_error",
-            Outcome::Miss => "miss",
-            Outcome::Revalidated => "revalidated",
-            Outcome::Pass => "pass",
-            Outcome::Error => "error",
-        }
-    }
-}
+/// How a request was answered, for the requests counter: the cache layer
+/// marks each response with one.
+pub use crate::layer::Outcome;
 
 const NOT_STORABLE: [NotStorable; 9] = [
     NotStorable::Method,
@@ -83,6 +44,25 @@ pub struct Metrics {
     pub gossip_dropped: AtomicU64,
     pub gossip_rejected: AtomicU64,
     pub latency: Histogram,
+}
+
+/// The cache layer's events, counted.
+impl crate::layer::Observer for Metrics {
+    fn not_stored(&self, reason: NotStorable) {
+        Metrics::not_stored(self, reason);
+    }
+
+    fn streamed_uncached(&self) {
+        self.streamed_uncached.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn collapsed(&self) {
+        self.collapsed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn background_refresh(&self) {
+        self.background_refreshes.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Metrics {

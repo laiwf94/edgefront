@@ -11,7 +11,8 @@ use bytes::Bytes;
 use edgefront_cache::config::CacheConfig;
 use edgefront_cache::headers::http_date;
 use edgefront_cache::layer::{
-    CACHE_STATUS, CacheLayer, Clock, LayerSettings, Prefixed, SystemClock, is_error_status,
+    CACHE_STATUS, CacheLayer, Clock, LayerSettings, Observer, Outcome, Prefixed, SystemClock,
+    is_error_status,
 };
 use edgefront_cache::purge::PurgeTarget;
 use edgefront_cache::store::{Cache, CacheSettings};
@@ -155,6 +156,7 @@ fn harness_with(cache_toml: &str, body_timeout: Duration) -> Harness {
         LayerSettings {
             name: "edge".into(),
             body_timeout,
+            via: Some(HeaderValue::from_static("1.1 edge")),
         },
         clock.clone(),
     );
@@ -198,12 +200,10 @@ impl Harness {
         }
         let filters = self.layer.route_filters();
         let upstream = self.upstream.clone();
-        filter::run(
-            filters.get(0),
-            0,
-            req.body(()).unwrap(),
-            move |r| async move { upstream.send(r).await },
-        )
+        filter::run(filters.get(0), 0, req.body(()).unwrap(), move |r| {
+            let upstream = upstream.clone();
+            async move { upstream.send(r).await }
+        })
         .await
     }
 
@@ -368,7 +368,7 @@ async fn without_an_entity_tag_last_modified_is_the_validator() {
 }
 
 #[tokio::test]
-async fn a_304_for_another_representation_drops_the_copy() {
+async fn a_304_for_another_representation_is_fetched_again_in_full() {
     let h = harness();
     h.upstream.push(origin(
         200,
@@ -378,17 +378,30 @@ async fn a_304_for_another_representation_drops_the_copy() {
     h.get("/m").await;
     h.clock.advance(5);
     h.upstream.push(origin(304, &[("etag", "\"v2\"")], ""));
-    let resp = h.get("/m").await;
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(status(&resp), "edge; fwd=stale; detail=mismatched-304");
-    h.upstream
-        .push(origin(200, &[("cache-control", "max-age=60")], "two"));
-    let resp = h.get("/m").await;
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=60"), ("etag", "\"v2\"")],
+        "two",
+    ));
+    let resp = h.send("GET", "/m", &[("x-trace", "t")]).await;
     assert_eq!(
         status(&resp),
-        "edge; fwd=miss; fwd-status=200; stored; ttl=60"
+        "edge; fwd=stale; fwd-status=200; stored; ttl=60"
     );
-    assert!(!h.upstream.last_headers().contains_key("if-none-match"));
+    assert_eq!(resp.extensions().get::<Outcome>(), Some(&Outcome::Miss));
+    assert_eq!(body(resp).await, "two");
+    assert_eq!(h.upstream.calls(), 3);
+    // The second request is the first without its validator.
+    let sent = h.upstream.last_headers();
+    assert!(!sent.contains_key("if-none-match"));
+    assert_eq!(sent["x-trace"], "t");
+    // A 304 to that one is not taken as a revalidation again.
+    h.clock.advance(100);
+    h.upstream.push(origin(304, &[("etag", "\"v3\"")], ""));
+    h.upstream.push(origin(304, &[("etag", "\"v3\"")], ""));
+    let resp = h.get("/m").await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(status(&resp), "edge; fwd=stale; fwd-status=304");
 }
 
 #[tokio::test]
@@ -797,7 +810,7 @@ async fn followers_share_a_failure_or_its_stale_copy() {
     let (st, code, b) = follower.await.unwrap();
     assert_eq!(st, "edge; fwd=miss; collapsed; detail=connect");
     assert_eq!(code, StatusCode::BAD_GATEWAY);
-    assert_eq!(b, "upstream failed\n");
+    assert_eq!(b, "origin unreachable\n");
     // With a copy stale-if-error allows, everyone gets the copy.
     h.upstream.push(origin(
         200,
@@ -982,12 +995,15 @@ async fn a_purge_during_the_fetch_wins() {
     let filters = h.layer.route_filters();
     let req = Request::get("/race").header("host", "a").body(()).unwrap();
     let cache = h.layer.cache().clone();
-    let resp = filter::run(filters.get(0), 0, req, |_| async move {
-        cache.purge(&[PurgeTarget::Key("a/race".into())]).await;
-        (
-            origin(200, &[("cache-control", "max-age=60")], "late"),
-            Delivery::Upstream,
-        )
+    let resp = filter::run(filters.get(0), 0, req, move |_| {
+        let cache = cache.clone();
+        async move {
+            cache.purge(&[PurgeTarget::Key("a/race".into())]).await;
+            (
+                origin(200, &[("cache-control", "max-age=60")], "late"),
+                Delivery::Upstream,
+            )
+        }
     })
     .await;
     assert_eq!(status(&resp), "edge; fwd=miss; fwd-status=200; ttl=60");
@@ -1037,4 +1053,149 @@ async fn prefixed_bodies_report_their_size() {
     };
     assert_eq!(chunks.size_hint().lower(), 1);
     assert_eq!(chunks.size_hint().upper(), None);
+}
+
+/// Records what the layer reports.
+#[derive(Default)]
+struct Events(Mutex<Vec<String>>);
+
+impl Observer for Events {
+    fn not_stored(&self, reason: edgefront_cache::policy::NotStorable) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("not_stored {}", reason.as_str()));
+    }
+    fn streamed_uncached(&self) {
+        self.0.lock().unwrap().push("streamed_uncached".into());
+    }
+    fn collapsed(&self) {
+        self.0.lock().unwrap().push("collapsed".into());
+    }
+    fn background_refresh(&self) {
+        self.0.lock().unwrap().push("background_refresh".into());
+    }
+}
+
+#[tokio::test]
+async fn the_observer_hears_what_responses_do_not_show() {
+    let mut h = harness_with(
+        "routes = [{ host = \"a\", path_prefix = \"/\", max_object_bytes = 4 }]\n",
+        Duration::from_secs(5),
+    );
+    let events = Arc::new(Events::default());
+    let cfg: CacheConfig =
+        toml::from_str("routes = [{ host = \"a\", path_prefix = \"/\", max_object_bytes = 4 }]")
+            .unwrap();
+    h.layer = CacheLayer::with_observer(
+        h.layer.cache().clone(),
+        cfg.resolve(&[route("a", "/"), route("b", "/")]).unwrap(),
+        LayerSettings::default(),
+        h.clock.clone(),
+        events.clone(),
+    );
+    let h = Arc::new(h);
+    h.upstream
+        .push(origin(200, &[("cache-control", "private")], "p"));
+    h.get("/p").await;
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=60"), ("content-length", "6")],
+        "123456",
+    ));
+    h.get("/big").await;
+    let gate = h.upstream.gated(Script::Respond(origin(
+        200,
+        &[("cache-control", "max-age=1, stale-while-revalidate=60")],
+        "c",
+    )));
+    let leader = spawn_get(&h, "/c", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/c", &[]);
+    settle().await;
+    gate.notify_one();
+    leader.await.unwrap();
+    let (st, _, _) = follower.await.unwrap();
+    assert!(st.contains("collapsed"), "{st}");
+    h.clock.advance(5);
+    h.upstream
+        .push(origin(200, &[("cache-control", "max-age=60")], "c2"));
+    let resp = h.get("/c").await;
+    assert_eq!(resp.extensions().get::<Outcome>(), Some(&Outcome::Stale));
+    until(|| h.layer.in_flight() == 0 && h.upstream.calls() == 4).await;
+    assert_eq!(
+        *events.0.lock().unwrap(),
+        [
+            "not_stored private",
+            "streamed_uncached",
+            "collapsed",
+            "background_refresh"
+        ]
+    );
+    // The default observer hears nothing and costs nothing.
+    struct Silent;
+    impl Observer for Silent {}
+    let s = Silent;
+    s.not_stored(edgefront_cache::policy::NotStorable::Private);
+    s.streamed_uncached();
+    s.collapsed();
+    s.background_refresh();
+}
+
+#[tokio::test]
+async fn every_answer_carries_its_outcome() {
+    let h = harness();
+    let outcome = |r: &Response<Body>| *r.extensions().get::<Outcome>().unwrap();
+    h.upstream.push(origin(
+        200,
+        &[
+            ("cache-control", "max-age=1, stale-if-error=600"),
+            ("etag", "\"o\""),
+        ],
+        "o",
+    ));
+    assert_eq!(outcome(&h.get("/o").await), Outcome::Miss);
+    assert_eq!(outcome(&h.get("/o").await), Outcome::Hit);
+    h.clock.advance(5);
+    let r = h
+        .send("GET", "/o", &[("cache-control", "max-stale=60")])
+        .await;
+    assert_eq!(outcome(&r), Outcome::Stale);
+    // A HEAD from that copy is a plain hit, as cachet 0.1 reported it.
+    let r = h
+        .send("HEAD", "/o", &[("cache-control", "max-stale=60")])
+        .await;
+    assert_eq!(outcome(&r), Outcome::Hit);
+    assert_eq!(status(&r), "edge; hit; ttl=-4");
+    h.upstream.push(origin(304, &[("etag", "\"o\"")], ""));
+    assert_eq!(outcome(&h.get("/o").await), Outcome::Revalidated);
+    h.clock.advance(5);
+    h.upstream.fail("connect");
+    assert_eq!(outcome(&h.get("/o").await), Outcome::StaleIfError);
+    h.upstream.push(origin(200, &[], ""));
+    let r = h.send("POST", "/o", &[]).await;
+    assert_eq!(outcome(&r), Outcome::Pass);
+    // Responses that pass through get the layer's Via.
+    assert_eq!(r.headers()["via"], "1.1 edge");
+    h.upstream.fail("connect");
+    assert_eq!(outcome(&h.send("POST", "/o", &[]).await), Outcome::Error);
+    let r = h
+        .send("GET", "/none", &[("cache-control", "only-if-cached")])
+        .await;
+    assert_eq!(outcome(&r), Outcome::Error);
+    h.upstream.fail("timeout");
+    assert_eq!(outcome(&h.get("/none").await), Outcome::Error);
+    let names: Vec<_> = Outcome::ALL.iter().map(|o| o.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "hit",
+            "stale",
+            "stale_if_error",
+            "miss",
+            "revalidated",
+            "pass",
+            "error"
+        ]
+    );
 }

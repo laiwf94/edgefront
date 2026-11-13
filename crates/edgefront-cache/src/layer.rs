@@ -11,17 +11,19 @@
 //!   `no-store`, a `HEAD` without a usable copy, and other methods pass
 //!   through.
 //! - **Upstream response phase.** A `304` refreshes the stored copy and
-//!   the client gets that copy. A storable response is read up to the
-//!   route's `max_object_bytes` within `body_timeout`, stored with the
-//!   purge epoch taken in the request phase (a purge that lands in between
-//!   wins) and served from the store, so the client's conditionals and
-//!   ranges apply. A larger body streams through unstored. A successful
-//!   unsafe method invalidates its URL and the same-host
-//!   `Location`/`Content-Location`.
+//!   the client gets that copy; a `304` about another representation than
+//!   the one asked about is answered by fetching again without validators
+//!   ([`Upstream::Resend`]). A storable response is read up to the route's
+//!   `max_object_bytes` within `body_timeout`, stored with the purge epoch
+//!   taken in the request phase (a purge that lands in between wins) and
+//!   served from the store, so the client's conditionals and ranges apply.
+//!   A larger body streams through unstored. A successful unsafe method
+//!   invalidates its URL and the same-host `Location`/`Content-Location`.
 //! - **Deliver phase.** An upstream `500`, `502`, `503` or `504`, or an
 //!   error the proxy or the layer wrote itself, is replaced by the stored
 //!   copy when `stale-if-error` allows it. Every response gets
-//!   `Cache-Status`.
+//!   `Cache-Status`, and an [`Outcome`] in its extensions for the server's
+//!   logs and metrics.
 //!
 //! Concurrent fills of one URL collapse into one upstream request. The
 //! first request leads: it goes upstream and publishes what came back.
@@ -36,7 +38,9 @@
 //! while the layer refreshes it upstream in the background
 //! ([`Decision::Refresh`]), one refresh per URL at a time.
 //!
-//! `Via`, the request ID and the forwarding headers belong to the proxy.
+//! The request ID and the forwarding headers belong to the server. `Via`
+//! does too, except on responses that pass through the cache unstored,
+//! which get [`LayerSettings::via`] when it is set.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,7 +50,7 @@ use std::time::{Duration, SystemTime};
 use bytes::{Bytes, BytesMut};
 use edgefront_core::body::{Body, text};
 use edgefront_core::filter::{
-    BoxFuture, Decision, Delivery, Exchange, Filter, RequestHead, RouteFilters,
+    BoxFuture, Decision, Delivery, Exchange, Filter, RequestHead, RouteFilters, Upstream,
 };
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Response, StatusCode, Uri};
@@ -58,7 +62,7 @@ use crate::collapse::{Collapser, Flight, Lead};
 use crate::config::{RoutePolicies, RoutePolicy};
 use crate::headers::strip_hop_by_hop;
 use crate::object::{CachedObject, Key, SURROGATE_KEY, primary_key};
-use crate::policy::{self, Exchange as Exchanged, Freshness, Use};
+use crate::policy::{self, Exchange as Exchanged, Freshness, NotStorable, Use};
 use crate::purge::PurgeTarget;
 use crate::respond;
 use crate::store::Cache;
@@ -97,6 +101,67 @@ pub fn is_error_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 500 | 502 | 503 | 504)
 }
 
+/// How a request was answered. The layer puts one in the extensions of
+/// every response it makes or passes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Fresh from the cache.
+    Hit,
+    /// Stale from the cache while a refresh runs, or accepted by max-stale.
+    Stale,
+    /// Stale from the cache because the upstream failed.
+    StaleIfError,
+    /// Fetched from upstream and possibly stored.
+    Miss,
+    /// Revalidated with a 304.
+    Revalidated,
+    /// Not cacheable: passed through to upstream.
+    Pass,
+    /// Answered with an error the cache or the server wrote.
+    Error,
+}
+
+impl Outcome {
+    pub const ALL: [Outcome; 7] = [
+        Outcome::Hit,
+        Outcome::Stale,
+        Outcome::StaleIfError,
+        Outcome::Miss,
+        Outcome::Revalidated,
+        Outcome::Pass,
+        Outcome::Error,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Hit => "hit",
+            Outcome::Stale => "stale",
+            Outcome::StaleIfError => "stale_if_error",
+            Outcome::Miss => "miss",
+            Outcome::Revalidated => "revalidated",
+            Outcome::Pass => "pass",
+            Outcome::Error => "error",
+        }
+    }
+}
+
+/// Events the layer reports beyond each response's [`Outcome`], for a
+/// server's metrics. Every method does nothing by default.
+pub trait Observer: Send + Sync {
+    /// An upstream response that may not be stored, and why.
+    fn not_stored(&self, _reason: NotStorable) {}
+    /// A storable response too large to store, sent on as it streamed.
+    fn streamed_uncached(&self) {}
+    /// A request that waited for another one's fill.
+    fn collapsed(&self) {}
+    /// A stale copy refreshed in the background.
+    fn background_refresh(&self) {}
+}
+
+struct Quiet;
+
+impl Observer for Quiet {}
+
 /// Settings of a [`CacheLayer`] that are not per route.
 #[derive(Debug, Clone)]
 pub struct LayerSettings {
@@ -105,6 +170,10 @@ pub struct LayerSettings {
     pub name: String,
     /// The longest an upstream body being stored may take to arrive.
     pub body_timeout: Duration,
+    /// A `Via` value appended to the responses that pass through the cache
+    /// without being stored, as a caching intermediary must (RFC 9110
+    /// section 7.6.3). `None` leaves `Via` to the server.
+    pub via: Option<HeaderValue>,
 }
 
 impl Default for LayerSettings {
@@ -112,7 +181,20 @@ impl Default for LayerSettings {
         LayerSettings {
             name: "edgefront".into(),
             body_timeout: Duration::from_secs(30),
+            via: None,
         }
+    }
+}
+
+/// The message of an error a follower shares, for the reason the server
+/// gave the leader's.
+fn failure_message(reason: &str) -> &'static str {
+    match reason {
+        "connect" => "origin unreachable\n",
+        "timeout" => "origin timed out\n",
+        "protocol" => "origin response invalid\n",
+        "body-too-large" => "request body too large\n",
+        _ => "upstream failed\n",
     }
 }
 
@@ -127,7 +209,9 @@ struct Shared {
     clock: Arc<dyn Clock>,
     name: String,
     body_timeout: Duration,
+    via: Option<HeaderValue>,
     collapser: Arc<Collapser<Fetched>>,
+    observer: Arc<dyn Observer>,
 }
 
 /// What a leading fill got from upstream, as its followers see it.
@@ -157,6 +241,17 @@ impl CacheLayer {
         settings: LayerSettings,
         clock: Arc<dyn Clock>,
     ) -> Arc<Self> {
+        CacheLayer::with_observer(cache, policies, settings, clock, Arc::new(Quiet))
+    }
+
+    /// [`CacheLayer::new`] reporting to `observer`.
+    pub fn with_observer(
+        cache: Arc<Cache>,
+        policies: RoutePolicies,
+        settings: LayerSettings,
+        clock: Arc<dyn Clock>,
+        observer: Arc<dyn Observer>,
+    ) -> Arc<Self> {
         let name = if !settings.name.is_empty() && settings.name.bytes().all(is_tchar) {
             settings.name
         } else {
@@ -169,7 +264,9 @@ impl CacheLayer {
                 clock,
                 name,
                 body_timeout: settings.body_timeout,
+                via: settings.via,
                 collapser: Arc::default(),
+                observer,
             }),
         })
     }
@@ -209,18 +306,27 @@ impl Filter for CacheLayer {
 }
 
 impl Shared {
-    fn status(&self, detail: &str) -> HeaderValue {
-        HeaderValue::from_str(&format!("{}; {detail}", self.name))
-            .unwrap_or_else(|_| HeaderValue::from_static("edgefront"))
+    /// Sets the response's `Cache-Status` and [`Outcome`].
+    fn mark(&self, resp: &mut Response<Body>, detail: &str, outcome: Outcome) {
+        let value = HeaderValue::from_str(&format!("{}; {detail}", self.name))
+            .unwrap_or_else(|_| HeaderValue::from_static("edgefront"));
+        resp.headers_mut().insert(CACHE_STATUS, value);
+        resp.extensions_mut().insert(outcome);
     }
 
-    fn hit(&self, obj: &CachedObject, method: &Method, req: &HeaderMap, detail: &str) -> Decision {
+    fn hit(
+        &self,
+        obj: &CachedObject,
+        method: &Method,
+        req: &HeaderMap,
+        detail: &str,
+        outcome: Outcome,
+    ) -> Response<Body> {
         let now = self.clock.now();
         let mut resp = respond::from_cache(obj, method, req, now);
         let status = format!("hit; ttl={}{detail}", obj.freshness.ttl_secs(now));
-        resp.headers_mut()
-            .insert(CACHE_STATUS, self.status(&status));
-        Decision::Respond(resp)
+        self.mark(&mut resp, &status, outcome);
+        resp
     }
 
     async fn request(self: &Arc<Self>, req: RequestHead<'_>) -> Decision {
@@ -244,15 +350,28 @@ impl Shared {
             .as_ref()
             .map(|obj| (obj, policy::decide(&obj.freshness, &obj.cc, &req_cc, now)));
         match usable {
-            Some((obj, Use::Fresh)) => return self.hit(obj, method, req.headers, ""),
+            Some((obj, Use::Fresh)) => {
+                return Decision::Respond(self.hit(obj, method, req.headers, "", Outcome::Hit));
+            }
+            // A HEAD answered from a copy max-stale accepts is reported as
+            // a plain hit, as cachet 0.1 did.
+            Some((obj, Use::StaleAccepted)) if *method == Method::HEAD => {
+                return Decision::Respond(self.hit(obj, method, req.headers, "", Outcome::Hit));
+            }
             Some((obj, Use::StaleAccepted)) => {
-                return self.hit(obj, method, req.headers, "; detail=max-stale");
+                let resp = self.hit(
+                    obj,
+                    method,
+                    req.headers,
+                    "; detail=max-stale",
+                    Outcome::Stale,
+                );
+                return Decision::Respond(resp);
             }
             _ if *method == Method::HEAD => return self.pass(key, &req, "fwd=miss"),
             _ if req_cc.only_if_cached => {
                 let mut resp = text(StatusCode::GATEWAY_TIMEOUT, "not in cache\n");
-                resp.headers_mut()
-                    .insert(CACHE_STATUS, self.status("fwd=miss; detail=only-if-cached"));
+                self.mark(&mut resp, "fwd=miss; detail=only-if-cached", Outcome::Error);
                 return Decision::Respond(resp);
             }
             _ => {}
@@ -271,33 +390,39 @@ impl Shared {
                 req.headers.insert(name, value);
             }
         }
+        let forwarded = req.headers.clone();
         let fill = |lead| {
             Box::new(Fill {
                 shared: self.clone(),
                 policy: policy.clone(),
                 key: key.clone(),
                 client_headers: client_headers.clone(),
+                forwarded: forwarded.clone(),
                 req_cc: req_cc.clone(),
                 stored: stored.clone(),
+                resent: false,
                 epoch: self.cache.epoch(),
                 request_time: now,
                 fwd,
                 status: String::new(),
+                outcome: Outcome::Miss,
                 failure: None,
                 lead,
             })
         };
         if let Some((obj, Use::StaleWhileRevalidate)) = usable {
-            let Decision::Respond(resp) = self.hit(
+            let resp = self.hit(
                 obj,
                 method,
                 &client_headers,
                 "; detail=stale-while-revalidate",
-            ) else {
-                unreachable!("hit always responds");
-            };
+                Outcome::Stale,
+            );
             return match self.collapser.lead_or_follow(key.clone()) {
-                Flight::Lead(lead) => Decision::Refresh(resp, fill(Some(lead))),
+                Flight::Lead(lead) => {
+                    self.observer.background_refresh();
+                    Decision::Refresh(resp, fill(Some(lead)))
+                }
                 // A refresh or fill is already on its way.
                 Flight::Follow(_) => Decision::Respond(resp),
             };
@@ -312,6 +437,7 @@ impl Shared {
             let Ok(fetched) = follow.wait().await else {
                 continue;
             };
+            self.observer.collapsed();
             let follower = Follower {
                 shared: self,
                 client_headers: &client_headers,
@@ -346,8 +472,7 @@ impl Shared {
             "hit; ttl={}; fwd=stale; {failure}; detail=stale-if-error",
             obj.freshness.ttl_secs(now)
         );
-        resp.headers_mut()
-            .insert(CACHE_STATUS, self.status(&status));
+        self.mark(&mut resp, &status, Outcome::StaleIfError);
         Some(resp)
     }
 
@@ -376,6 +501,15 @@ impl Shared {
             fill.epoch,
             fill.policy.max_variants,
         )
+    }
+
+    /// Removes framing and stored-only fields from a response that passes
+    /// through unstored, and adds `Via`.
+    fn pass_on(&self, headers: &mut HeaderMap) {
+        headers.remove(SURROGATE_KEY);
+        if let Some(via) = &self.via {
+            headers.append(header::VIA, via.clone());
+        }
     }
 }
 
@@ -410,7 +544,7 @@ impl Follower<'_> {
             return Some(stale);
         }
         let fwd = self.fwd;
-        let (mut resp, status) = match fetched {
+        let (mut resp, status, outcome) = match fetched {
             Fetched::Object {
                 obj,
                 stored,
@@ -418,16 +552,16 @@ impl Follower<'_> {
             } if obj.matches(self.client_headers) => {
                 let now = self.shared.clock.now();
                 let resp = respond::from_cache(&obj, &Method::GET, self.client_headers, now);
-                let fwd_status = if revalidated {
-                    304
+                let (fwd_status, outcome) = if revalidated {
+                    (304, Outcome::Revalidated)
                 } else {
-                    obj.status.as_u16()
+                    (obj.status.as_u16(), Outcome::Miss)
                 };
                 let stored = if stored { "; stored" } else { "" };
                 let ttl = obj.freshness.ttl_secs(now);
                 let status =
                     format!("{fwd}; fwd-status={fwd_status}{stored}; collapsed; ttl={ttl}");
-                (resp, status)
+                (resp, status, outcome)
             }
             Fetched::Failed {
                 status,
@@ -436,11 +570,11 @@ impl Follower<'_> {
             } => (
                 text(status, message),
                 format!("{fwd}; collapsed; detail={detail}"),
+                Outcome::Error,
             ),
             Fetched::Object { .. } | Fetched::Single(_) => return None,
         };
-        resp.headers_mut()
-            .insert(CACHE_STATUS, self.shared.status(&status));
+        self.shared.mark(&mut resp, &status, outcome);
         Some(resp)
     }
 }
@@ -461,10 +595,10 @@ struct Pass {
 }
 
 impl Exchange for Pass {
-    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Response<Body>> {
+    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Upstream> {
         Box::pin(async move {
             let (mut parts, body) = resp.into_parts();
-            parts.headers.remove(SURROGATE_KEY);
+            self.shared.pass_on(&mut parts.headers);
             let ok = parts.status.is_success() || parts.status.is_redirection();
             if let Some(inv) = self.invalidate.take().filter(|_| ok) {
                 let mut targets = vec![PurgeTarget::Key(inv.key.clone())];
@@ -478,17 +612,18 @@ impl Exchange for Pass {
                 self.shared.cache.purge(&targets).await;
             }
             self.status = format!("{}; fwd-status={}", self.fwd, parts.status.as_u16());
-            Response::from_parts(parts, body)
+            Upstream::Respond(Response::from_parts(parts, body))
         })
     }
 
     fn deliver(self: Box<Self>, mut resp: Response<Body>, from: Delivery) -> Response<Body> {
-        let status = match from {
-            Delivery::Upstream => self.status,
-            Delivery::Generated(reason) => format!("{}; detail={reason}", self.fwd),
+        let (status, outcome) = match from {
+            Delivery::Upstream => (self.status, Outcome::Pass),
+            Delivery::Generated(reason) => {
+                (format!("{}; detail={reason}", self.fwd), Outcome::Error)
+            }
         };
-        resp.headers_mut()
-            .insert(CACHE_STATUS, self.shared.status(&status));
+        self.shared.mark(&mut resp, &status, outcome);
         resp
     }
 }
@@ -500,15 +635,21 @@ struct Fill {
     key: Key,
     /// The client's request headers, for Vary, storability and serving.
     client_headers: HeaderMap,
+    /// The headers the request phase sent upstream, for a resend.
+    forwarded: HeaderMap,
     req_cc: CacheControl,
     /// The stored copy being revalidated, if any.
     stored: Option<Arc<CachedObject>>,
+    /// Sent again without validators after a `304` for another
+    /// representation.
+    resent: bool,
     /// The purge epoch before the request went upstream.
     epoch: u64,
     request_time: SystemTime,
     fwd: &'static str,
     /// `Cache-Status` for an upstream response.
     status: String,
+    outcome: Outcome,
     /// Why the upstream response counts as an error, if it does.
     failure: Option<String>,
     /// The flight this fill leads, if followers wait on it.
@@ -548,50 +689,65 @@ impl Fill {
     }
 
     /// A response that goes to the client as the upstream sent it.
-    fn through(&mut self, mut parts: http::response::Parts, body: Body) -> Response<Body> {
+    fn through(&mut self, mut parts: http::response::Parts, body: Body) -> Upstream {
         self.publish(Fetched::Single(parts.status));
-        parts.headers.remove(SURROGATE_KEY);
+        self.shared.pass_on(&mut parts.headers);
         self.status = format!("{}; fwd-status={}", self.fwd, parts.status.as_u16());
-        Response::from_parts(parts, body)
+        self.outcome = Outcome::Miss;
+        Upstream::Respond(Response::from_parts(parts, body))
     }
 
     /// An upstream response the layer could not use, answered with an
     /// error of its own.
-    fn failed(
-        &mut self,
-        status: StatusCode,
-        message: &'static str,
-        detail: &str,
-    ) -> Response<Body> {
+    fn failed(&mut self, status: StatusCode, message: &'static str, detail: &str) -> Upstream {
         self.failure = Some(format!("detail-origin={detail}"));
         self.status = format!("{}; detail={detail}", self.fwd);
+        self.outcome = Outcome::Error;
         self.publish(Fetched::Failed {
             status,
             message,
             detail: detail.to_owned(),
         });
-        text(status, message)
+        Upstream::Respond(text(status, message))
     }
 
-    async fn not_modified(
-        &mut self,
-        stored: Arc<CachedObject>,
-        parts: &http::response::Parts,
-    ) -> Response<Body> {
+    /// A stored object the client gets from the store.
+    fn stored_object(&mut self, obj: Arc<CachedObject>, revalidated: bool) -> Upstream {
+        let kept = self.shared.store(&self.key, &obj, self);
+        let fwd_status = if revalidated {
+            304
+        } else {
+            obj.status.as_u16()
+        };
+        self.status = format!(
+            "{}; fwd-status={fwd_status}{}; ttl={}",
+            self.fwd,
+            if kept { "; stored" } else { "" },
+            obj.freshness.ttl_secs(self.shared.clock.now())
+        );
+        self.outcome = if revalidated {
+            Outcome::Revalidated
+        } else {
+            Outcome::Miss
+        };
+        let resp = self.serve(&obj);
+        self.publish(Fetched::Object {
+            obj,
+            stored: kept,
+            revalidated,
+        });
+        Upstream::Respond(resp)
+    }
+
+    fn not_modified(&mut self, stored: &CachedObject, parts: &http::response::Parts) -> Upstream {
         if !policy::not_modified_matches(&stored.headers, &parts.headers) {
             // The 304 is about another representation than the one asked
-            // about. It cannot refresh the copy, and the client sent no
-            // conditional it could answer; drop the copy so the next
-            // request fetches in full.
-            self.shared
-                .cache
-                .purge(&[PurgeTarget::Key(self.key.clone())])
-                .await;
-            return self.failed(
-                StatusCode::BAD_GATEWAY,
-                "origin response invalid\n",
-                "mismatched-304",
-            );
+            // about, so it cannot refresh the copy: fetch in full.
+            self.resent = true;
+            let mut headers = self.forwarded.clone();
+            headers.remove(header::IF_NONE_MATCH);
+            headers.remove(header::IF_MODIFIED_SINCE);
+            return Upstream::Resend(headers);
         }
         let headers = policy::merge_not_modified(&stored.headers, &parts.headers);
         let cc = CacheControl::from_headers(&headers);
@@ -603,29 +759,17 @@ impl Fill {
             freshness,
             stored.vary().clone(),
         ));
-        let kept = self.shared.store(&self.key, &obj, self);
-        self.status = format!(
-            "{}; fwd-status=304{}; ttl={}",
-            self.fwd,
-            if kept { "; stored" } else { "" },
-            obj.freshness.ttl_secs(self.shared.clock.now())
-        );
-        let resp = self.serve(&obj);
-        self.publish(Fetched::Object {
-            obj,
-            stored: kept,
-            revalidated: true,
-        });
-        resp
+        self.stored_object(obj, true)
     }
 
-    async fn fill(&mut self, resp: Response<Body>) -> Response<Body> {
+    async fn fill(&mut self, resp: Response<Body>) -> Upstream {
         let (mut parts, body) = resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
         if parts.status == StatusCode::NOT_MODIFIED
+            && !self.resent
             && let Some(stored) = self.stored.clone()
         {
-            return self.not_modified(stored, &parts).await;
+            return self.not_modified(&stored, &parts);
         }
         if is_error_status(parts.status) {
             self.failure = Some(format!("fwd-status={}", parts.status.as_u16()));
@@ -640,11 +784,12 @@ impl Fill {
             resp_cc: &resp_cc,
             response_time: self.shared.clock.now(),
         };
-        if policy::storable(&exchange, self.policy.heuristic_max).is_err() {
+        if let Err(reason) = policy::storable(&exchange, self.policy.heuristic_max) {
+            self.shared.observer.not_stored(reason);
             // The origin answered in full but no longer lets this be
             // stored. Drop the old copy too, or stale-if-error could keep
             // serving what the origin has since made private.
-            if self.stored.is_some() && !is_error_status(parts.status) {
+            if self.stored.is_some() && !self.resent && !is_error_status(parts.status) {
                 self.shared
                     .cache
                     .purge(&[PurgeTarget::Key(self.key.clone())])
@@ -660,12 +805,14 @@ impl Fill {
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
         if declared.is_some_and(|n| n > limit as u64) {
+            self.shared.observer.streamed_uncached();
             return self.through(parts, body);
         }
         let read = tokio::time::timeout(self.shared.body_timeout, read_limited(body, limit)).await;
         let bytes = match read {
             Ok(Ok(Read::Complete(bytes))) => bytes,
             Ok(Ok(Read::TooLarge(prefix, rest))) => {
+                self.shared.observer.streamed_uncached();
                 let body = Prefixed {
                     prefix: Some(prefix),
                     rest,
@@ -694,39 +841,25 @@ impl Fill {
             freshness,
             &self.client_headers,
         ));
-        let kept = self.shared.store(&self.key, &obj, self);
-        self.status = format!(
-            "{}; fwd-status={}{}; ttl={}",
-            self.fwd,
-            obj.status.as_u16(),
-            if kept { "; stored" } else { "" },
-            obj.freshness.ttl_secs(self.shared.clock.now())
-        );
-        let resp = self.serve(&obj);
-        self.publish(Fetched::Object {
-            obj,
-            stored: kept,
-            revalidated: false,
-        });
-        resp
+        self.stored_object(obj, false)
     }
 }
 
 impl Exchange for Fill {
-    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Response<Body>> {
+    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Upstream> {
         Box::pin(self.fill(resp))
     }
 
     fn deliver(mut self: Box<Self>, mut resp: Response<Body>, from: Delivery) -> Response<Body> {
         let failure = match from {
             Delivery::Upstream => self.failure.clone(),
-            // A response the proxy wrote counts as a failure only when it
+            // A response the server wrote counts as a failure only when it
             // is one of the upstream errors stale-if-error covers, not, say,
             // a request it refused.
             Delivery::Generated(reason) if is_error_status(resp.status()) => {
                 self.publish(Fetched::Failed {
                     status: resp.status(),
-                    message: "upstream failed\n",
+                    message: failure_message(reason),
                     detail: reason.to_owned(),
                 });
                 Some(format!("detail-origin={reason}"))
@@ -748,12 +881,13 @@ impl Exchange for Fill {
         {
             return stale;
         }
-        let status = match from {
-            Delivery::Upstream => self.status,
-            Delivery::Generated(reason) => format!("{}; detail={reason}", self.fwd),
+        let (status, outcome) = match from {
+            Delivery::Upstream => (std::mem::take(&mut self.status), self.outcome),
+            Delivery::Generated(reason) => {
+                (format!("{}; detail={reason}", self.fwd), Outcome::Error)
+            }
         };
-        resp.headers_mut()
-            .insert(CACHE_STATUS, self.shared.status(&status));
+        self.shared.mark(&mut resp, &status, outcome);
         resp
     }
 }
@@ -847,5 +981,22 @@ where
         }
         hint.set_lower(rest.lower().saturating_add(n));
         hint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_failures_keep_the_message_for_their_reason() {
+        assert_eq!(failure_message("connect"), "origin unreachable\n");
+        assert_eq!(failure_message("timeout"), "origin timed out\n");
+        assert_eq!(failure_message("protocol"), "origin response invalid\n");
+        assert_eq!(
+            failure_message("body-too-large"),
+            "request body too large\n"
+        );
+        assert_eq!(failure_message("bad_gateway"), "upstream failed\n");
     }
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use edgefront_core::body::{Body, full, text};
 use edgefront_core::config::Config;
 use edgefront_core::filter::{
-    BoxFuture, Decision, Delivery, Exchange, Filter, RequestHead, RouteFilters,
+    BoxFuture, Decision, Delivery, Exchange, Filter, RequestHead, RouteFilters, Upstream,
 };
 use edgefront_core::listener::{ServerLimits, serve};
 use edgefront_proxy::server::Proxy;
@@ -54,7 +54,7 @@ impl Filter for Probe {
 }
 
 impl Exchange for Recorder {
-    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Response<Body>> {
+    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Upstream> {
         Box::pin(async move {
             let (parts, body) = resp.into_parts();
             // The proxy adds the request ID after this phase, so a filter
@@ -64,11 +64,17 @@ impl Exchange for Recorder {
                 parts.status.as_u16(),
                 parts.headers.contains_key("x-request-id")
             ));
+            if parts.headers.contains_key("x-resend") {
+                let mut h = http::HeaderMap::new();
+                h.insert("x-resent", HeaderValue::from_static("1"));
+                h.insert("host", HeaderValue::from_static("a"));
+                return Upstream::Resend(h);
+            }
             let mut bytes = body.collect().await.unwrap().to_bytes().to_vec();
             bytes.push(b'!');
             let mut parts = parts;
             parts.headers.remove("content-length");
-            Response::from_parts(parts, full(bytes))
+            Upstream::Respond(Response::from_parts(parts, full(bytes)))
         })
     }
 
@@ -368,4 +374,126 @@ async fn a_refresh_is_held_to_the_cluster_timeout() {
         log_of(&proxy),
         ["request 0 /refresh", "deliver generated:upstream_timeout"]
     );
+}
+
+/// An upstream that asks for a resend (`X-Resend`) unless the request is
+/// one (`x-resent`), or always when `always` is set.
+async fn resending(always: bool) -> (String, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (r, mut w) = conn.into_split();
+                let mut r = BufReader::new(r);
+                loop {
+                    let mut head = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if let Some(v) = line.strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap();
+                        }
+                        head.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    if r.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let resend = always || !head.contains("x-resent: 1\r\n");
+                    let _ = tx.send(head);
+                    let reply: &[u8] = if resend {
+                        b"HTTP/1.1 304 Not Modified\r\nX-Resend: 1\r\n\r\n"
+                    } else {
+                        OK
+                    };
+                    if w.write_all(reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, rx)
+}
+
+#[tokio::test]
+async fn a_resend_goes_upstream_once_more_without_a_body() {
+    let (up, mut seen) = resending(false).await;
+    let proxy = start(&[&up], "").await;
+    let mut conn = TcpStream::connect(proxy.addr).await.unwrap();
+    conn.write_all(
+        b"POST /r HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn.read_to_end(&mut out)).await;
+    let resp = String::from_utf8_lossy(&out).into_owned();
+    assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+    assert!(resp.ends_with("ok!"), "{resp}");
+    let first = seen.recv().await.unwrap();
+    assert!(first.contains("content-length: 4\r\n"), "{first}");
+    let second = seen.recv().await.unwrap();
+    assert!(second.starts_with("POST /r HTTP/1.1\r\n"), "{second}");
+    assert!(second.contains("x-resent: 1\r\n"), "{second}");
+    assert!(second.contains("x-request-id: "), "{second}");
+    assert!(
+        second.contains("x-forwarded-for: 127.0.0.1\r\n"),
+        "{second}"
+    );
+    assert!(
+        !second.contains("x-filtered"),
+        "the resend's headers replace the first's"
+    );
+    assert!(second.contains("content-length: 0\r\n"), "{second}");
+}
+
+#[tokio::test]
+async fn a_second_resend_is_refused() {
+    let (up, mut seen) = resending(true).await;
+    let proxy = start(&[&up], "").await;
+    let resp = get(proxy.addr, "/r").await;
+    assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{resp}");
+    assert!(
+        resp.contains("x-phase: generated:resend_limit\r\n"),
+        "{resp}"
+    );
+    seen.recv().await.unwrap();
+    seen.recv().await.unwrap();
+    assert!(seen.try_recv().is_err(), "two requests, not three");
+    // In a background refresh too.
+    let resp = get(proxy.addr, "/refresh").await;
+    assert!(resp.ends_with("stale\n"), "{resp}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !log_of(&proxy).contains(&"deliver generated:resend_limit".to_owned())
+            || log_of(&proxy)
+                .iter()
+                .filter(|l| l.contains("resend_limit"))
+                .count()
+                < 2
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_resend_does_not_hold_two_places() {
+    // One place in the cluster: the first try gives it back before the
+    // resend takes it.
+    let (up, _seen) = resending(false).await;
+    let proxy = start(&[&up], r#","max_requests":1"#).await;
+    let resp = get(proxy.addr, "/r").await;
+    assert!(resp.ends_with("ok!"), "{resp}");
 }

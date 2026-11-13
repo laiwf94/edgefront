@@ -70,7 +70,7 @@ use bytes::{Bytes, BytesMut};
 use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
-use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters};
+use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
 use edgefront_core::http1::{Client, ClientError, ClientLimits};
 use edgefront_core::listener::Handler;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -120,7 +120,7 @@ pub struct Proxy {
     /// Each route's index and its cluster's.
     router: Router<(usize, usize)>,
     clusters: Vec<Arc<Cluster>>,
-    trusted: Vec<IpPrefix>,
+    trusted: Arc<[IpPrefix]>,
     /// The layers on each route, such as the cache.
     filters: RouteFilters,
 }
@@ -245,7 +245,7 @@ impl Proxy {
         Proxy {
             router,
             clusters,
-            trusted: cfg.trusted_proxies.clone(),
+            trusted: cfg.trusted_proxies.clone().into(),
             filters: RouteFilters::new(cfg.routes.len()),
         }
     }
@@ -331,6 +331,13 @@ impl Proxy {
         };
         let cluster = &self.clusters[ci];
         let access = access.cluster(&cluster.name);
+        let fwd = Forwarding {
+            trusted: Arc::clone(&self.trusted),
+            peer: access.peer,
+            host: host.clone(),
+            id: id.clone(),
+            absolute: parts.uri.authority().is_some(),
+        };
         // The request phase runs before the cluster's `max_requests`, so
         // an answer from a filter, such as a cache hit, takes no place.
         let mut exchange = None;
@@ -351,14 +358,14 @@ impl Proxy {
                 Decision::Respond(resp) => Some(resp),
                 Decision::Refresh(resp, x) => {
                     let mut headers = parts.headers.clone();
-                    self.upstream_headers(&mut headers, &parts.uri, access.peer, &host, &id);
+                    fwd.apply(&mut headers);
                     let refresh = Refresh {
                         cluster: Arc::clone(cluster),
                         method: parts.method.clone(),
                         key: cluster.key(&parts.headers),
                         headers,
                         target: target.upstream_target().into_owned(),
-                        id: id.clone(),
+                        fwd: fwd.clone(),
                         exchange: x,
                     };
                     tokio::spawn(refresh.run());
@@ -389,7 +396,7 @@ impl Proxy {
         let key = cluster.key(&parts.headers);
         let mut headers = parts.headers;
         let length = request_length(&headers, &incoming);
-        self.upstream_headers(&mut headers, &parts.uri, access.peer, &host, &id);
+        fwd.apply(&mut headers);
 
         let deadline = cluster.timeout.map(|t| started + t);
         let mut picked = None;
@@ -426,8 +433,16 @@ impl Proxy {
             Ok((resp, in_flight)) => {
                 let mut resp = proxied(resp, deadline, permit, in_flight);
                 if let Some(mut x) = exchange {
-                    resp = x.upstream_response(resp).await;
-                    resp = x.deliver(resp, Delivery::Upstream);
+                    let next = x.upstream_response(resp).await;
+                    let again = Again {
+                        cluster,
+                        method: &parts.method,
+                        target: &upstream_target,
+                        key,
+                        fwd: &fwd,
+                        deadline,
+                    };
+                    resp = again.finish(x, next).await;
                 }
                 resp.headers_mut().insert(reqid::HEADER, id);
                 log(&access, started, &resp, "");
@@ -441,27 +456,111 @@ impl Proxy {
         log(&access, started, &resp, logged);
         resp
     }
+}
 
-    /// Turns the client's request headers into the upstream's: hop-by-hop
-    /// headers go, the forwarding headers are rewritten, and the request ID
-    /// and, for an absolute-form target, the `Host` are set.
-    fn upstream_headers(
-        &self,
-        headers: &mut HeaderMap,
-        uri: &Uri,
-        peer: Option<std::net::IpAddr>,
-        host: &str,
-        id: &HeaderValue,
-    ) {
+/// How a request's headers are turned into the upstream's, kept so a
+/// resend or a background refresh gets the same treatment.
+#[derive(Clone)]
+struct Forwarding {
+    trusted: Arc<[IpPrefix]>,
+    peer: Option<std::net::IpAddr>,
+    host: String,
+    id: HeaderValue,
+    /// The client sent an absolute-form target.
+    absolute: bool,
+}
+
+impl Forwarding {
+    /// Hop-by-hop headers go, the forwarding headers are rewritten, and the
+    /// request ID and, for an absolute-form target, the `Host` are set.
+    fn apply(&self, headers: &mut HeaderMap) {
         strip_hop_by_hop(headers, true);
-        forwarded::set_forwarded(headers, peer, false, host.as_bytes(), &self.trusted);
-        headers.insert(reqid::HEADER, id.clone());
-        if uri.authority().is_some() {
+        forwarded::set_forwarded(
+            headers,
+            self.peer,
+            false,
+            self.host.as_bytes(),
+            &self.trusted,
+        );
+        headers.insert(reqid::HEADER, self.id.clone());
+        if self.absolute {
             // Go sends `Request.Host`, which an absolute-form target sets.
             headers.insert(
                 header::HOST,
-                HeaderValue::from_str(host).expect("an authority"),
+                HeaderValue::from_str(&self.host).expect("an authority"),
             );
+        }
+    }
+}
+
+/// What a filter's resend needs: the request's cluster, method, target,
+/// hash key and forwarding, and the deadline its first try was held to.
+struct Again<'a> {
+    cluster: &'a Cluster,
+    method: &'a Method,
+    target: &'a [u8],
+    key: Option<u64>,
+    fwd: &'a Forwarding,
+    deadline: Option<Instant>,
+}
+
+impl Again<'_> {
+    /// Delivers what the upstream response phase decided, after sending
+    /// the request once more, without a body, if it asked to. The resend
+    /// takes a place under `max_requests` and keeps the first try's
+    /// deadline.
+    async fn finish(&self, mut x: Box<dyn Exchange>, next: Upstream) -> Response<Body> {
+        let mut headers = match next {
+            Upstream::Respond(resp) => return x.deliver(resp, Delivery::Upstream),
+            Upstream::Resend(headers) => headers,
+        };
+        self.fwd.apply(&mut headers);
+        let id = &self.fwd.id;
+        let Some(permit) = self.cluster.acquire() else {
+            let resp = error(
+                id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                "too many concurrent requests to this service",
+            );
+            return x.deliver(resp, Delivery::Generated("overloaded"));
+        };
+        let mut picked = None;
+        let send = self.cluster.forward(
+            self.method,
+            headers,
+            self.target,
+            body::empty(),
+            Some(0),
+            self.key,
+            &mut picked,
+        );
+        let result = match self.deadline {
+            Some(at) => tokio::time::timeout_at(at, send)
+                .await
+                .unwrap_or(Err(Failure::Timeout)),
+            None => send.await,
+        };
+        match result {
+            Ok((resp, in_flight)) => {
+                let resp = proxied(resp, self.deadline, permit, in_flight);
+                match x.upstream_response(resp).await {
+                    Upstream::Respond(resp) => x.deliver(resp, Delivery::Upstream),
+                    Upstream::Resend(_) => {
+                        let resp = error(
+                            id,
+                            StatusCode::BAD_GATEWAY,
+                            "bad_gateway",
+                            "the upstream failed to answer",
+                        );
+                        x.deliver(resp, Delivery::Generated("resend_limit"))
+                    }
+                }
+            }
+            Err(f) => {
+                let (status, code, message, _) = f.describe();
+                x.deliver(error(id, status, code, message), Delivery::Generated(code))
+            }
         }
     }
 }
@@ -564,7 +663,7 @@ struct Refresh {
     key: Option<u64>,
     headers: HeaderMap,
     target: Vec<u8>,
-    id: HeaderValue,
+    fwd: Forwarding,
     exchange: Box<dyn Exchange>,
 }
 
@@ -576,12 +675,13 @@ impl Refresh {
             key,
             headers,
             target,
-            id,
+            fwd,
             mut exchange,
         } = self;
+        let id = &fwd.id;
         let Some(permit) = cluster.acquire() else {
             let resp = error(
-                &id,
+                id,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "overloaded",
                 "too many concurrent requests to this service",
@@ -609,12 +709,20 @@ impl Refresh {
         match result {
             Ok((resp, in_flight)) => {
                 let resp = proxied(resp, deadline, permit, in_flight);
-                let resp = exchange.upstream_response(resp).await;
-                drop(exchange.deliver(resp, Delivery::Upstream));
+                let next = exchange.upstream_response(resp).await;
+                let again = Again {
+                    cluster: &cluster,
+                    method: &method,
+                    target: &target,
+                    key,
+                    fwd: &fwd,
+                    deadline,
+                };
+                drop(again.finish(exchange, next).await);
             }
             Err(f) => {
                 let (status, code, message, _) = f.describe();
-                let resp = error(&id, status, code, message);
+                let resp = error(id, status, code, message);
                 drop(exchange.deliver(resp, Delivery::Generated(code)));
             }
         }

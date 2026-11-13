@@ -212,7 +212,7 @@ The cache is becoming a layer that each proxy route turns on, so its settings ar
 
 - **Request phase.** Lookup, then the four freshness outcomes. A fill strips the client's conditionals and `Range` and adds the stored copy's validator. `only-if-cached` gets `504`. `no-store`, `HEAD` misses and other methods pass through.
 - **Upstream response phase.**
-  - A matching `304` refreshes the copy. A mismatched one drops the copy and gets `502`, because the layer cannot send the request again.
+  - A matching `304` refreshes the copy. For a `304` about another representation, the layer returns `Upstream::Resend` with its validators removed. The server sends the request once more, without a body, and gives the new response back to the same exchange. A second `Resend` is answered with a `502` the server writes (`resend_limit`).
   - A storable body is read within the route's `max_object_bytes` and `body_timeout`, then stored under the purge epoch taken in the request phase.
   - A larger body streams through unstored.
   - A successful unsafe method invalidates its URL and its same-host `Location` and `Content-Location`.
@@ -268,7 +268,20 @@ Requests go one at a time, and a store completes before its response is sent, so
 
 ## Following one request
 
-A request is handled in `proxy.rs`. GET and HEAD go through the cache; every other method passes through to the origin. A request with `Cache-Control: no-store` also passes through.
+A request is handled in `proxy.rs`, which since W02 is a front over `CacheLayer`. The node answers some requests itself before the cache sees them:
+
+- a request that already passed through this node (`508`);
+- a target over `max_uri_bytes` (`414`);
+- a request without a host (`400`);
+- a body over `max_request_body` on a request that passes through (`413`).
+
+Everything else goes through the layer's phases (`filter::run`) on a single route whose policy is the `[cache]` settings. The upstream is the origin pool. Requests get hop-by-hop headers removed, plus `Via`, `X-Forwarded-For` and the request ID. A failing origin is reported to the layer by name (`connect`, `timeout`, `protocol`, `body-too-large`).
+
+The layer marks each response with its `Outcome` for the requests counter and the access log. It reports the other counters (not stored, streamed uncached, collapsed, background refreshes) through `Observer`, which cachet's `Metrics` implements. It adds the node's `Via` to responses that pass through unstored.
+
+The cluster tests (`tests/cluster.rs`), `tests/revalidation.rs`, `tests/proxy.rs` and `tests/failure.rs` run against this layered node unchanged. `make difftest-cache` holds it to cachet 0.1's answers, request for request.
+
+GET and HEAD go through the cache; every other method passes through to the origin. A request with `Cache-Control: no-store` also passes through.
 
 For GET, the node computes the primary key (lower-cased host plus the request target), looks up the stored variants for that key, and picks the newest one whose Vary selecting headers match the request. The freshness rules in `policy.rs` then decide one of four things: serve it (fresh), serve it because the client accepts staleness (`max-stale`), serve it and refresh in the background (`stale-while-revalidate`), or validate it with the origin first.
 

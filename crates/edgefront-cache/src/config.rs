@@ -192,6 +192,13 @@ pub struct RoutePolicies {
 }
 
 impl RoutePolicies {
+    /// The policies of routes in order, `None` for a route that bypasses
+    /// the cache. [`CacheConfig::resolve`] builds them from a config; a
+    /// server with routes of its own can build them directly.
+    pub fn new(routes: Vec<Option<RoutePolicy>>) -> Self {
+        RoutePolicies { routes }
+    }
+
     /// The policy of route `index`, or `None` when the route bypasses the
     /// cache (no entry, `enabled = false`, or no such route).
     pub fn get(&self, index: usize) -> Option<&RoutePolicy> {

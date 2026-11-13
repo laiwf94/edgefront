@@ -98,12 +98,34 @@ pub enum Delivery {
     Generated(&'static str),
 }
 
+/// What the upstream response phase decided.
+pub enum Upstream {
+    /// Deliver this response.
+    Respond(Response<Body>),
+    /// Send the request upstream once more, without a body, with these
+    /// headers in place of the ones the request phase left; the new
+    /// response comes back to [`Exchange::upstream_response`]. A cache
+    /// does this when a `304` turns out to be about another
+    /// representation than the one it asked about. A server resends at
+    /// most once; a second `Resend` is delivered as a `502` it writes,
+    /// with the reason `resend_limit`.
+    Resend(HeaderMap),
+}
+
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Upstream::Respond(r) => f.debug_tuple("Respond").field(&r.status()).finish(),
+            Upstream::Resend(h) => f.debug_tuple("Resend").field(&h.len()).finish(),
+        }
+    }
+}
+
 /// One request's state from the request phase on. It is dropped without
 /// a call to [`Exchange::deliver`] only when the client went away first.
 pub trait Exchange: Send {
-    /// The upstream response, before any of it is sent on. Returns the
-    /// response to deliver.
-    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Response<Body>>;
+    /// The upstream response, before any of it is sent on.
+    fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Upstream>;
 
     /// The response about to be written to the client. Called once.
     fn deliver(self: Box<Self>, resp: Response<Body>, from: Delivery) -> Response<Body>;
@@ -171,16 +193,17 @@ impl RouteFilters {
 /// upstream's, or one the caller wrote because there was no usable
 /// upstream response. Without a filter it is the response `send` returns.
 /// A [`Decision::Refresh`] runs `send` on a task of its own, so this must
-/// be called inside a tokio runtime.
+/// be called inside a tokio runtime. An [`Upstream::Resend`] calls `send`
+/// again, with an empty body.
 pub async fn run<B, S, Fut>(
     filter: Option<&dyn Filter>,
     route: usize,
     req: Request<B>,
-    send: S,
+    mut send: S,
 ) -> Response<Body>
 where
-    B: Send + 'static,
-    S: FnOnce(Request<B>) -> Fut + Send + 'static,
+    B: Default + Send + 'static,
+    S: FnMut(Request<B>) -> Fut + Send + 'static,
     Fut: Future<Output = (Response<Body>, Delivery)> + Send + 'static,
 {
     let Some(filter) = filter else {
@@ -198,29 +221,54 @@ where
     let req = Request::from_parts(parts, body);
     match decision {
         Decision::Respond(resp) => resp,
-        Decision::Forward(exchange) => complete(send(req).await, exchange).await,
+        Decision::Forward(None) => send(req).await.0,
+        Decision::Forward(Some(exchange)) => complete(send, req, exchange).await,
         Decision::Refresh(resp, exchange) => {
             tokio::spawn(async move {
-                drop(complete(send(req).await, Some(exchange)).await);
+                drop(complete(send, req, exchange).await);
             });
             resp
         }
     }
 }
 
-/// The later two phases for what the upstream call returned.
-async fn complete(
-    sent: (Response<Body>, Delivery),
-    exchange: Option<Box<dyn Exchange>>,
-) -> Response<Body> {
-    let Some(mut x) = exchange else {
-        return sent.0;
-    };
-    let (resp, from) = match sent {
-        (resp, Delivery::Upstream) => (x.upstream_response(resp).await, Delivery::Upstream),
-        generated => generated,
-    };
-    x.deliver(resp, from)
+/// The upstream call and the later two phases, with at most one resend.
+async fn complete<B, S, Fut>(
+    mut send: S,
+    req: Request<B>,
+    mut x: Box<dyn Exchange>,
+) -> Response<Body>
+where
+    B: Default,
+    S: FnMut(Request<B>) -> Fut,
+    Fut: Future<Output = (Response<Body>, Delivery)>,
+{
+    let (method, uri, version) = (req.method().clone(), req.uri().clone(), req.version());
+    let mut sent = send(req).await;
+    let mut resent = false;
+    loop {
+        let resp = match sent {
+            (resp, Delivery::Upstream) => resp,
+            (resp, generated) => return x.deliver(resp, generated),
+        };
+        match x.upstream_response(resp).await {
+            Upstream::Respond(resp) => return x.deliver(resp, Delivery::Upstream),
+            Upstream::Resend(headers) if !resent => {
+                resent = true;
+                let mut again = Request::new(B::default());
+                *again.method_mut() = method.clone();
+                *again.uri_mut() = uri.clone();
+                *again.version_mut() = version;
+                *again.headers_mut() = headers;
+                sent = send(again).await;
+            }
+            Upstream::Resend(_) => {
+                let resp =
+                    crate::body::text(http::StatusCode::BAD_GATEWAY, "upstream response invalid\n");
+                return x.deliver(resp, Delivery::Generated("resend_limit"));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -274,18 +322,23 @@ mod tests {
     }
 
     impl Exchange for RecordingExchange {
-        fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Response<Body>> {
+        fn upstream_response(&mut self, resp: Response<Body>) -> BoxFuture<'_, Upstream> {
             Box::pin(async move {
                 self.log
                     .lock()
                     .unwrap()
                     .push(format!("upstream {}", resp.status().as_u16()));
+                if let Some(n) = resp.headers().get("x-resend") {
+                    let mut h = HeaderMap::new();
+                    h.insert("x-resent", n.clone());
+                    return Upstream::Resend(h);
+                }
                 let (mut parts, body) = resp.into_parts();
                 let bytes = body.collect().await.unwrap().to_bytes();
                 parts
                     .headers
                     .insert("x-seen", HeaderValue::from(bytes.len()));
-                Response::from_parts(parts, full(bytes))
+                Upstream::Respond(Response::from_parts(parts, full(bytes)))
             })
         }
 
@@ -380,10 +433,14 @@ mod tests {
     async fn a_refresh_answers_at_once_and_runs_the_exchange_in_the_background() {
         let f = Recorder::default();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let resp = run(Some(&f), 2, request("/refresh"), |r| async move {
-            // The client has its answer before the upstream is reached.
-            rx.await.unwrap();
-            upstream(r).await
+        let mut rx = Some(rx);
+        let resp = run(Some(&f), 2, request("/refresh"), move |r| {
+            let rx = rx.take().expect("sent once");
+            async move {
+                // The client has its answer before the upstream is reached.
+                rx.await.unwrap();
+                upstream(r).await
+            }
         })
         .await;
         assert_eq!(body(resp).await, "stale\n");
@@ -407,6 +464,60 @@ mod tests {
             }),
         );
         assert_eq!(format!("{d:?}"), "Refresh(200)");
+    }
+
+    /// Asks for a resend while the upstream sends `x-resend`, which it
+    /// does `n` times.
+    fn resending(
+        n: usize,
+    ) -> impl FnMut(Request<()>) -> BoxFuture<'static, (Response<Body>, Delivery)> + Send + 'static
+    {
+        let mut left = n;
+        move |req: Request<()>| {
+            let resend = left > 0;
+            left = left.saturating_sub(1);
+            Box::pin(async move {
+                let mut resp = Response::new(full("origin"));
+                if resend {
+                    resp.headers_mut()
+                        .insert("x-resend", HeaderValue::from_static("1"));
+                }
+                if let Some(v) = req.headers().get("x-resent") {
+                    resp.headers_mut().insert("x-resent", v.clone());
+                    assert_eq!(req.uri(), "/x?q");
+                }
+                (resp, Delivery::Upstream)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resend_goes_upstream_once_more() {
+        let f = Recorder::default();
+        let resp = run(Some(&f), 0, request("/x?q"), resending(1)).await;
+        assert_eq!(resp.headers()["x-resent"], "1");
+        assert_eq!(body(resp).await, "origin");
+        assert_eq!(
+            *f.log.lock().unwrap(),
+            [
+                "request 0 GET /x?q",
+                "upstream 200",
+                "upstream 200",
+                "deliver Upstream"
+            ]
+        );
+        // A second resend is refused.
+        let f = Recorder::default();
+        let resp = run(Some(&f), 0, request("/x?q"), resending(5)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            f.log.lock().unwrap().last().unwrap(),
+            "deliver Generated(\"resend_limit\")"
+        );
+        let u = Upstream::Resend(HeaderMap::new());
+        assert_eq!(format!("{u:?}"), "Resend(0)");
+        let u = Upstream::Respond(text(StatusCode::OK, "x"));
+        assert_eq!(format!("{u:?}"), "Respond(200)");
     }
 
     #[tokio::test]
