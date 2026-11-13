@@ -49,8 +49,8 @@ Still to come from steer: health checks, outlier detection, retries, the admin A
 - `Table`: a fixed-memory map from keys (an API key, an address) to their own bucket, in power-of-two shards, keyed by SipHash with a random key. When it is full it reclaims idle entries, then denies new keys or evicts the coldest of eight, and it never drops a key that holds a concurrency slot (`hold`/`release`). Each shard keeps its arrival times from its own moving epoch, so keyed limits also work past 4.5 years of uptime.
 - `Window`: a sliding-window counter of up to 16 buckets, for quotas such as 1,000 requests an hour, that weights the oldest bucket by the part of it still inside the window.
 - `rate::RateSpec`: rates as operators write them, with fractions and units up to days: `0.5/s`, `90/min`, `2.5/10s burst 5`, `10000/day`. Each is held as an exact fraction and enforced within 0.1% of it, or refused with the reason. Periods of an hour or more without a burst become window quotas (`rate::Quota`, at most N in any window); shorter ones are token buckets.
-- `config::LimiterConfig`: pacerd's listeners and limits. `parse_pacerd` reads an existing pacerd.conf with pacerd's own messages and line numbers, and the same settings load through serde as a TOML section, with each value written as in pacerd (`per_ip_conn_rate = "10/s burst 20"`).
-- `lint`: ten lints for configs that parse but cannot work as written, such as a client table smaller than `max_conns` (new clients are refused while the listener has room), a listener that takes another's traffic, a per-client limit that can never bind, or an upstream that loops back. `edgefront check [--allow CLASS]... FILE` prints each as `FILE:LINE: warning[CLASS]: ...` for a pacerd.conf or a `.toml` limiter section, and exits 1 if there are any; the classes are listed in [docs/DESIGN.md](docs/DESIGN.md#config-lints).
+- `config::LimiterConfig`: pacerd's listeners and limits. `parse_pacerd` reads an existing pacerd.conf with pacerd's own messages and line numbers, and the same settings load through serde as a TOML section, with each value written as in pacerd (`per_ip_conn_rate = "10/s burst 20"`). The TOML section also takes `RateSpec` rates (`"0.5/s burst 30"`) and a per-client connection quota (`per_ip_conn_quota = "10000/day"`); see [the reference below](#limiter-config-reference).
+- `lint`: eleven lints for configs that parse but cannot work as written, such as a client table smaller than `max_conns` (new clients are refused while the listener has room), a listener that takes another's traffic, a per-client limit that can never bind, or an upstream that loops back. `edgefront check [--allow CLASS]... FILE` prints each as `FILE:LINE: warning[CLASS]: ...` for a pacerd.conf or a `.toml` limiter section, and exits 1 if there are any; the classes are listed in [docs/DESIGN.md](docs/DESIGN.md#config-lints).
 
 Every call takes the time in nanoseconds from the caller, so the library reads no clock and its answers are exact:
 
@@ -68,7 +68,64 @@ if !d.allowed {
 
 `edgefront-difftest` holds the port to libpacer through `legacy/pacer/tests/diffdrive.c`, a C driver that reads one operation per line and prints each decision with the full state after it. `make difftest-pacer` diffs 100 generated scripts of 10,000 operations against the Rust crate and prints the seed, step and replay command of the first difference. `crates/edgefront-difftest/tests/e2e_limiter_port.rs` runs one million of those operations in CI on every push, plus a worked example of per-key limits, retry times and an hourly quota that both sides must answer exactly. How the port was checked and where it deliberately differs from the C is in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
 
-Still to come from pacer: the rest of week 2 (`RateSpec` in the limiter's config section), the L4 data path with connection limits and shaping (week 3), and `pacerctl` with the published C-versus-Rust benchmark (week 4), after which `legacy/pacer` is removed.
+Still to come from pacer: the L4 data path with connection limits and shaping, which will enforce this config (week 3), and `pacerctl` with the published C-versus-Rust benchmark (week 4), after which `legacy/pacer` is removed.
+
+### Limiter config reference
+
+A limiter config is either a pacerd.conf, read exactly as pacerd reads it, or the limiter section of an edgefront config in TOML. The TOML field names are pacerd's directive names, so moving a file over changes its syntax and nothing else; `edgefront check --print pacerd.conf` writes the TOML for you, leaving out values equal to the defaults. `examples/limiter/` holds pacer's example pacerd.conf and a TOML config with daily quotas, and `examples/limiter_config.sh` loads, converts and lints both (CI runs it).
+
+```toml
+workers = 2
+admin_socket = "/run/edgefront/limiter.sock"
+
+[[listeners]]
+name = "api"
+listen = "0.0.0.0:8443"
+upstream = "127.0.0.1:9443"
+max_conns = 4096
+per_ip_max_conns = 16
+per_ip_conn_rate = "0.5/s burst 30"   # one every two seconds, bursts of 30
+per_ip_conn_quota = "10000/day"       # and at most 10,000 in any day
+per_ip_bandwidth = "2.5m/s burst 512k"
+table_size = 65536
+```
+
+Top level:
+
+| field | value | default | meaning |
+|---|---|---|---|
+| `workers` | 1 to 64 | 1 | worker threads |
+| `admin_socket` | absolute path under 108 bytes | none | the admin socket; in TOML the path may contain spaces |
+| `drain_timeout` | duration up to `1h` | `30s` | how long open connections may finish at shutdown |
+| `log_level` | `debug`, `info`, `warn`, `error` | `info` | |
+| `listeners` | 1 to 16 listeners | | in pacerd.conf, `listener NAME { ... }` blocks |
+
+Each listener (`name` is 1 to 31 letters, digits, `_` or `-`, and `listen` and `upstream` are required):
+
+| field | value | default | meaning |
+|---|---|---|---|
+| `listen`, `upstream` | `a.b.c.d:port` or `[v6]:port`, numeric | | where to accept connections and where to send them |
+| `max_conns` | 1 to 1,000,000 | 1024 | open connections across the listener |
+| `buffer` | size, `1k` to `1m` | `16k` | buffer per direction per connection |
+| `connect_timeout` | duration, `1ms` to `10m` | `5s` | to connect to the upstream |
+| `idle_timeout` | duration, `1s` to `24h` | `5m` | a connection with no traffic for this long is closed |
+| `min_rate` | `BYTES per DURATION` (window `1s` to `10m`) or `off` | `off` | a connection that moves less than this is closed (slowloris) |
+| `per_ip_max_conns` | 0 to 1,000,000 | 0 (no cap) | open connections per client address |
+| `ipv6_prefix` | 32 to 128 | 64 | IPv6 clients are grouped by this prefix |
+| `per_ip_conn_rate` | rate | none | new connections per client, a token bucket |
+| `per_ip_conn_quota` | quota, TOML only | none | new connections per client in a long window |
+| `per_ip_bandwidth` | rate, in bytes | none | bytes per second per client |
+| `bandwidth` | rate, in bytes | none | bytes per second across the listener |
+| `table_size` | 16 to 16,777,216 | 16384 | client addresses tracked at once |
+| `table_full` | `deny` or `evict` | `deny` | what a new client gets when the table is full of active ones |
+
+Sizes take `k`, `m` and `g` (powers of 1024) and durations `ms`, `s`, `m` or `h`; in TOML a count or size may also be an integer.
+
+A **rate** is `COUNT/PERIOD [burst N]`, with the burst defaulting to the count. In pacerd.conf the count is a whole number or size and the period is `s`, `m` or `h` (`10/s`, `600/m`, `1m/s burst 256k`). TOML takes those, read as pacerd reads them, and also `RateSpec` text: up to nine decimal places and periods of a number of `s`, `min`, `h` or `day` (`0.5/s`, `90/min`, `2.5/10s burst 5`, `10/day burst 10`). A rate is held as its exact fraction and enforced within 0.1%, or refused with the reason. A period of an hour or more needs a burst here, because without one it is a quota.
+
+A **quota** is `COUNT/PERIOD` with a period of an hour to 366 days and no burst: at most COUNT in any window of that length, on a sliding window counter of 16 buckets (`10000/day`, `1500/6h`; `1.5/h` is 3 in any two hours). A bucket with burst N admits up to N plus the refill in one window, so a quota is the way to hold a whole day to a number. pacerd.conf has no quotas, so a config with one, or with a rate pacerd cannot write, loads and prints as TOML but `LimiterConfig::to_pacerd` refuses it, naming the field.
+
+`edgefront check FILE` lints either syntax and names the line of each finding, including `quota-unreachable` when `per_ip_conn_rate` can never admit as many as `per_ip_conn_quota` in its window.
 
 ## Cache (formerly cachet)
 
@@ -184,6 +241,8 @@ Hits through cachet run at about the rate of the in-memory origin serving the sa
 HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are buffered in memory up to the per-object limit (8 MiB by default); larger responses stream through uncached. Only single byte ranges are served. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#what-it-does-not-do-well) for the full list.
 
 ## Checking a change
+
+`examples/limiter_config.sh` is the limiter config's demo: an old pacerd.conf and a new TOML config with daily quotas, loaded, converted and linted by `edgefront check`. CI runs it, and `crates/edgefront/tests/e2e_limiter_config.rs` runs it under `make test`.
 
 `make check` is the gate: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests under cargo-llvm-cov, where `scripts/coverage.sh` holds every crate to at least 90% line coverage on its own sources, and the workspace too. `make audit` runs cargo deny on the workspace and on each fuzz crate, cargo audit on every lockfile, and `scripts/direct-deps.sh`, which requires exact pins and allows at most 14 direct runtime dependencies across the workspace. `make fuzz` runs every cargo-fuzz target in `crates/edgefront-cache/fuzz`, `crates/edgefront-core/fuzz` and `crates/edgefront-limiter/fuzz`, with the target's dictionary when it has one, and fails on any input that takes over 10 seconds (nightly; CI gives each target 10 minutes, and the pacerd.conf reader's `limiter_config` 30). `make tsan` runs each crate's unit tests and its concurrency tests under ThreadSanitizer, one crate at a time (`make tsan-<crate>` for one; nightly with rust-src). `scripts/verify-history.sh` runs `make check` on every commit of the branch and prints each one's lowest crate coverage. CI runs all of these, with one ThreadSanitizer job per crate, builds on Rust 1.88, runs the demo and builds the container image, which runs as a non-root user.
 

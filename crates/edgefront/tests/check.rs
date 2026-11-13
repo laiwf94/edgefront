@@ -88,6 +88,7 @@ listen = "[::]:443"
 upstream = "[2001:db8::1]:443"
 per_ip_conn_rate = "10/s"
 ipv6_prefix = 32
+per_ip_conn_quota = "864010/day"
 "#;
 
 /// `(line, class)` for each finding line of `stdout`, which must all name
@@ -170,9 +171,13 @@ fn reports_toml_lines_from_its_spans() {
             (17, "unused-table"),
             (18, "ipv6-prefix-unused"),
             (25, "wide-ipv6-prefix"),
+            (26, "quota-unreachable"),
         ])
     );
-    assert_eq!(summary, format!("{path}: 12 warnings"));
+    assert_eq!(summary, format!("{path}: 13 warnings"));
+    // pacerd.conf has no quotas, so only TOML can show the last class.
+    let classes: std::collections::BTreeSet<_> = found.iter().map(|(_, c)| c.as_str()).collect();
+    assert_eq!(classes.len(), 11, "{classes:?}");
 
     // A default is reported on the line that opens its listener: the
     // `[[listeners]]` header, or an inline table's brace.
@@ -274,9 +279,13 @@ fn invalid_configs_and_bad_usage_exit_2() {
             .starts_with("edgefront: cannot read ")
     );
 
-    let usage = "usage: edgefront check [--allow CLASS]... <file>\n";
+    let usage =
+        "usage: edgefront check [--allow CLASS]... <file>\n       edgefront check --print <file>\n";
     for args in [
         &["check"][..],
+        &["check", "--print"],
+        &["check", "--print", "--allow"],
+        &["check", "--print", "a", "b"],
         &["check", "a", "b"],
         &["check", "--allow"],
         &["check", "--allow", "rate-rounding"],
@@ -294,5 +303,68 @@ fn invalid_configs_and_bad_usage_exit_2() {
             "edgefront: unknown lint class \"nope\"; the classes are burst-below-read, "
         ),
         "{err}"
+    );
+}
+
+#[test]
+fn print_writes_the_config_as_toml_that_reads_back_the_same() {
+    let dir = Scratch::new("print");
+    let example = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../legacy/pacer/examples/pacerd.conf"
+    );
+    let out = edgefront(&["check", "--print", example]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stderr.is_empty());
+    let toml = String::from_utf8(out.stdout).unwrap();
+    assert!(toml.contains("[[listeners]]\nname = \"web\"\n"), "{toml}");
+    assert!(toml.contains("bandwidth = \"100m/s burst 1m\"\n"), "{toml}");
+    let converted = dir.write("converted.toml", &toml);
+    let again = edgefront(&["check", "--print", &converted]);
+    assert!(again.status.success());
+    assert_eq!(String::from_utf8(again.stdout).unwrap(), toml);
+    let out = edgefront(&["check", &converted]);
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{converted}: ok\n")
+    );
+
+    // A TOML file comes back in canonical form: rates in lowest terms,
+    // quotas in their whole windows, and defaults left out.
+    let path = dir.write(
+        "quota.toml",
+        "[[listeners]]\nname = \"api\"\nlisten = \"0.0.0.0:8443\"\nupstream = \"10.0.0.2:8443\"\n\
+         per_ip_conn_rate = \"0.5/s burst 10\"\nper_ip_conn_quota = \"1.5/h\"\n",
+    );
+    let out = edgefront(&["check", "--print", &path]);
+    assert!(out.status.success());
+    let toml = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        toml,
+        "[[listeners]]\nname = \"api\"\nlisten = \"0.0.0.0:8443\"\nupstream = \"10.0.0.2:8443\"\n\
+         per_ip_conn_rate = \"1/2s burst 10\"\nper_ip_conn_quota = \"3/2h\"\n"
+    );
+
+    // Errors are those of a plain check.
+    let bad = dir.write("bad.toml", "[[listeners]]\nname = \"a\"\n");
+    let out = edgefront(&["check", "--print", &bad]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("listeners[0]: listener a: missing listen")
+    );
+    // pacerd takes admin paths that are not UTF-8, and TOML cannot hold one.
+    let mut conf = b"admin_socket /run/\xff.sock\n".to_vec();
+    conf.extend_from_slice(b"listener a {\nlisten 127.0.0.1:1\nupstream 127.0.0.1:2\n}\n");
+    let path = dir.0.join("latin1.conf");
+    std::fs::write(&path, conf).unwrap();
+    let out = edgefront(&["check", "--print", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("admin_socket: the path is not UTF-8")
     );
 }

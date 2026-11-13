@@ -22,11 +22,12 @@
 //! | `ipv6-prefix-unused` | `ipv6_prefix` is set on a listener that never groups IPv6 clients |
 //! | `wide-ipv6-prefix` | per-client limits group IPv6 clients by a prefix shorter than /48, so whole sites share one limit |
 //! | `upstream-loop` | the upstream is a listener's own address, so connections loop back into the limiter |
+//! | `quota-unreachable` | `per_ip_conn_rate` admits no more than `per_ip_conn_quota` in the quota's window, so the quota never refuses anyone |
 
 use std::fmt;
 use std::net::SocketAddr;
 
-use crate::config::{LimiterConfig, ListenerConfig, ListenerLines, SourceMap};
+use crate::config::{LimiterConfig, ListenerConfig, ListenerLines, SourceMap, period_text};
 use crate::gcra::{Rate, TICK_SHIFT};
 use crate::rate::bucket_slowdown;
 
@@ -60,11 +61,12 @@ pub enum Class {
     Ipv6PrefixUnused,
     WideIpv6Prefix,
     UpstreamLoop,
+    QuotaUnreachable,
 }
 
 impl Class {
     /// Every class, in the order of the table in the module docs.
-    pub const ALL: [Class; 10] = [
+    pub const ALL: [Class; 11] = [
         Class::BurstBelowRead,
         Class::ListenOverlap,
         Class::TableBelowMaxConns,
@@ -75,6 +77,7 @@ impl Class {
         Class::Ipv6PrefixUnused,
         Class::WideIpv6Prefix,
         Class::UpstreamLoop,
+        Class::QuotaUnreachable,
     ];
 
     /// The class's name, as `edgefront check` prints it and `--allow`
@@ -91,6 +94,7 @@ impl Class {
             Class::Ipv6PrefixUnused => "ipv6-prefix-unused",
             Class::WideIpv6Prefix => "wide-ipv6-prefix",
             Class::UpstreamLoop => "upstream-loop",
+            Class::QuotaUnreachable => "quota-unreachable",
         }
     }
 
@@ -178,7 +182,7 @@ pub fn lint(cfg: &LimiterConfig, map: &SourceMap) -> Vec<Lint> {
 /// Whether the listener admits connections through the per-client table
 /// (proxy.c's `admit`).
 fn per_ip_admission(l: &ListenerConfig) -> bool {
-    l.per_ip_max_conns != 0 || l.per_ip_conn_rate.is_some()
+    l.per_ip_max_conns != 0 || l.per_ip_conn_rate.is_some() || l.per_ip_conn_quota.is_some()
 }
 
 /// Whether any per-client limit keys the client table.
@@ -186,12 +190,14 @@ fn uses_table(l: &ListenerConfig) -> bool {
     per_ip_admission(l) || l.per_ip_bandwidth.is_some()
 }
 
-/// `tokens/period` and `burst` as written, such as `1m/s burst 2k`.
+/// `tokens/period` and `burst`, such as `1048576/s burst 2048` or
+/// `5/20s burst 5`.
 fn shown(r: &Rate) -> String {
     let unit = match r.period_ns {
         1_000_000_000 => "s".to_owned(),
         60_000_000_000 => "m".to_owned(),
         3_600_000_000_000 => "h".to_owned(),
+        p if p != 0 && p.is_multiple_of(1_000_000_000) => period_text(p),
         p => format!("{p}ns"),
     };
     let mut s = format!("{}/{unit}", r.tokens);
@@ -308,6 +314,28 @@ fn listener_lints(
         }
     }
 
+    if let (Some(r), Some(q)) = (&l.per_ip_conn_rate, &l.per_ip_conn_quota) {
+        // The bucket admits at most its burst plus what refills in the
+        // window; rounding only makes it slower.
+        let window = q.window.as_nanos();
+        let refill = window * u128::from(r.tokens) / u128::from(r.period_ns);
+        let most = u128::from(r.burst) + refill;
+        if u128::from(q.limit) >= most {
+            // A valid config's quota has a text and a window of whole
+            // seconds.
+            let text = q.to_text().unwrap_or_default();
+            push(
+                "per_ip_conn_quota",
+                Class::QuotaUnreachable,
+                format!(
+                    "per_ip_conn_quota {text} is never reached: per_ip_conn_rate {} admits at most {most} new connections per client in any {}, so the quota never refuses anyone",
+                    shown(r),
+                    period_text(window as u64)
+                ),
+            );
+        }
+    }
+
     let v6 = l.listen.is_ipv6();
     if v6 && uses_table(l) && l.ipv6_prefix < SITE_PREFIX {
         push(
@@ -330,7 +358,7 @@ fn listener_lints(
                     name,
                     Class::UnusedTable,
                     format!(
-                        "{name} has no effect: no per_ip_max_conns, per_ip_conn_rate or per_ip_bandwidth uses the client table"
+                        "{name} has no effect: no per_ip_max_conns, per_ip_conn_rate, per_ip_conn_quota or per_ip_bandwidth uses the client table"
                     ),
                 );
             }

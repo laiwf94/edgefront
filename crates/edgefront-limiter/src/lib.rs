@@ -16,7 +16,7 @@ pub mod table;
 pub mod window;
 
 pub use config::{
-    LimiterConfig, Lines, ListenerConfig, ListenerLines, LogLevel, MinRate, SourceMap,
+    ConnQuota, LimiterConfig, Lines, ListenerConfig, ListenerLines, LogLevel, MinRate, SourceMap,
     parse_pacerd, parse_pacerd_mapped,
 };
 pub use gcra::{Decision, Error, Gcra, Rate};

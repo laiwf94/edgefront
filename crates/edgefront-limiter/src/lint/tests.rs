@@ -286,7 +286,7 @@ fn unused_table_settings_are_reported_where_written() {
     assert_eq!(found(&one("table_size 64\nper_ip_bandwidth 1m/s\n")), []);
     assert_eq!(
         lints(&one("table_full deny\n"))[0].message,
-        "table_full has no effect: no per_ip_max_conns, per_ip_conn_rate or per_ip_bandwidth uses the client table"
+        "table_full has no effect: no per_ip_max_conns, per_ip_conn_rate, per_ip_conn_quota or per_ip_bandwidth uses the client table"
     );
 }
 
@@ -403,4 +403,67 @@ fn every_accepted_corpus_file_lints_without_panicking_on_real_lines() {
         }
     }
     assert!(accepted >= 3, "{accepted}");
+}
+
+/// One listener from `body` in pacerd.conf syntax plus a quota set on
+/// line 20, as a TOML reader would record it.
+fn with_quota(body: &str, quota: &str) -> Vec<Lint> {
+    let (mut cfg, mut map) = parse_pacerd_mapped(one(body).as_bytes()).unwrap();
+    cfg.listeners[0].per_ip_conn_quota = Some(crate::ConnQuota::parse(quota).unwrap());
+    map.listeners[0].set("per_ip_conn_quota", 20);
+    cfg.validate().unwrap();
+    lint(&cfg, &map)
+}
+
+#[test]
+fn quota_unreachable_when_the_rate_admits_less_in_the_window() {
+    // 1/min with a burst of 5 admits 5 + 1,440 in a day.
+    let got = with_quota("per_ip_conn_rate 1/m burst 5\n", "1445/day");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].line, got[0].class), (20, Class::QuotaUnreachable));
+    assert_eq!(
+        got[0].message,
+        "per_ip_conn_quota 1445/day is never reached: per_ip_conn_rate 1/m burst 5 admits at most 1445 new connections per client in any day, so the quota never refuses anyone"
+    );
+    // One fewer and the quota can refuse.
+    assert_eq!(with_quota("per_ip_conn_rate 1/m burst 5\n", "1444/day"), []);
+    // Windows that are not whole units, and refills that are not whole.
+    let got = with_quota("per_ip_conn_rate 7/h\n", "17/90min");
+    assert_eq!(got[0].class, Class::QuotaUnreachable);
+    assert!(
+        got[0]
+            .message
+            .contains("admits at most 17 new connections per client in any 90min")
+    );
+    assert_eq!(with_quota("per_ip_conn_rate 7/h\n", "16/90min"), []);
+    // Without a rate the quota is the only limit.
+    assert_eq!(with_quota("", "10/day"), []);
+}
+
+#[test]
+fn a_quota_alone_is_per_client_admission() {
+    // It keys the table, so table settings are used and a small table is
+    // reported.
+    let got = with_quota("max_conns 100\ntable_size 64\n", "10/day");
+    assert_eq!(
+        got.iter().map(|l| (l.line, l.class)).collect::<Vec<_>>(),
+        [(5, Class::TableBelowMaxConns)]
+    );
+    let got = with_quota("table_full evict\n", "10/day");
+    assert_eq!(got, []);
+}
+
+#[test]
+fn serde_only_rate_periods_are_shown_in_whole_units() {
+    let (mut cfg, map) = parse_pacerd_mapped(one("").as_bytes()).unwrap();
+    cfg.listeners[0].bandwidth = Some(Rate::new(1 << 20, 20_000_000_000, 1024));
+    let got = lint(&cfg, &map);
+    assert_eq!(got.len(), 1);
+    assert!(
+        got[0]
+            .message
+            .starts_with("bandwidth 1048576/20s burst 1024: a burst of 1024 bytes"),
+        "{}",
+        got[0].message
+    );
 }

@@ -156,6 +156,8 @@ jobs:
         run: examples/demo.sh
       - name: Live demo against the reference cachet binary
         run: DEMO_BIN=cachet examples/demo.sh
+      - name: Limiter config demo
+        run: examples/limiter_config.sh
 
   docker:
     runs-on: ubuntu-latest

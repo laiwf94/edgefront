@@ -687,7 +687,7 @@ fn toml_errors_name_the_field() {
         ),
         (
             "per_ip_conn_rate = \"10/s burst\"",
-            "listeners[0].per_ip_conn_rate: expected RATE or RATE burst N",
+            "listeners[0].per_ip_conn_rate: expected RATE or RATE burst N, like 10/s burst 20, got \"10/s burst\"",
         ),
         (
             "min_rate = \"\"",
@@ -853,12 +853,35 @@ fn configs_built_in_code_are_checked() {
         "listeners[0].idle_timeout: must be between 1000ms and 86400000ms"
     );
     assert_eq!(
-        with(&|l| l.bandwidth = Some(Rate::new(1, 2 * SEC, 1))),
-        "listeners[0].bandwidth: a period of 2000000000ns is not a second, minute or hour"
+        with(&|l| l.bandwidth = Some(Rate::new(1, 1500 * MS, 1))),
+        "listeners[0].bandwidth: a period of 1500000000ns is not a whole number of seconds"
     );
     assert_eq!(
+        with(&|l| l.bandwidth = Some(Rate::new(1, 0, 1))),
+        "listeners[0].bandwidth: a period of 0ns is not a whole number of seconds"
+    );
+    assert_eq!(
+        with(&|l| l.bandwidth = Some(Rate::new(1 << 51, 2 * SEC, 1))),
+        "listeners[0].bandwidth: \"2251799813685248/2s\": the count is above 2^50"
+    );
+    for (limit, window) in [
+        (5, Duration::from_secs(1800)),
+        (0, Duration::from_secs(3600)),
+        ((1 << 50) + 1, Duration::from_secs(3600)),
+        (5, Duration::from_millis(3_600_500)),
+        (5, Duration::from_secs(367 * 86_400)),
+    ] {
+        let v = with(&|l| l.per_ip_conn_quota = Some(ConnQuota { limit, window }));
+        assert_eq!(
+            v,
+            format!(
+                "listeners[0].per_ip_conn_quota: {limit} in {window:?} is not a quota: the limit must be 1 to 2^50 and the window a whole number of seconds from 1h to 366 days"
+            )
+        );
+    }
+    assert_eq!(
         with(&|l| l.per_ip_bandwidth = Some(Rate::new(1, 3600 * SEC, 1 << 50))),
-        "listeners[0].per_ip_bandwidth: rate and burst are too large together"
+        "listeners[0].per_ip_bandwidth: \"1/h\": rate and burst are too large together"
     );
     assert_eq!(
         with(&|l| {
@@ -895,6 +918,210 @@ fn configs_built_in_code_are_checked() {
             .validate()
             .unwrap_err()
             .starts_with("drain_timeout: 1ns")
+    );
+}
+
+fn one_listener(extra: &str) -> Result<LimiterConfig, String> {
+    from_toml(&format!(
+        "[[listeners]]\nname = \"a\"\nlisten = \"127.0.0.1:1\"\nupstream = \"127.0.0.1:2\"\n{extra}\n"
+    ))
+}
+
+#[test]
+fn toml_rates_take_fractions_and_units_up_to_days() {
+    let rate = |field: &str, text: &str| {
+        let cfg = one_listener(&format!("{field} = \"{text}\"")).unwrap();
+        let l = &cfg.listeners[0];
+        match field {
+            "per_ip_conn_rate" => l.per_ip_conn_rate,
+            "per_ip_bandwidth" => l.per_ip_bandwidth,
+            _ => l.bandwidth,
+        }
+        .unwrap()
+    };
+    let cases: &[(&str, Rate)] = &[
+        // pacerd's text is read as pacerd reads it.
+        ("10/s burst 20", Rate::new(10, SEC, 20)),
+        ("600/m", Rate::new(600, 60 * SEC, 600)),
+        ("1m/s burst 256k", Rate::new(1 << 20, SEC, 256 << 10)),
+        // RateSpec text, with the count over the period in lowest terms.
+        ("0.5/s", Rate::new(1, 2 * SEC, 1)),
+        ("90/min", Rate::new(90, 60 * SEC, 90)),
+        ("2.5/10s burst 5", Rate::new(5, 20 * SEC, 5)),
+        ("1.5m/s", Rate::new(3 << 19, SEC, 3 << 19)),
+        ("3/2h burst 3", Rate::new(3, 7200 * SEC, 3)),
+        ("10/day burst 10", Rate::new(10, 86_400 * SEC, 10)),
+        ("0.25/day burst 1", Rate::new(1, 4 * 86_400 * SEC, 1)),
+        ("1.000000001/19s burst 2", Rate::new(0, 0, 0)),
+    ];
+    for &(text, want) in &cases[..cases.len() - 1] {
+        for field in ["per_ip_conn_rate", "per_ip_bandwidth", "bandwidth"] {
+            assert_eq!(rate(field, text), want, "{field} = {text:?}");
+        }
+    }
+    // A rate whose period would need more than 64 bits of nanoseconds to
+    // hold its count exactly. RateSpec itself takes it, in lower terms
+    // than whole seconds can write.
+    assert!(RateSpec::parse(cases[cases.len() - 1].0).is_ok());
+    let refused: &[(&str, &str)] = &[
+        (
+            "per_ip_conn_rate = \"1.000000001/19s burst 2\"",
+            "listeners[0].per_ip_conn_rate: \"1.000000001/19s burst 2\" is too precise to hold exactly; use fewer decimal places",
+        ),
+        (
+            "per_ip_conn_rate = \"10000/day\"",
+            "listeners[0].per_ip_conn_rate: \"10000/day\" is a quota (a period of an hour or more with no burst), not a rate; set it as per_ip_conn_quota, or give it a burst to make it a token bucket",
+        ),
+        (
+            "bandwidth = \"1g/day\"",
+            "listeners[0].bandwidth: \"1073741824/day\" is a quota (a period of an hour or more with no burst), not a rate; give it a burst to make it a token bucket",
+        ),
+        (
+            "bandwidth = \"0.0000000001/s\"",
+            "listeners[0].bandwidth: \"0.0000000001/s\": a count may have at most 9 decimal places",
+        ),
+        (
+            "per_ip_bandwidth = \"0.5/s burst 1048576g\"",
+            "listeners[0].per_ip_bandwidth: \"0.5/s\": rate and burst are too large together",
+        ),
+        (
+            "per_ip_bandwidth = \"1.5g/s\"",
+            "listeners[0].per_ip_bandwidth: \"1.5g/s\": too fast to enforce within 0.1% (it would run 0.66% slow)",
+        ),
+        (
+            "bandwidth = \"10/fortnight\"",
+            "listeners[0].bandwidth: expected a rate like 0.5/s, 90/min or 10000/day, got \"10/fortnight\"",
+        ),
+        // A value that is no rate keeps pacerd's message.
+        (
+            "bandwidth = 10",
+            "listeners[0].bandwidth: expected a rate like 10/s, 600/m or 1m/s, got \"10\"",
+        ),
+    ];
+    for (extra, want) in refused {
+        assert_eq!(one_listener(extra).unwrap_err(), *want, "for {extra:?}");
+    }
+}
+
+#[test]
+fn toml_takes_a_per_client_connection_quota() {
+    let quota = |text: &str| {
+        one_listener(&format!("per_ip_conn_quota = \"{text}\""))
+            .map(|c| c.listeners[0].per_ip_conn_quota.unwrap())
+    };
+    let day = Duration::from_secs(86_400);
+    let hour = Duration::from_secs(3_600);
+    assert_eq!(
+        quota("10000/day"),
+        Ok(ConnQuota {
+            limit: 10_000,
+            window: day
+        })
+    );
+    assert_eq!(
+        quota("500/6h"),
+        Ok(ConnQuota {
+            limit: 500,
+            window: 6 * hour
+        })
+    );
+    assert_eq!(
+        quota("1.5/h"),
+        Ok(ConnQuota {
+            limit: 3,
+            window: 2 * hour
+        })
+    );
+    assert_eq!(
+        quota("90/90min"),
+        Ok(ConnQuota {
+            limit: 90,
+            window: Duration::from_secs(5_400)
+        })
+    );
+    assert_eq!(
+        quota("100/min").unwrap_err(),
+        "listeners[0].per_ip_conn_quota: \"100/min\" is a rate, not a quota: a quota has a period of an hour or more and no burst, like 10000/day; set a rate as per_ip_conn_rate"
+    );
+    assert_eq!(
+        quota("100/day burst 5").unwrap_err(),
+        "listeners[0].per_ip_conn_quota: \"100/day burst 5\" is a rate, not a quota: a quota has a period of an hour or more and no burst, like 10000/day; set a rate as per_ip_conn_rate"
+    );
+    assert_eq!(
+        quota("10000/year").unwrap_err(),
+        "listeners[0].per_ip_conn_quota: expected a rate like 0.5/s, 90/min or 10000/day, got \"10000/year\""
+    );
+    assert!(
+        one_listener("per_ip_conn_quota = 5")
+            .unwrap_err()
+            .contains("expected a string")
+    );
+    // Written back in the largest unit that divides the window.
+    for (limit, secs, text) in [
+        (1, 86_400, "1/day"),
+        (7, 2 * 86_400, "7/2day"),
+        (3, 7_200, "3/2h"),
+        (90, 5_400, "90/90min"),
+        (4, 3_601, "4/3601s"),
+    ] {
+        let q = ConnQuota {
+            limit,
+            window: Duration::from_secs(secs),
+        };
+        assert_eq!(q.to_text().unwrap(), text);
+        assert_eq!(ConnQuota::parse(text), Ok(q));
+    }
+}
+
+#[test]
+fn serde_only_settings_round_trip_but_are_not_pacerd() {
+    let cfg = one_listener(
+        "per_ip_conn_rate = \"0.5/s burst 3\"\nper_ip_conn_quota = \"10000/day\"\n\
+         bandwidth = \"2.5/10s burst 5\"\nper_ip_bandwidth = \"10/day burst 10\"",
+    )
+    .unwrap();
+    assert_eq!(cfg.validate(), Ok(()));
+    let text = toml::to_string(&cfg).unwrap();
+    assert!(
+        text.contains("per_ip_conn_rate = \"1/2s burst 3\""),
+        "{text}"
+    );
+    assert!(text.contains("per_ip_conn_quota = \"10000/day\""), "{text}");
+    assert!(text.contains("bandwidth = \"5/20s burst 5\""), "{text}");
+    assert!(
+        text.contains("per_ip_bandwidth = \"10/day burst 10\""),
+        "{text}"
+    );
+    assert_eq!(from_toml(&text).unwrap(), cfg);
+    assert_eq!(
+        cfg.to_pacerd().unwrap_err(),
+        "listeners[0].per_ip_conn_rate: 1/2s burst 3 cannot be written in pacerd syntax, whose rates are per second, minute or hour"
+    );
+    let mut quota_only = cfg.clone();
+    let l = &mut quota_only.listeners[0];
+    (l.per_ip_conn_rate, l.per_ip_bandwidth, l.bandwidth) = (None, None, None);
+    assert_eq!(
+        quota_only.to_pacerd().unwrap_err(),
+        "listeners[0].per_ip_conn_quota: pacerd has no quotas, so it cannot be written in pacerd syntax"
+    );
+    quota_only.listeners[0].per_ip_conn_quota = None;
+    assert_eq!(
+        parse_pacerd(&quota_only.to_pacerd().unwrap()).unwrap(),
+        quota_only
+    );
+    // The line of a serde-only field is recorded like a directive's.
+    let mut lines = ListenerLines::new(3);
+    lines.set("per_ip_conn_quota", 9);
+    lines.set("no_such_field", 10);
+    assert_eq!(lines.line_of("per_ip_conn_quota"), 9);
+    assert_eq!(lines.line_of("no_such_field"), 3);
+    assert_eq!(
+        rate_text(&Rate::new(3, 3_600 * SEC, 9)).unwrap(),
+        "3/h burst 9"
+    );
+    assert_eq!(
+        rate_text(&Rate::new(3, 7 * 86_400 * SEC, 9)).unwrap(),
+        "3/7day burst 9"
     );
 }
 
@@ -982,6 +1209,7 @@ fn listener(i: usize) -> impl Strategy<Value = ListenerConfig> {
                 per_ip_conn_rate: conn_rate,
                 per_ip_bandwidth: ip_bw,
                 bandwidth: bw,
+                per_ip_conn_quota: None,
                 table_size,
                 table_full: if evict {
                     FullPolicy::Evict
@@ -1017,7 +1245,61 @@ fn config() -> impl Strategy<Value = LimiterConfig> {
         })
 }
 
+/// A rate only the serde form can hold: a whole number of seconds that
+/// is not one second, minute or hour, with tokens and period in lowest
+/// terms, as the serde reader keeps them.
+fn serde_rate() -> impl Strategy<Value = Rate> {
+    (1u64..=1 << 30, 1u64..=366 * 86_400, 1u64..=1 << 30)
+        .prop_map(|(tokens, secs, burst)| {
+            let (mut a, mut b) = (tokens, secs * SEC);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            Rate::new(tokens / a, secs * SEC / a, burst)
+        })
+        .prop_filter("whole seconds, not s, m or h, enforced within 0.1%", |r| {
+            r.period_ns.is_multiple_of(SEC)
+                && ![SEC, 60 * SEC, 3_600 * SEC].contains(&r.period_ns)
+                && RateSpec::parse(&rate_text(r).unwrap()).is_ok()
+        })
+}
+
+fn quota() -> impl Strategy<Value = ConnQuota> {
+    (1u64..=1 << 50, 3_600u64..=366 * 86_400).prop_map(|(limit, secs)| ConnQuota {
+        limit,
+        window: Duration::from_secs(secs),
+    })
+}
+
+/// [`config`] with serde-only rates and quotas mixed in.
+fn serde_config() -> impl Strategy<Value = LimiterConfig> {
+    let extras = proptest::collection::vec(
+        (
+            proptest::option::of(serde_rate()),
+            proptest::option::of(serde_rate()),
+            proptest::option::of(serde_rate()),
+            proptest::option::of(quota()),
+        ),
+        4,
+    );
+    (config(), extras).prop_map(|(mut cfg, extras)| {
+        for (l, (a, b, c, q)) in cfg.listeners.iter_mut().zip(extras) {
+            l.per_ip_conn_rate = a.or(l.per_ip_conn_rate);
+            l.per_ip_bandwidth = b.or(l.per_ip_bandwidth);
+            l.bandwidth = c.or(l.bandwidth);
+            l.per_ip_conn_quota = q;
+        }
+        cfg
+    })
+}
+
 proptest! {
+    #[test]
+    fn serde_only_settings_round_trip_through_toml(cfg in serde_config()) {
+        let text = toml::to_string(&cfg).unwrap();
+        prop_assert_eq!(from_toml(&text).unwrap(), cfg);
+    }
+
     #[test]
     fn pacerd_text_round_trips(cfg in config()) {
         let text = cfg.to_pacerd().unwrap();

@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! edgefront check [--allow CLASS]... <file>
+//! edgefront check --print <file>
 //! ```
 //!
 //! A file ending in `.toml` is read as the limiter section of an edgefront
@@ -17,6 +18,12 @@
 //!
 //! then exits 1, or prints `FILE: ok` and exits 0 when nothing is found.
 //! `--allow CLASS` drops the findings of one class, and may be repeated.
+//!
+//! `--print` writes the config instead, as the TOML limiter section that
+//! reads back to the same config, and exits 0. That turns a pacerd.conf
+//! into its edgefront form, and shows a TOML file in canonical form:
+//! values equal to pacerd's defaults left out, rates in lowest terms and
+//! quotas in their whole windows.
 
 use std::process::ExitCode;
 
@@ -25,7 +32,8 @@ use edgefront_limiter::config::{ListenerLines, SourceMap, read_pacerd_mapped};
 use edgefront_limiter::lint::{Class, lint};
 use toml::de::{DeTable, DeValue};
 
-const USAGE: &str = "usage: edgefront check [--allow CLASS]... <file>\n";
+const USAGE: &str =
+    "usage: edgefront check [--allow CLASS]... <file>\n       edgefront check --print <file>\n";
 
 /// The 1-based line holding byte `offset` of `text`.
 fn line_at(text: &str, offset: usize) -> usize {
@@ -90,8 +98,31 @@ fn load(path: &str) -> Result<(LimiterConfig, SourceMap), String> {
     }
 }
 
+/// Writes the config at `path` as TOML.
+fn print(path: &str) -> ExitCode {
+    let text = load(path).and_then(|(cfg, _)| {
+        toml::to_string(&cfg).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))
+    });
+    match text {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("edgefront: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 /// Runs `edgefront check` with the arguments after `check`.
 pub fn run(args: &[String]) -> ExitCode {
+    if let [flag, path] = args
+        && flag == "--print"
+        && !path.starts_with("--")
+    {
+        return print(path);
+    }
     let mut allowed = Vec::new();
     let mut rest = args;
     let path = loop {

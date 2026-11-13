@@ -18,7 +18,21 @@
 //!   `listeners[0].max_conns: must be between 1 and 1000000`.
 //!
 //! Both readers share one directive table, so a value means the same in
-//! either syntax. [`LimiterConfig::to_pacerd`] and the `Serialize`
+//! either syntax. The serde form also takes two things pacerd.conf cannot
+//! say:
+//!
+//! - **Rates in [`RateSpec`] syntax.** `per_ip_conn_rate`,
+//!   `per_ip_bandwidth` and `bandwidth` take fractional counts and periods
+//!   up to days with a burst (`"0.5/s"`, `"90/min"`, `"2.5/10s burst 5"`,
+//!   `"10/day burst 10"`) as well as pacerd's text. pacerd's reading is
+//!   tried first, so every pacerd rate means what it always did.
+//! - **`per_ip_conn_quota`**, a [`ConnQuota`]: at most N new connections
+//!   per client in any window of an hour to 366 days, such as
+//!   `"10000/day"`, counted on a sliding [`crate::Window`] as
+//!   [`RateSpec`] quotas are.
+//!
+//! A config using either is valid, and serializes and reads back equal,
+//! but [`LimiterConfig::to_pacerd`] refuses it, naming the field. [`LimiterConfig::to_pacerd`] and the `Serialize`
 //! implementation write a config back out, and the result reads back into
 //! an equal config.
 
@@ -34,6 +48,7 @@ use serde::ser::{self, Serializer};
 use serde::{Deserialize, Serialize};
 
 use crate::gcra::Rate;
+use crate::rate::{Plan, RateSpec};
 use crate::table::FullPolicy;
 
 /// The most listeners one config may define.
@@ -100,6 +115,71 @@ pub struct MinRate {
     pub window: Duration,
 }
 
+/// At most `limit` new connections per client in any `window`: the
+/// serde form's `per_ip_conn_quota`, written like `"10000/day"` or
+/// `"500/6h"`. The window is a whole number of seconds from one hour to
+/// 366 days, and the limit is 1 to 2^50. A fractional count takes the
+/// shortest whole window, as [`RateSpec`] quotas do: `"1.5/h"` is 3 in
+/// two hours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConnQuota {
+    pub limit: u64,
+    pub window: Duration,
+}
+
+impl ConnQuota {
+    /// Reads a quota from [`RateSpec`] text. A rate that is a token
+    /// bucket (a period under an hour, or a burst) is refused.
+    pub fn parse(text: &str) -> Result<ConnQuota, String> {
+        let spec = RateSpec::parse(text).map_err(|e| e.to_string())?;
+        match spec.plan() {
+            Plan::Quota { limit, window_ns } => Ok(ConnQuota {
+                limit,
+                window: Duration::from_nanos(window_ns),
+            }),
+            Plan::Bucket(_) => Err(format!(
+                "\"{}\" is a rate, not a quota: a quota has a period of an hour or more and no burst, like 10000/day; set a rate as per_ip_conn_rate",
+                spec
+            )),
+        }
+    }
+
+    /// The quota's text, such as `10000/day` or `3/2h`, or why it has
+    /// none: a limit outside 1 to 2^50, or a window that is not a whole
+    /// number of seconds from an hour to 366 days.
+    pub fn to_text(&self) -> Result<String, String> {
+        let ns = self.window.as_nanos();
+        let limit_ok = (1..=MAX_SIZE).contains(&self.limit);
+        let window_ok = ns.is_multiple_of(u128::from(SEC))
+            && (u128::from(crate::rate::QUOTA_MIN_PERIOD_NS)
+                ..=u128::from(crate::rate::MAX_PERIOD_NS))
+                .contains(&ns);
+        if !limit_ok || !window_ok {
+            return Err(format!(
+                "{} in {:?} is not a quota: the limit must be 1 to 2^50 and the window a whole number of seconds from 1h to 366 days",
+                self.limit, self.window
+            ));
+        }
+        Ok(format!("{}/{}", self.limit, period_text(ns as u64)))
+    }
+}
+
+/// A period of whole seconds in [`RateSpec`] syntax, in the largest unit
+/// that divides it: `day`, `2h`, `90min`, `7s`.
+pub(crate) fn period_text(ns: u64) -> String {
+    let secs = ns / SEC;
+    let (n, unit) = [(86_400, "day"), (3_600, "h"), (60, "min"), (1, "s")]
+        .into_iter()
+        .find(|&(u, _)| secs.is_multiple_of(u))
+        .map(|(u, name)| (secs / u, name))
+        .expect("1 divides everything");
+    if n == 1 {
+        unit.to_owned()
+    } else {
+        format!("{n}{unit}")
+    }
+}
+
 /// One L4 listener and its limits. [`ListenerConfig::new`] gives pacerd's
 /// defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +205,9 @@ pub struct ListenerConfig {
     pub per_ip_bandwidth: Option<Rate>,
     /// Bytes per second across the listener.
     pub bandwidth: Option<Rate>,
+    /// New connections per client address in a long window. Only the
+    /// serde form can set it; pacerd has no quotas.
+    pub per_ip_conn_quota: Option<ConnQuota>,
     /// Client addresses tracked at once.
     pub table_size: u32,
     pub table_full: FullPolicy,
@@ -148,6 +231,7 @@ impl ListenerConfig {
             per_ip_conn_rate: None,
             per_ip_bandwidth: None,
             bandwidth: None,
+            per_ip_conn_quota: None,
             table_size: 16_384,
             table_full: FullPolicy::Deny,
         }
@@ -208,12 +292,16 @@ impl Lines {
     /// Records that `directive` was set on `line`. `directive` must be one
     /// of the directive names; others are ignored.
     pub fn set(&mut self, directive: &str, line: usize) {
-        let Some((_, d)) = directive_named(directive) else {
-            return;
+        let name = match directive_named(directive) {
+            Some((_, d)) => d.name,
+            None => match SERDE_ONLY.iter().find(|&&n| n == directive) {
+                Some(n) => n,
+                None => return,
+            },
         };
-        match self.lines.iter_mut().find(|(n, _)| *n == d.name) {
+        match self.lines.iter_mut().find(|(n, _)| *n == name) {
             Some(slot) => slot.1 = line,
-            None => self.lines.push((d.name, line)),
+            None => self.lines.push((name, line)),
         }
     }
 
@@ -263,6 +351,10 @@ pub struct SourceMap {
     pub top: Lines,
     pub listeners: Vec<ListenerLines>,
 }
+
+/// Listener fields that only the serde form has. [`Lines`] records them
+/// as it records directives.
+pub const SERDE_ONLY: [&str; 1] = ["per_ip_conn_quota"];
 
 /// The names of every directive, top-level ones first, in config.c's
 /// order.
@@ -936,17 +1028,34 @@ fn fmt_duration(field: &str, d: Duration) -> Result<String, String> {
     Ok(format!("{}ms", ns / u128::from(MS)))
 }
 
-fn fmt_rate(field: &str, r: &Rate) -> Result<String, String> {
-    let unit = match r.period_ns {
-        SEC => "s",
-        p if p == 60 * SEC => "m",
-        p if p == 3600 * SEC => "h",
-        _ => {
+/// Whether pacerd.conf can hold the rate: per second, minute or hour.
+fn pacerd_period(r: &Rate) -> Option<&'static str> {
+    match r.period_ns {
+        SEC => Some("s"),
+        p if p == 60 * SEC => Some("m"),
+        p if p == 3600 * SEC => Some("h"),
+        _ => None,
+    }
+}
+
+/// The rate as the serde form writes it: pacerd's text when pacerd can
+/// hold it, else [`RateSpec`] text with the burst written out, such as
+/// `5/2s burst 3` or `10/day burst 10`, which reads back to an equal
+/// [`Rate`]. Fails for a period that is not a whole number of seconds.
+pub fn rate_text(r: &Rate) -> Result<String, String> {
+    let Some(unit) = pacerd_period(r) else {
+        if r.period_ns == 0 || !r.period_ns.is_multiple_of(SEC) {
             return Err(format!(
-                "{field}: a period of {}ns is not a second, minute or hour",
+                "a period of {}ns is not a whole number of seconds",
                 r.period_ns
             ));
         }
+        return Ok(format!(
+            "{}/{} burst {}",
+            r.tokens,
+            period_text(r.period_ns),
+            fmt_size(r.burst)
+        ));
     };
     let mut s = format!("{}/{unit}", fmt_size(r.tokens));
     if r.burst != r.tokens {
@@ -954,6 +1063,48 @@ fn fmt_rate(field: &str, r: &Rate) -> Result<String, String> {
         s.push_str(&fmt_size(r.burst));
     }
     Ok(s)
+}
+
+fn fmt_rate(field: &str, r: &Rate) -> Result<String, String> {
+    rate_text(r).map_err(|e| format!("{field}: {e}"))
+}
+
+/// A rate in the serde form's [`RateSpec`] syntax, for the text pacerd's
+/// reader refused. The count over the period is kept as written, in
+/// lowest terms (`2.5/10s` is 5 per 20 s), so the rate reads back from
+/// [`rate_text`] equal. A quota is refused: these fields are token
+/// buckets.
+fn spec_rate(field: &str, text: &str) -> Result<Rate, String> {
+    let at = |m: String| format!("{field}: {m}");
+    let spec = RateSpec::parse(text).map_err(|e| at(e.to_string()))?;
+    if let Plan::Quota { .. } = spec.plan() {
+        let quota = if field == "per_ip_conn_rate" {
+            "set it as per_ip_conn_quota, or "
+        } else {
+            ""
+        };
+        return Err(at(format!(
+            "\"{spec}\" is a quota (a period of an hour or more with no burst), not a rate; {quota}give it a burst to make it a token bucket"
+        )));
+    }
+    let (num, den) = spec.count();
+    let g = {
+        let (mut a, mut b) = (num, den);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let tokens = u64::try_from(num / g).ok();
+    let period = u64::try_from(u128::from(spec.period_ns()) * (den / g)).ok();
+    let (Some(tokens), Some(period)) = (tokens, period) else {
+        return Err(at(format!(
+            "\"{spec}\" is too precise to hold exactly; use fewer decimal places"
+        )));
+    };
+    // The same interval and burst as the plan's rate, whose ticks
+    // RateSpec checked.
+    Ok(Rate::new(tokens, period, spec.burst()))
 }
 
 /// A value as either reader takes it: an integer or pacerd's text.
@@ -1056,6 +1207,8 @@ struct RawListener {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bandwidth: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    per_ip_conn_quota: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     table_size: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     table_full: Option<Value>,
@@ -1137,7 +1290,25 @@ impl TryFrom<RawConfig> for LimiterConfig {
             let mut p = open_listener(&cfg.listeners, name.as_bytes())
                 .map_err(|m| format!("listeners[{i}]: {m}"))?;
             for (field, v) in rl.entries() {
-                apply_words(Target::Listener(&mut p), field, &v.words()).map_err(at)?;
+                let pacerd = apply_words(Target::Listener(&mut p), field, &v.words());
+                let (Err(e), Value::Text(text)) = (&pacerd, &v) else {
+                    pacerd.map_err(at)?;
+                    continue;
+                };
+                // A rate pacerd refused may still be one in RateSpec
+                // syntax, and then its refusal is the one to report.
+                let slot = match field {
+                    "per_ip_conn_rate" => &mut p.conf.per_ip_conn_rate,
+                    "per_ip_bandwidth" => &mut p.conf.per_ip_bandwidth,
+                    "bandwidth" => &mut p.conf.bandwidth,
+                    _ => return Err(at(e.clone())),
+                };
+                *slot = Some(spec_rate(field, text).map_err(at)?);
+            }
+            if let Some(text) = &rl.per_ip_conn_quota {
+                p.conf.per_ip_conn_quota = Some(
+                    ConnQuota::parse(text).map_err(|m| at(format!("per_ip_conn_quota: {m}")))?,
+                );
             }
             let l =
                 close_listener(&cfg.listeners, p).map_err(|m| format!("listeners[{i}]: {m}"))?;
@@ -1148,8 +1319,10 @@ impl TryFrom<RawConfig> for LimiterConfig {
 }
 
 impl LimiterConfig {
-    /// The config as serde values. The admin socket is left to the caller,
-    /// because pacerd accepts paths that are not UTF-8.
+    /// The config as serde values, leaving out each value that equals
+    /// pacerd's default so that a written config says only what it
+    /// changes. The admin socket is left to the caller, because pacerd
+    /// accepts paths that are not UTF-8.
     fn to_raw(&self) -> Result<RawConfig, String> {
         let text = |s: String| Some(Value::Text(s));
         let mut raw = RawConfig {
@@ -1197,6 +1370,11 @@ impl LimiterConfig {
                 per_ip_conn_rate: rate("per_ip_conn_rate", &l.per_ip_conn_rate)?,
                 per_ip_bandwidth: rate("per_ip_bandwidth", &l.per_ip_bandwidth)?,
                 bandwidth: rate("bandwidth", &l.bandwidth)?,
+                per_ip_conn_quota: l
+                    .per_ip_conn_quota
+                    .map(|q| q.to_text())
+                    .transpose()
+                    .map_err(|m| at(format!("per_ip_conn_quota: {m}")))?,
                 table_size: Some(Value::Int(l.table_size.into())),
                 table_full: text(
                     match l.table_full {
@@ -1206,6 +1384,38 @@ impl LimiterConfig {
                     .to_owned(),
                 ),
             });
+            let rl = raw.listeners.last_mut().expect("just pushed");
+            let d = ListenerConfig::new(&l.name, l.listen, l.upstream);
+            let skip = |v: &mut Option<Value>, default: bool| {
+                if default {
+                    *v = None;
+                }
+            };
+            skip(&mut rl.max_conns, l.max_conns == d.max_conns);
+            skip(&mut rl.buffer, l.buffer_size == d.buffer_size);
+            skip(
+                &mut rl.connect_timeout,
+                l.connect_timeout == d.connect_timeout,
+            );
+            skip(&mut rl.idle_timeout, l.idle_timeout == d.idle_timeout);
+            skip(&mut rl.min_rate, l.min_rate == d.min_rate);
+            skip(
+                &mut rl.per_ip_max_conns,
+                l.per_ip_max_conns == d.per_ip_max_conns,
+            );
+            skip(&mut rl.ipv6_prefix, l.ipv6_prefix == d.ipv6_prefix);
+            skip(&mut rl.table_size, l.table_size == d.table_size);
+            skip(&mut rl.table_full, l.table_full == d.table_full);
+        }
+        let d = LimiterConfig::default();
+        if self.workers == d.workers {
+            raw.workers = None;
+        }
+        if self.drain_timeout == d.drain_timeout {
+            raw.drain_timeout = None;
+        }
+        if self.log_level == d.log_level {
+            raw.log_level = None;
         }
         Ok(raw)
     }
@@ -1227,10 +1437,31 @@ impl LimiterConfig {
 
     /// Writes the config as a pacerd.conf that [`parse_pacerd`] reads back
     /// into an equal config. Fails if the config is invalid or cannot be
-    /// written in that syntax (an admin path with spaces, tabs, `#` or a
-    /// newline in it).
+    /// written in that syntax: an admin path with spaces, tabs, `#` or a
+    /// newline in it, a rate that is not per second, minute or hour, or a
+    /// `per_ip_conn_quota`.
     pub fn to_pacerd(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
+        for (i, l) in self.listeners.iter().enumerate() {
+            let rates = [
+                ("per_ip_conn_rate", &l.per_ip_conn_rate),
+                ("per_ip_bandwidth", &l.per_ip_bandwidth),
+                ("bandwidth", &l.bandwidth),
+            ];
+            for (field, r) in rates {
+                if let Some(r) = r.as_ref().filter(|r| pacerd_period(r).is_none()) {
+                    return Err(format!(
+                        "listeners[{i}].{field}: {} cannot be written in pacerd syntax, whose rates are per second, minute or hour",
+                        rate_text(r)?
+                    ));
+                }
+            }
+            if l.per_ip_conn_quota.is_some() {
+                return Err(format!(
+                    "listeners[{i}].per_ip_conn_quota: pacerd has no quotas, so it cannot be written in pacerd syntax"
+                ));
+            }
+        }
         let raw = self.to_raw()?;
         let mut out = Vec::new();
         let line = |out: &mut Vec<u8>, indent: &str, name: &str, words: &[u8]| {
