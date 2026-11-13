@@ -92,6 +92,10 @@ criterion.workspace = true
 name = "hit_path"
 harness = false
 
+[[bench]]
+name = "layer_overhead"
+harness = false
+
 [lints]
 workspace = true
 

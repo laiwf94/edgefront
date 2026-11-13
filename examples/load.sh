@@ -3,6 +3,10 @@
 # driven by oha (https://github.com/hatoo/oha). Prints throughput and
 # latency for cache hits, for misses, and for a burst of concurrent misses
 # on one slow URL.
+#
+# CACHET_BIN runs another build of the node, such as the edgefront binary
+# or the cachet 0.1 reference that `make difftest-cache` builds; it is
+# given the same config and flags.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,6 +38,7 @@ wait_for() {
 }
 
 cargo build --release --quiet --bin cachet --example origin
+CACHET_BIN=${CACHET_BIN:-target/release/cachet}
 
 cat >"$WORK/cachet.toml" <<TOML
 node_id = "edge-load"
@@ -51,7 +56,7 @@ ORIGIN_PID=$!
 wait_for "http://$ORIGIN/healthz"
 # Per-request logs go through the JSON formatter; warn keeps them out of
 # the measurement, the same as a production edge that samples its logs.
-CACHET_LOG=warn target/release/cachet --config "$WORK/cachet.toml" &
+CACHET_LOG=warn "$CACHET_BIN" --config "$WORK/cachet.toml" &
 CACHET_PID=$!
 wait_for "http://$ADMIN/healthz"
 
@@ -66,7 +71,7 @@ print("  requests/s %10.0f   p50 %6.3f ms   p99 %6.3f ms   p99.9 %6.3f ms   stat
 '
 }
 
-echo "machine: $(uname -sm), $(sysctl -n hw.ncpu 2>/dev/null || nproc) cpus"
+echo "machine: $(uname -sm), $(sysctl -n hw.ncpu 2>/dev/null || nproc) cpus, node $CACHET_BIN"
 echo
 echo "origin directly, 4 KiB body ($DURATION, $CONNECTIONS connections)"
 oha -z "$DURATION" -c "$CONNECTIONS" --no-tui --output-format json "http://$ORIGIN/static/a" | summary
