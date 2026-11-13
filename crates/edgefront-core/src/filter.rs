@@ -27,6 +27,12 @@
 //! A response the request phase answered with is final: it is not passed
 //! to the deliver phase, because the filter that wrote it wrote all of it.
 //!
+//! The request phase can also answer at once and still have the request
+//! sent upstream in the background ([`Decision::Refresh`]), which is how
+//! a cache serves a stale copy while it refreshes it. The background
+//! exchange goes through the same two later phases, and the response its
+//! deliver phase returns is dropped.
+//!
 //! [`run`] drives the phases around an upstream call. A server with steps
 //! of its own between the phases can call them directly instead, keeping
 //! the same order.
@@ -61,6 +67,10 @@ pub enum Decision {
     Forward(Option<Box<dyn Exchange>>),
     /// Answer with this response without going upstream. It is final.
     Respond(Response<Body>),
+    /// Answer with this response now, and send the request upstream in
+    /// the background for the exchange, whose delivered response is
+    /// dropped.
+    Refresh(Response<Body>, Box<dyn Exchange>),
 }
 
 impl std::fmt::Debug for Decision {
@@ -71,6 +81,7 @@ impl std::fmt::Debug for Decision {
                 .field(&x.as_ref().map(|_| "Exchange"))
                 .finish(),
             Decision::Respond(r) => f.debug_tuple("Respond").field(&r.status()).finish(),
+            Decision::Refresh(r, _) => f.debug_tuple("Refresh").field(&r.status()).finish(),
         }
     }
 }
@@ -159,15 +170,18 @@ impl RouteFilters {
 /// upstream call and returns the response with where it came from: the
 /// upstream's, or one the caller wrote because there was no usable
 /// upstream response. Without a filter it is the response `send` returns.
+/// A [`Decision::Refresh`] runs `send` on a task of its own, so this must
+/// be called inside a tokio runtime.
 pub async fn run<B, S, Fut>(
     filter: Option<&dyn Filter>,
     route: usize,
-    mut req: Request<B>,
+    req: Request<B>,
     send: S,
 ) -> Response<Body>
 where
-    S: FnOnce(Request<B>) -> Fut,
-    Fut: Future<Output = (Response<Body>, Delivery)>,
+    B: Send + 'static,
+    S: FnOnce(Request<B>) -> Fut + Send + 'static,
+    Fut: Future<Output = (Response<Body>, Delivery)> + Send + 'static,
 {
     let Some(filter) = filter else {
         return send(req).await.0;
@@ -181,21 +195,32 @@ where
             headers: &mut parts.headers,
         })
         .await;
-    let mut exchange = match decision {
-        Decision::Respond(resp) => return resp,
-        Decision::Forward(x) => x,
-    };
-    req = Request::from_parts(parts, body);
-    let (resp, from) = match (send(req).await, &mut exchange) {
-        ((resp, Delivery::Upstream), Some(x)) => {
-            (x.upstream_response(resp).await, Delivery::Upstream)
+    let req = Request::from_parts(parts, body);
+    match decision {
+        Decision::Respond(resp) => resp,
+        Decision::Forward(exchange) => complete(send(req).await, exchange).await,
+        Decision::Refresh(resp, exchange) => {
+            tokio::spawn(async move {
+                drop(complete(send(req).await, Some(exchange)).await);
+            });
+            resp
         }
-        (sent, _) => sent,
-    };
-    match exchange {
-        Some(x) => x.deliver(resp, from),
-        None => resp,
     }
+}
+
+/// The later two phases for what the upstream call returned.
+async fn complete(
+    sent: (Response<Body>, Delivery),
+    exchange: Option<Box<dyn Exchange>>,
+) -> Response<Body> {
+    let Some(mut x) = exchange else {
+        return sent.0;
+    };
+    let (resp, from) = match sent {
+        (resp, Delivery::Upstream) => (x.upstream_response(resp).await, Delivery::Upstream),
+        generated => generated,
+    };
+    x.deliver(resp, from)
 }
 
 #[cfg(test)]
@@ -230,6 +255,12 @@ mod tests {
                 match req.uri.path() {
                     "/hit" => Decision::Respond(text(StatusCode::OK, "from filter\n")),
                     "/plain" => Decision::Forward(None),
+                    "/refresh" => Decision::Refresh(
+                        text(StatusCode::OK, "stale\n"),
+                        Box::new(RecordingExchange {
+                            log: self.log.clone(),
+                        }),
+                    ),
                     _ => {
                         req.headers
                             .insert("x-filtered", HeaderValue::from_static("1"));
@@ -318,13 +349,17 @@ mod tests {
     #[tokio::test]
     async fn a_response_from_the_request_phase_is_final() {
         let f = Recorder::default();
-        let called = std::sync::atomic::AtomicBool::new(false);
-        let resp = run(Some(&f), 0, request("/hit"), |r| {
-            called.store(true, std::sync::atomic::Ordering::Relaxed);
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c = called.clone();
+        let resp = run(Some(&f), 0, request("/hit"), move |r| {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
             upstream(r)
         })
         .await;
-        assert!(!called.into_inner(), "upstream was not called");
+        assert!(
+            !called.load(std::sync::atomic::Ordering::Relaxed),
+            "upstream was not called"
+        );
         assert_eq!(body(resp).await, "from filter\n");
         assert_eq!(*f.log.lock().unwrap(), ["request 0 GET /hit"]);
     }
@@ -339,6 +374,39 @@ mod tests {
             *f.log.lock().unwrap(),
             ["request 1 GET /slow", "deliver Generated(\"timeout\")"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_answers_at_once_and_runs_the_exchange_in_the_background() {
+        let f = Recorder::default();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let resp = run(Some(&f), 2, request("/refresh"), |r| async move {
+            // The client has its answer before the upstream is reached.
+            rx.await.unwrap();
+            upstream(r).await
+        })
+        .await;
+        assert_eq!(body(resp).await, "stale\n");
+        assert_eq!(*f.log.lock().unwrap(), ["request 2 GET /refresh"]);
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while f.log.lock().unwrap().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *f.log.lock().unwrap(),
+            ["request 2 GET /refresh", "upstream 200", "deliver Upstream"]
+        );
+        let d = Decision::Refresh(
+            text(StatusCode::OK, "x"),
+            Box::new(RecordingExchange {
+                log: Arc::default(),
+            }),
+        );
+        assert_eq!(format!("{d:?}"), "Refresh(200)");
     }
 
     #[tokio::test]

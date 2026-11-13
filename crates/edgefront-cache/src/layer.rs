@@ -23,10 +23,20 @@
 //!   copy when `stale-if-error` allows it. Every response gets
 //!   `Cache-Status`.
 //!
-//! The layer does not collapse concurrent misses or refresh in the
-//! background yet: a copy inside its `stale-while-revalidate` window is
-//! revalidated before use, which RFC 5861 allows. `Via`, the request ID
-//! and the forwarding headers belong to the proxy.
+//! Concurrent fills of one URL collapse into one upstream request. The
+//! first request leads: it goes upstream and publishes what came back.
+//! The others wait for that in their request phase and answer from it
+//! (`collapsed` in `Cache-Status`), share its failure, or go upstream on
+//! their own when the result was only for the leader: a response that
+//! could not be stored, or a variant their own request would not select.
+//! The leader's fetch is part of its request, so a leader whose client
+//! goes away releases its followers and one of them leads instead.
+//!
+//! A copy inside its `stale-while-revalidate` window is served at once
+//! while the layer refreshes it upstream in the background
+//! ([`Decision::Refresh`]), one refresh per URL at a time.
+//!
+//! `Via`, the request ID and the forwarding headers belong to the proxy.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,6 +54,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 
 use crate::cache_control::{CacheControl, is_tchar};
+use crate::collapse::{Collapser, Flight, Lead};
 use crate::config::{RoutePolicies, RoutePolicy};
 use crate::headers::strip_hop_by_hop;
 use crate::object::{CachedObject, Key, SURROGATE_KEY, primary_key};
@@ -116,6 +127,27 @@ struct Shared {
     clock: Arc<dyn Clock>,
     name: String,
     body_timeout: Duration,
+    collapser: Arc<Collapser<Fetched>>,
+}
+
+/// What a leading fill got from upstream, as its followers see it.
+#[derive(Clone)]
+enum Fetched {
+    /// A stored response every follower whose request selects it may use.
+    Object {
+        obj: Arc<CachedObject>,
+        stored: bool,
+        /// Refreshed by a `304` rather than a full response.
+        revalidated: bool,
+    },
+    /// A response only the leader could use: not storable, or too large.
+    Single(StatusCode),
+    /// No usable upstream response.
+    Failed {
+        status: StatusCode,
+        message: &'static str,
+        detail: String,
+    },
 }
 
 impl CacheLayer {
@@ -137,6 +169,7 @@ impl CacheLayer {
                 clock,
                 name,
                 body_timeout: settings.body_timeout,
+                collapser: Arc::default(),
             }),
         })
     }
@@ -148,6 +181,11 @@ impl CacheLayer {
     /// The name `Cache-Status` uses.
     pub fn name(&self) -> &str {
         &self.shared.name
+    }
+
+    /// Fills and background refreshes running upstream now.
+    pub fn in_flight(&self) -> usize {
+        self.shared.collapser.in_flight()
     }
 
     /// The layer attached to every route that has a cache policy, and no
@@ -233,19 +271,84 @@ impl Shared {
                 req.headers.insert(name, value);
             }
         }
-        Decision::Forward(Some(Box::new(Fill {
-            shared: self.clone(),
-            policy: policy.clone(),
-            key,
-            client_headers,
-            req_cc,
-            stored,
-            epoch: self.cache.epoch(),
-            request_time: now,
-            fwd,
-            status: String::new(),
-            failure: None,
-        })))
+        let fill = |lead| {
+            Box::new(Fill {
+                shared: self.clone(),
+                policy: policy.clone(),
+                key: key.clone(),
+                client_headers: client_headers.clone(),
+                req_cc: req_cc.clone(),
+                stored: stored.clone(),
+                epoch: self.cache.epoch(),
+                request_time: now,
+                fwd,
+                status: String::new(),
+                failure: None,
+                lead,
+            })
+        };
+        if let Some((obj, Use::StaleWhileRevalidate)) = usable {
+            let Decision::Respond(resp) = self.hit(
+                obj,
+                method,
+                &client_headers,
+                "; detail=stale-while-revalidate",
+            ) else {
+                unreachable!("hit always responds");
+            };
+            return match self.collapser.lead_or_follow(key.clone()) {
+                Flight::Lead(lead) => Decision::Refresh(resp, fill(Some(lead))),
+                // A refresh or fill is already on its way.
+                Flight::Follow(_) => Decision::Respond(resp),
+            };
+        }
+        loop {
+            let follow = match self.collapser.lead_or_follow(key.clone()) {
+                Flight::Lead(lead) => return Decision::Forward(Some(fill(Some(lead)))),
+                Flight::Follow(follow) => follow,
+            };
+            // A leader that went away without a result: try again, and
+            // perhaps lead this time.
+            let Ok(fetched) = follow.wait().await else {
+                continue;
+            };
+            let follower = Follower {
+                shared: self,
+                client_headers: &client_headers,
+                req_cc: &req_cc,
+                stored: stored.as_ref(),
+                fwd,
+            };
+            return match follower.answer(fetched) {
+                Some(resp) => Decision::Respond(resp),
+                // Go upstream alone; nobody waits on this fetch.
+                None => Decision::Forward(Some(fill(None))),
+            };
+        }
+    }
+
+    /// The stored copy in place of an upstream failure, when
+    /// `stale-if-error` allows it.
+    fn stale_on_error(
+        &self,
+        stored: Option<&Arc<CachedObject>>,
+        req_cc: &CacheControl,
+        client_headers: &HeaderMap,
+        failure: &str,
+    ) -> Option<Response<Body>> {
+        let obj = stored?;
+        let now = self.clock.now();
+        if !policy::stale_if_error_allows(&obj.freshness, &obj.cc, req_cc, now) {
+            return None;
+        }
+        let mut resp = respond::from_cache(obj, &Method::GET, client_headers, now);
+        let status = format!(
+            "hit; ttl={}; fwd=stale; {failure}; detail=stale-if-error",
+            obj.freshness.ttl_secs(now)
+        );
+        resp.headers_mut()
+            .insert(CACHE_STATUS, self.status(&status));
+        Some(resp)
     }
 
     fn pass(self: &Arc<Self>, key: Key, req: &RequestHead<'_>, fwd: &'static str) -> Decision {
@@ -273,6 +376,72 @@ impl Shared {
             fill.epoch,
             fill.policy.max_variants,
         )
+    }
+}
+
+/// A request that waited for another one's fill.
+struct Follower<'a> {
+    shared: &'a Shared,
+    client_headers: &'a HeaderMap,
+    req_cc: &'a CacheControl,
+    stored: Option<&'a Arc<CachedObject>>,
+    fwd: &'static str,
+}
+
+impl Follower<'_> {
+    /// This request's answer from the leader's result, or `None` when it
+    /// has to go upstream itself.
+    fn answer(&self, fetched: Fetched) -> Option<Response<Body>> {
+        let failure = match &fetched {
+            Fetched::Failed { detail, .. } => Some(format!("detail-origin={detail}")),
+            Fetched::Object { obj, .. } if is_error_status(obj.status) => {
+                Some(format!("fwd-status={}", obj.status.as_u16()))
+            }
+            Fetched::Single(status) if is_error_status(*status) => {
+                Some(format!("fwd-status={}", status.as_u16()))
+            }
+            _ => None,
+        };
+        if let Some(failure) = failure
+            && let Some(stale) =
+                self.shared
+                    .stale_on_error(self.stored, self.req_cc, self.client_headers, &failure)
+        {
+            return Some(stale);
+        }
+        let fwd = self.fwd;
+        let (mut resp, status) = match fetched {
+            Fetched::Object {
+                obj,
+                stored,
+                revalidated,
+            } if obj.matches(self.client_headers) => {
+                let now = self.shared.clock.now();
+                let resp = respond::from_cache(&obj, &Method::GET, self.client_headers, now);
+                let fwd_status = if revalidated {
+                    304
+                } else {
+                    obj.status.as_u16()
+                };
+                let stored = if stored { "; stored" } else { "" };
+                let ttl = obj.freshness.ttl_secs(now);
+                let status =
+                    format!("{fwd}; fwd-status={fwd_status}{stored}; collapsed; ttl={ttl}");
+                (resp, status)
+            }
+            Fetched::Failed {
+                status,
+                message,
+                detail,
+            } => (
+                text(status, message),
+                format!("{fwd}; collapsed; detail={detail}"),
+            ),
+            Fetched::Object { .. } | Fetched::Single(_) => return None,
+        };
+        resp.headers_mut()
+            .insert(CACHE_STATUS, self.shared.status(&status));
+        Some(resp)
     }
 }
 
@@ -342,6 +511,8 @@ struct Fill {
     status: String,
     /// Why the upstream response counts as an error, if it does.
     failure: Option<String>,
+    /// The flight this fill leads, if followers wait on it.
+    lead: Option<Lead<Fetched>>,
 }
 
 impl Fill {
@@ -369,26 +540,16 @@ impl Fill {
         )
     }
 
-    /// The stored copy in place of an upstream failure, when
-    /// `stale-if-error` allows it.
-    fn stale_on_error(&self, failure: &str) -> Option<Response<Body>> {
-        let obj = self.stored.as_ref()?;
-        let now = self.shared.clock.now();
-        if !policy::stale_if_error_allows(&obj.freshness, &obj.cc, &self.req_cc, now) {
-            return None;
+    /// Hands the result to the requests waiting on this fill.
+    fn publish(&mut self, fetched: Fetched) {
+        if let Some(lead) = self.lead.take() {
+            lead.publish(fetched);
         }
-        let mut resp = self.serve(obj);
-        let status = format!(
-            "hit; ttl={}; fwd=stale; {failure}; detail=stale-if-error",
-            obj.freshness.ttl_secs(now)
-        );
-        resp.headers_mut()
-            .insert(CACHE_STATUS, self.shared.status(&status));
-        Some(resp)
     }
 
     /// A response that goes to the client as the upstream sent it.
     fn through(&mut self, mut parts: http::response::Parts, body: Body) -> Response<Body> {
+        self.publish(Fetched::Single(parts.status));
         parts.headers.remove(SURROGATE_KEY);
         self.status = format!("{}; fwd-status={}", self.fwd, parts.status.as_u16());
         Response::from_parts(parts, body)
@@ -404,6 +565,11 @@ impl Fill {
     ) -> Response<Body> {
         self.failure = Some(format!("detail-origin={detail}"));
         self.status = format!("{}; detail={detail}", self.fwd);
+        self.publish(Fetched::Failed {
+            status,
+            message,
+            detail: detail.to_owned(),
+        });
         text(status, message)
     }
 
@@ -444,7 +610,13 @@ impl Fill {
             if kept { "; stored" } else { "" },
             obj.freshness.ttl_secs(self.shared.clock.now())
         );
-        self.serve(&obj)
+        let resp = self.serve(&obj);
+        self.publish(Fetched::Object {
+            obj,
+            stored: kept,
+            revalidated: true,
+        });
+        resp
     }
 
     async fn fill(&mut self, resp: Response<Body>) -> Response<Body> {
@@ -530,7 +702,13 @@ impl Fill {
             if kept { "; stored" } else { "" },
             obj.freshness.ttl_secs(self.shared.clock.now())
         );
-        self.serve(&obj)
+        let resp = self.serve(&obj);
+        self.publish(Fetched::Object {
+            obj,
+            stored: kept,
+            revalidated: false,
+        });
+        resp
     }
 }
 
@@ -539,13 +717,34 @@ impl Exchange for Fill {
         Box::pin(self.fill(resp))
     }
 
-    fn deliver(self: Box<Self>, mut resp: Response<Body>, from: Delivery) -> Response<Body> {
+    fn deliver(mut self: Box<Self>, mut resp: Response<Body>, from: Delivery) -> Response<Body> {
         let failure = match from {
             Delivery::Upstream => self.failure.clone(),
-            Delivery::Generated(reason) => Some(format!("detail-origin={reason}")),
+            // A response the proxy wrote counts as a failure only when it
+            // is one of the upstream errors stale-if-error covers, not, say,
+            // a request it refused.
+            Delivery::Generated(reason) if is_error_status(resp.status()) => {
+                self.publish(Fetched::Failed {
+                    status: resp.status(),
+                    message: "upstream failed\n",
+                    detail: reason.to_owned(),
+                });
+                Some(format!("detail-origin={reason}"))
+            }
+            // Followers go upstream themselves rather than share an answer
+            // about this request alone.
+            Delivery::Generated(_) => {
+                self.lead = None;
+                None
+            }
         };
         if let Some(failure) = &failure
-            && let Some(stale) = self.stale_on_error(failure)
+            && let Some(stale) = self.shared.stale_on_error(
+                self.stored.as_ref(),
+                &self.req_cc,
+                &self.client_headers,
+                failure,
+            )
         {
             return stale;
         }

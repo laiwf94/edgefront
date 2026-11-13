@@ -39,6 +39,16 @@
 //!    after it the response is cut. An upstream that cannot be reached or
 //!    breaks before answering is `502 bad_gateway`.
 //!
+//! A route can carry a filter ([`edgefront_core::filter`], attached with
+//! [`Proxy::with_filters`]), such as the cache. Its request phase runs
+//! after routing and before `max_requests`, so an answer it gives, such as
+//! a cache hit, takes no place under the limit and never reaches an
+//! upstream. Its upstream response phase sees the head and body before
+//! the request ID is added, and its deliver phase sees every response,
+//! including the proxy's own errors, named by their steer code. A
+//! background refresh a filter asks for takes a place under
+//! `max_requests` and the cluster's `timeout` like any other request.
+//!
 //! Errors the proxy writes itself have steer's shape,
 //! `{"error":{"code":...,"message":...,"request_id":...}}`, and steer's
 //! headers. Each request is logged once, as steer's access log was.
@@ -60,6 +70,7 @@ use bytes::{Bytes, BytesMut};
 use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
+use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters};
 use edgefront_core::http1::{Client, ClientError, ClientLimits};
 use edgefront_core::listener::Handler;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
@@ -106,9 +117,12 @@ const HOP_BY_HOP: [&str; 9] = [
 /// The proxy for one configuration. It is a [`Handler`] for
 /// [`edgefront_core::listener::serve`].
 pub struct Proxy {
-    router: Router<usize>,
-    clusters: Vec<Cluster>,
+    /// Each route's index and its cluster's.
+    router: Router<(usize, usize)>,
+    clusters: Vec<Arc<Cluster>>,
     trusted: Vec<IpPrefix>,
+    /// The layers on each route, such as the cache.
+    filters: RouteFilters,
 }
 
 struct Cluster {
@@ -210,10 +224,10 @@ impl Proxy {
     /// from. A manual clock and a seeded generator make the picks
     /// repeatable, which is how they are diffed against steer.
     pub fn with_sources(cfg: &Config, clock: Arc<dyn Clock>, rng: Arc<dyn Rng>) -> Self {
-        let clusters: Vec<Cluster> = cfg
+        let clusters: Vec<Arc<Cluster>> = cfg
             .clusters
             .iter()
-            .map(|c| Cluster::new(c, &clock, &rng))
+            .map(|c| Arc::new(Cluster::new(c, &clock, &rng)))
             .collect();
         let index = |name: &str| {
             clusters
@@ -221,16 +235,28 @@ impl Proxy {
                 .position(|c| c.name == name)
                 .expect("validation ties every route to a cluster")
         };
-        let router = Router::new(
-            cfg.routes
-                .iter()
-                .map(|r| (r.host.as_str(), r.path_prefix.as_str(), index(&r.cluster))),
-        );
+        let router = Router::new(cfg.routes.iter().enumerate().map(|(ri, r)| {
+            (
+                r.host.as_str(),
+                r.path_prefix.as_str(),
+                (ri, index(&r.cluster)),
+            )
+        }));
         Proxy {
             router,
             clusters,
             trusted: cfg.trusted_proxies.clone(),
+            filters: RouteFilters::new(cfg.routes.len()),
         }
+    }
+
+    /// Runs requests on each route through that route's filter in
+    /// `filters`, indexed as the configuration's routes are. Routes with
+    /// no filter are proxied as before, at the cost of one branch.
+    #[must_use]
+    pub fn with_filters(mut self, filters: RouteFilters) -> Self {
+        self.filters = filters;
+        self
     }
 
     /// The live endpoints of the cluster named `name`, in configuration
@@ -254,7 +280,7 @@ impl Proxy {
     /// Answers one request from `peer`.
     pub async fn handle(&self, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         let started = Instant::now();
-        let (parts, incoming) = req.into_parts();
+        let (mut parts, incoming) = req.into_parts();
 
         if parts.method == Method::CONNECT {
             let id = reqid::from_request(&parts.headers);
@@ -293,7 +319,7 @@ impl Proxy {
 
         let id = reqid::from_request(&parts.headers);
         let access = Access::new(&parts, &id, peer, &self.trusted, target.clean_path());
-        let Some(&ci) = self.router.route(&host, target.clean_path()) else {
+        let Some(&(ri, ci)) = self.router.route(&host, target.clean_path()) else {
             let resp = error(
                 &id,
                 StatusCode::NOT_FOUND,
@@ -305,6 +331,46 @@ impl Proxy {
         };
         let cluster = &self.clusters[ci];
         let access = access.cluster(&cluster.name);
+        // The request phase runs before the cluster's `max_requests`, so
+        // an answer from a filter, such as a cache hit, takes no place.
+        let mut exchange = None;
+        if let Some(filter) = self.filters.get(ri) {
+            let decision = filter
+                .request(RequestHead {
+                    route: ri,
+                    method: &parts.method,
+                    uri: &parts.uri,
+                    headers: &mut parts.headers,
+                })
+                .await;
+            let resp = match decision {
+                Decision::Forward(x) => {
+                    exchange = x;
+                    None
+                }
+                Decision::Respond(resp) => Some(resp),
+                Decision::Refresh(resp, x) => {
+                    let mut headers = parts.headers.clone();
+                    self.upstream_headers(&mut headers, &parts.uri, access.peer, &host, &id);
+                    let refresh = Refresh {
+                        cluster: Arc::clone(cluster),
+                        method: parts.method.clone(),
+                        key: cluster.key(&parts.headers),
+                        headers,
+                        target: target.upstream_target().into_owned(),
+                        id: id.clone(),
+                        exchange: x,
+                    };
+                    tokio::spawn(refresh.run());
+                    Some(resp)
+                }
+            };
+            if let Some(mut resp) = resp {
+                resp.headers_mut().insert(reqid::HEADER, id);
+                log(&access, started, &resp, "");
+                return resp;
+            }
+        }
         let Some(permit) = cluster.acquire() else {
             let mut resp = error(
                 &id,
@@ -316,101 +382,267 @@ impl Proxy {
                 OVERFLOW_HEADER,
                 HeaderValue::from_static("cluster_max_requests"),
             );
+            let resp = deliver_generated(exchange, resp, "overloaded", &id);
             log(&access, started, &resp, "overflow");
             return resp;
         };
         let key = cluster.key(&parts.headers);
         let mut headers = parts.headers;
         let length = request_length(&headers, &incoming);
-        strip_hop_by_hop(&mut headers, true);
-        forwarded::set_forwarded(
-            &mut headers,
-            access.peer,
-            false,
-            host.as_bytes(),
-            &self.trusted,
-        );
-        headers.insert(reqid::HEADER, id.clone());
-        if parts.uri.authority().is_some() {
-            // Go sends `Request.Host`, which an absolute-form target sets.
-            headers.insert(
-                header::HOST,
-                HeaderValue::from_str(&host).expect("an authority"),
-            );
-        }
+        self.upstream_headers(&mut headers, &parts.uri, access.peer, &host, &id);
 
         let deadline = cluster.timeout.map(|t| started + t);
         let mut picked = None;
-        let exchange = async {
+        let upstream_target = target.upstream_target();
+        let exchange_fut = async {
             // steer reads a body it may replay before it picks.
             let Ok(body) = upstream_body(incoming, length, cluster.replay_limit).await else {
                 return Err(Failure::ClientBody);
             };
-            let Some(i) = cluster.balancer.pick(key, &[]) else {
-                return Err(Failure::NoHealthyUpstream);
-            };
-            picked = Some(i);
-            let endpoint = &cluster.balancer.endpoints()[i];
-            let in_flight = endpoint.state.track();
-            set_framing(&mut headers, &parts.method, length);
-            let uri = format!(
-                "http://{}{}",
-                endpoint.address,
-                String::from_utf8_lossy(&target.upstream_target())
-            );
-            let mut out = Request::new(body);
-            *out.method_mut() = parts.method.clone();
-            *out.uri_mut() = Uri::try_from(uri).map_err(|_| Failure::Proxy)?;
-            *out.version_mut() = Version::HTTP_11;
-            *out.headers_mut() = headers;
-            let began = cluster.clock.now();
-            let result = cluster.client.send(out).await;
-            // A cancelled exchange (the cluster timeout) observes nothing,
-            // as steer skipped requests whose context ended.
-            let now = cluster.clock.now();
-            let elapsed = now.saturating_duration_since(began);
-            let sample = match &result {
-                Ok(r) if !r.status().is_server_error() => elapsed,
-                _ => elapsed.max(FAILURE_PENALTY),
-            };
-            endpoint.state.observe_latency(sample, now);
-            match result {
-                Ok(resp) => Ok((resp, in_flight)),
-                Err(e) => Err(Failure::Upstream(e)),
-            }
+            cluster
+                .forward(
+                    &parts.method,
+                    headers,
+                    &upstream_target,
+                    body,
+                    length,
+                    key,
+                    &mut picked,
+                )
+                .await
         };
         let result = match deadline {
-            Some(at) => tokio::time::timeout_at(at, exchange)
+            Some(at) => tokio::time::timeout_at(at, exchange_fut)
                 .await
                 .unwrap_or(Err(Failure::Timeout)),
-            None => exchange.await,
+            None => exchange_fut.await,
         };
         let access = match picked {
             Some(i) => access.endpoint(&cluster.balancer.endpoints()[i].address),
             None => access,
         };
 
-        let resp = match result {
+        let failure = match result {
             Ok((resp, in_flight)) => {
-                let (mut head, incoming) = resp.into_parts();
-                strip_hop_by_hop(&mut head.headers, false);
-                // Go writes the standard reason phrase whatever the
-                // upstream sent.
-                head.extensions.remove::<hyper::ext::ReasonPhrase>();
-                head.headers.insert(reqid::HEADER, id);
-                let body = Proxied {
-                    inner: incoming,
-                    deadline: deadline.map(|at| Box::pin(tokio::time::sleep_until(at))),
-                    _permit: permit,
-                    _in_flight: in_flight,
-                };
-                let resp = Response::from_parts(head, BodyExt::boxed(body));
+                let mut resp = proxied(resp, deadline, permit, in_flight);
+                if let Some(mut x) = exchange {
+                    resp = x.upstream_response(resp).await;
+                    resp = x.deliver(resp, Delivery::Upstream);
+                }
+                resp.headers_mut().insert(reqid::HEADER, id);
                 log(&access, started, &resp, "");
                 return resp;
             }
             Err(f) => f,
         };
-        let (status, code, message, failure) = match resp {
+        let (status, code, message, logged) = failure.describe();
+        let resp = error(&id, status, code, message);
+        let resp = deliver_generated(exchange, resp, code, &id);
+        log(&access, started, &resp, logged);
+        resp
+    }
+
+    /// Turns the client's request headers into the upstream's: hop-by-hop
+    /// headers go, the forwarding headers are rewritten, and the request ID
+    /// and, for an absolute-form target, the `Host` are set.
+    fn upstream_headers(
+        &self,
+        headers: &mut HeaderMap,
+        uri: &Uri,
+        peer: Option<std::net::IpAddr>,
+        host: &str,
+        id: &HeaderValue,
+    ) {
+        strip_hop_by_hop(headers, true);
+        forwarded::set_forwarded(headers, peer, false, host.as_bytes(), &self.trusted);
+        headers.insert(reqid::HEADER, id.clone());
+        if uri.authority().is_some() {
+            // Go sends `Request.Host`, which an absolute-form target sets.
+            headers.insert(
+                header::HOST,
+                HeaderValue::from_str(host).expect("an authority"),
+            );
+        }
+    }
+}
+
+impl Cluster {
+    /// Picks an endpoint and sends it the request, recording the pick in
+    /// `picked` as soon as it is made, and the time to the response head
+    /// on the endpoint.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward(
+        &self,
+        method: &Method,
+        mut headers: HeaderMap,
+        target: &[u8],
+        body: Body,
+        length: Option<u64>,
+        key: Option<u64>,
+        picked: &mut Option<usize>,
+    ) -> Result<(Response<Incoming>, InFlight), Failure> {
+        let Some(i) = self.balancer.pick(key, &[]) else {
+            return Err(Failure::NoHealthyUpstream);
+        };
+        *picked = Some(i);
+        let endpoint = &self.balancer.endpoints()[i];
+        let in_flight = endpoint.state.track();
+        set_framing(&mut headers, method, length);
+        let uri = format!(
+            "http://{}{}",
+            endpoint.address,
+            String::from_utf8_lossy(target)
+        );
+        let mut out = Request::new(body);
+        *out.method_mut() = method.clone();
+        *out.uri_mut() = Uri::try_from(uri).map_err(|_| Failure::Proxy)?;
+        *out.version_mut() = Version::HTTP_11;
+        *out.headers_mut() = headers;
+        let began = self.clock.now();
+        let result = self.client.send(out).await;
+        // A cancelled exchange (the cluster timeout) observes nothing,
+        // as steer skipped requests whose context ended.
+        let now = self.clock.now();
+        let elapsed = now.saturating_duration_since(began);
+        let sample = match &result {
+            Ok(r) if !r.status().is_server_error() => elapsed,
+            _ => elapsed.max(FAILURE_PENALTY),
+        };
+        endpoint.state.observe_latency(sample, now);
+        match result {
+            Ok(resp) => Ok((resp, in_flight)),
+            Err(e) => Err(Failure::Upstream(e)),
+        }
+    }
+}
+
+/// An upstream response on its way to the client, with the hop-by-hop
+/// headers removed and its body cut at the deadline.
+fn proxied(
+    resp: Response<Incoming>,
+    deadline: Option<Instant>,
+    permit: Permit,
+    in_flight: InFlight,
+) -> Response<Body> {
+    let (mut head, incoming) = resp.into_parts();
+    strip_hop_by_hop(&mut head.headers, false);
+    // Go writes the standard reason phrase whatever the upstream sent.
+    head.extensions.remove::<hyper::ext::ReasonPhrase>();
+    let body = Proxied {
+        inner: incoming,
+        deadline: deadline.map(|at| Box::pin(tokio::time::sleep_until(at))),
+        _permit: permit,
+        _in_flight: in_flight,
+    };
+    Response::from_parts(head, BodyExt::boxed(body))
+}
+
+/// An error the proxy wrote, through the filter's deliver phase when the
+/// request has an exchange.
+fn deliver_generated(
+    exchange: Option<Box<dyn Exchange>>,
+    resp: Response<Body>,
+    reason: &'static str,
+    id: &HeaderValue,
+) -> Response<Body> {
+    let Some(x) = exchange else {
+        return resp;
+    };
+    let mut resp = x.deliver(resp, Delivery::Generated(reason));
+    resp.headers_mut().insert(reqid::HEADER, id.clone());
+    resp
+}
+
+/// A request a filter answered at once and wants sent upstream in the
+/// background (a cache refreshing a stale copy). It takes a place under
+/// the cluster's `max_requests` and its timeout like any other request,
+/// carries the client request's ID, and has no body. What the exchange
+/// delivers is dropped.
+struct Refresh {
+    cluster: Arc<Cluster>,
+    method: Method,
+    key: Option<u64>,
+    headers: HeaderMap,
+    target: Vec<u8>,
+    id: HeaderValue,
+    exchange: Box<dyn Exchange>,
+}
+
+impl Refresh {
+    async fn run(self) {
+        let Refresh {
+            cluster,
+            method,
+            key,
+            headers,
+            target,
+            id,
+            mut exchange,
+        } = self;
+        let Some(permit) = cluster.acquire() else {
+            let resp = error(
+                &id,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded",
+                "too many concurrent requests to this service",
+            );
+            drop(exchange.deliver(resp, Delivery::Generated("overloaded")));
+            return;
+        };
+        let deadline = cluster.timeout.map(|t| Instant::now() + t);
+        let mut picked = None;
+        let send = cluster.forward(
+            &method,
+            headers,
+            &target,
+            body::empty(),
+            Some(0),
+            key,
+            &mut picked,
+        );
+        let result = match deadline {
+            Some(at) => tokio::time::timeout_at(at, send)
+                .await
+                .unwrap_or(Err(Failure::Timeout)),
+            None => send.await,
+        };
+        match result {
+            Ok((resp, in_flight)) => {
+                let resp = proxied(resp, deadline, permit, in_flight);
+                let resp = exchange.upstream_response(resp).await;
+                drop(exchange.deliver(resp, Delivery::Upstream));
+            }
+            Err(f) => {
+                let (status, code, message, _) = f.describe();
+                let resp = error(&id, status, code, message);
+                drop(exchange.deliver(resp, Delivery::Generated(code)));
+            }
+        }
+    }
+}
+
+impl Handler for Proxy {
+    type Body = Body;
+
+    async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+        self.handle(req, peer).await
+    }
+}
+
+/// Why the proxy answered instead of an upstream.
+enum Failure {
+    NoHealthyUpstream,
+    Timeout,
+    ClientBody,
+    Upstream(ClientError),
+    Proxy,
+}
+
+impl Failure {
+    /// The status, steer's error code and message, and the access log's
+    /// `failure` field.
+    fn describe(&self) -> (StatusCode, &'static str, &'static str, &'static str) {
+        match self {
             Failure::NoHealthyUpstream => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_healthy_upstream",
@@ -445,28 +677,8 @@ impl Proxy {
                 "the upstream failed to answer",
                 "proxy_error",
             ),
-        };
-        let resp = error(&id, status, code, message);
-        log(&access, started, &resp, failure);
-        resp
+        }
     }
-}
-
-impl Handler for Proxy {
-    type Body = Body;
-
-    async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
-        self.handle(req, peer).await
-    }
-}
-
-/// Why the proxy answered instead of an upstream.
-enum Failure {
-    NoHealthyUpstream,
-    Timeout,
-    ClientBody,
-    Upstream(ClientError),
-    Proxy,
 }
 
 /// The host a request is routed on (Go's `Request.Host`), after the checks

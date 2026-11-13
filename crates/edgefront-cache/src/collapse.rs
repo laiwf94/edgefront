@@ -113,6 +113,66 @@ impl<T: Clone + Send + Sync + 'static> Collapser<T> {
     pub fn in_flight(&self) -> usize {
         self.lock().len()
     }
+
+    /// Leads the flight for `key` when none is running, or follows the one
+    /// that is. Unlike [`Collapser::run`], the leader makes the fetch
+    /// itself, as part of its own request, and hands the result to its
+    /// followers with [`Lead::publish`]. A leader dropped before that
+    /// releases its followers with [`Abandoned`], and they try again.
+    pub fn lead_or_follow(self: &Arc<Self>, key: Key) -> Flight<T> {
+        let mut map = self.lock();
+        if let Some(rx) = map.get(&key) {
+            return Flight::Follow(Follow(rx.clone()));
+        }
+        let (tx, rx) = watch::channel(None);
+        map.insert(key.clone(), rx);
+        Flight::Lead(Lead {
+            cleanup: Cleanup {
+                collapser: self.clone(),
+                key,
+            },
+            tx,
+        })
+    }
+}
+
+/// Whether [`Collapser::lead_or_follow`] made this caller the leader.
+pub enum Flight<T> {
+    Lead(Lead<T>),
+    Follow(Follow<T>),
+}
+
+/// The leader's side of a flight.
+pub struct Lead<T> {
+    // Declared first so it drops first: a leader that goes away without a
+    // result frees the key before its followers wake to try again.
+    cleanup: Cleanup<T>,
+    tx: watch::Sender<Option<T>>,
+}
+
+impl<T> Lead<T> {
+    /// Hands `value` to every follower, then ends the flight.
+    pub fn publish(self, value: T) {
+        let Lead { cleanup, tx } = self;
+        // Publish before removing the key, so a caller arriving in between
+        // still gets this result instead of starting a second fetch.
+        tx.send_replace(Some(value));
+        drop(cleanup);
+    }
+}
+
+/// A follower's side of a flight.
+pub struct Follow<T>(watch::Receiver<Option<T>>);
+
+impl<T: Clone> Follow<T> {
+    /// The leader's result, or [`Abandoned`] when the leader went away
+    /// without one.
+    pub async fn wait(mut self) -> Result<T, Abandoned> {
+        match self.0.wait_for(Option::is_some).await {
+            Ok(value) => Ok(value.clone().expect("waited for Some")),
+            Err(_) => Err(Abandoned),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +270,52 @@ mod tests {
         }
         let (result, _) = c.run("k".into(), || async { 3 }).await;
         assert_eq!(result, Ok(3));
+    }
+
+    #[tokio::test]
+    async fn a_leader_publishes_to_its_followers() {
+        let c = Arc::new(Collapser::<u32>::default());
+        let Flight::Lead(lead) = c.lead_or_follow("k".into()) else {
+            panic!("the first caller leads");
+        };
+        let Flight::Follow(f1) = c.lead_or_follow("k".into()) else {
+            panic!("the second caller follows");
+        };
+        let Flight::Follow(f2) = c.lead_or_follow("k".into()) else {
+            panic!("so does the third");
+        };
+        // Another key is its own flight, and `run` joins this one.
+        assert!(matches!(c.lead_or_follow("j".into()), Flight::Lead(_)));
+        let runner = {
+            let c = c.clone();
+            tokio::spawn(async move { c.run("k".into(), || async { 9 }).await })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(c.in_flight(), 1);
+        lead.publish(5);
+        assert_eq!(c.in_flight(), 0);
+        assert_eq!(f1.wait().await, Ok(5));
+        assert_eq!(f2.wait().await, Ok(5));
+        assert_eq!(runner.await.unwrap(), (Ok(5), Role::Follower));
+        assert!(matches!(c.lead_or_follow("k".into()), Flight::Lead(_)));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_leader_releases_its_followers() {
+        let c = Arc::new(Collapser::<u32>::default());
+        let Flight::Lead(lead) = c.lead_or_follow("k".into()) else {
+            panic!("the first caller leads");
+        };
+        let Flight::Follow(f) = c.lead_or_follow("k".into()) else {
+            panic!("the second caller follows");
+        };
+        let waiter = tokio::spawn(f.wait());
+        tokio::task::yield_now().await;
+        drop(lead);
+        assert_eq!(waiter.await.unwrap(), Err(Abandoned));
+        // The key is free at once, so a follower that retries leads.
+        assert_eq!(c.in_flight(), 0);
+        assert!(matches!(c.lead_or_follow("k".into()), Flight::Lead(_)));
     }
 
     #[tokio::test]

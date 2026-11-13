@@ -60,7 +60,8 @@ TSAN_CARGO ?= cargo +nightly
 TSAN_CRATES := cachet edgefront-cache edgefront-core edgefront-limiter edgefront-proxy edgefront-difftest
 TSAN_TESTS_cachet := proxy revalidation failure cluster
 TSAN_TESTS_edgefront-core := listener admin client
-TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier
+TSAN_TESTS_edgefront-cache := layer proxy_layer
+TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier filters
 
 define tsan_crate
 .PHONY: tsan-$(1)

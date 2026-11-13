@@ -21,6 +21,7 @@ use edgefront_core::filter::{self, Decision, Delivery, Filter, RequestHead};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame};
+use tokio::sync::Notify;
 
 struct TestClock(Mutex<SystemTime>);
 
@@ -45,7 +46,12 @@ impl Clock for TestClock {
 /// What the scripted upstream does for one request.
 enum Script {
     Respond(Response<Body>),
+    /// A `502` the proxy wrote.
     Fail(&'static str),
+    /// A `400` the proxy wrote, about the client's request.
+    Refuse,
+    /// The script item once the gate opens.
+    Wait(Arc<Notify>, Box<Script>),
 }
 
 /// An upstream that answers from a queue and records what it was sent.
@@ -65,6 +71,16 @@ impl Upstream {
         self.script.lock().unwrap().push_back(Script::Fail(reason));
     }
 
+    /// Queues `script` behind a gate, and returns the gate.
+    fn gated(&self, script: Script) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.script
+            .lock()
+            .unwrap()
+            .push_back(Script::Wait(gate.clone(), Box::new(script)));
+        gate
+    }
+
     fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
     }
@@ -80,13 +96,25 @@ impl Upstream {
             req.uri().to_string(),
             req.headers().clone(),
         ));
-        match self.script.lock().unwrap().pop_front() {
-            Some(Script::Respond(r)) => (r, Delivery::Upstream),
-            Some(Script::Fail(reason)) => (
-                text(StatusCode::BAD_GATEWAY, "proxy error\n"),
-                Delivery::Generated(reason),
-            ),
-            None => panic!("unexpected upstream request"),
+        let mut next = self.script.lock().unwrap().pop_front();
+        loop {
+            return match next {
+                Some(Script::Respond(r)) => (r, Delivery::Upstream),
+                Some(Script::Fail(reason)) => (
+                    text(StatusCode::BAD_GATEWAY, "proxy error\n"),
+                    Delivery::Generated(reason),
+                ),
+                Some(Script::Refuse) => (
+                    text(StatusCode::BAD_REQUEST, "bad request\n"),
+                    Delivery::Generated("bad_request"),
+                ),
+                Some(Script::Wait(gate, then)) => {
+                    gate.notified().await;
+                    next = Some(*then);
+                    continue;
+                }
+                None => panic!("unexpected upstream request"),
+            };
         }
     }
 }
@@ -101,7 +129,7 @@ fn route(host: &str, prefix: &str) -> Route {
 
 struct Harness {
     layer: Arc<CacheLayer>,
-    upstream: Upstream,
+    upstream: Arc<Upstream>,
     clock: Arc<TestClock>,
 }
 
@@ -132,7 +160,7 @@ fn harness_with(cache_toml: &str, body_timeout: Duration) -> Harness {
     );
     Harness {
         layer,
-        upstream: Upstream::default(),
+        upstream: Arc::default(),
         clock,
     }
 }
@@ -169,9 +197,13 @@ impl Harness {
             req = req.header(*k, *v);
         }
         let filters = self.layer.route_filters();
-        filter::run(filters.get(0), 0, req.body(()).unwrap(), |r| {
-            self.upstream.send(r)
-        })
+        let upstream = self.upstream.clone();
+        filter::run(
+            filters.get(0),
+            0,
+            req.body(()).unwrap(),
+            move |r| async move { upstream.send(r).await },
+        )
         .await
     }
 
@@ -576,8 +608,39 @@ async fn request_directives() {
     assert_eq!(status(&resp), "edge; fwd=miss; fwd-status=200");
 }
 
+/// Waits, with a bound, until `done` holds.
+async fn until(mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("condition reached in time");
+}
+
+/// Starts a GET on its own task.
+fn spawn_get(
+    h: &Arc<Harness>,
+    path: &'static str,
+    headers: &'static [(&'static str, &'static str)],
+) -> tokio::task::JoinHandle<(String, StatusCode, Bytes)> {
+    let h = h.clone();
+    tokio::spawn(async move {
+        let resp = h.send("GET", path, headers).await;
+        let st = status(&resp).to_owned();
+        let code = resp.status();
+        (st, code, body(resp).await)
+    })
+}
+
+/// Gives spawned requests time to reach the point where they wait.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(30)).await;
+}
+
 #[tokio::test]
-async fn stale_while_revalidate_revalidates_before_use() {
+async fn stale_while_revalidate_serves_stale_and_refreshes_in_the_background() {
     let h = harness();
     h.upstream.push(origin(
         200,
@@ -589,17 +652,232 @@ async fn stale_while_revalidate_revalidates_before_use() {
     ));
     h.get("/w").await;
     h.clock.advance(5);
-    h.upstream.push(origin(
+    let gate = h.upstream.gated(Script::Respond(origin(
         304,
         &[("etag", "\"a\""), ("cache-control", "max-age=10")],
         "",
-    ));
+    )));
     let resp = h.get("/w").await;
     assert_eq!(
         status(&resp),
-        "edge; fwd=stale; fwd-status=304; stored; ttl=10"
+        "edge; hit; ttl=-4; detail=stale-while-revalidate"
     );
     assert_eq!(body(resp).await, "a");
+    until(|| h.upstream.calls() == 2).await;
+    assert_eq!(h.upstream.last_headers()["if-none-match"], "\"a\"");
+    // While the refresh runs, others get the stale copy without a second one.
+    let resp = h.get("/w").await;
+    assert_eq!(
+        status(&resp),
+        "edge; hit; ttl=-4; detail=stale-while-revalidate"
+    );
+    assert_eq!(h.layer.in_flight(), 1);
+    gate.notify_one();
+    until(|| h.layer.in_flight() == 0).await;
+    let resp = h.get("/w").await;
+    assert_eq!(status(&resp), "edge; hit; ttl=10");
+    assert_eq!(h.upstream.calls(), 2);
+}
+
+#[tokio::test]
+async fn concurrent_misses_share_one_fill() {
+    let h = Arc::new(harness());
+    let gate = h.upstream.gated(Script::Respond(origin(
+        200,
+        &[("cache-control", "max-age=60")],
+        "shared",
+    )));
+    let leader = spawn_get(&h, "/c", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let followers: Vec<_> = (0..5).map(|_| spawn_get(&h, "/c", &[])).collect();
+    settle().await;
+    gate.notify_one();
+    let (st, _, b) = leader.await.unwrap();
+    assert_eq!(st, "edge; fwd=miss; fwd-status=200; stored; ttl=60");
+    assert_eq!(b, "shared");
+    for f in followers {
+        let (st, _, b) = f.await.unwrap();
+        assert_eq!(
+            st,
+            "edge; fwd=miss; fwd-status=200; stored; collapsed; ttl=60"
+        );
+        assert_eq!(b, "shared");
+    }
+    assert_eq!(h.upstream.calls(), 1);
+    assert_eq!(h.layer.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn a_shared_revalidation_reaches_its_followers() {
+    let h = Arc::new(harness());
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=1"), ("etag", "\"r\"")],
+        "rv",
+    ));
+    h.get("/rv").await;
+    h.clock.advance(5);
+    let gate = h.upstream.gated(Script::Respond(origin(
+        304,
+        &[("cache-control", "max-age=60"), ("etag", "\"r\"")],
+        "",
+    )));
+    let leader = spawn_get(&h, "/rv", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/rv", &[]);
+    settle().await;
+    gate.notify_one();
+    leader.await.unwrap();
+    let (st, _, b) = follower.await.unwrap();
+    assert_eq!(
+        st,
+        "edge; fwd=stale; fwd-status=304; stored; collapsed; ttl=60"
+    );
+    assert_eq!(b, "rv");
+    assert_eq!(h.upstream.calls(), 2);
+}
+
+#[tokio::test]
+async fn followers_go_alone_when_the_result_was_only_for_the_leader() {
+    let h = Arc::new(harness());
+    // Not storable.
+    let gate = h.upstream.gated(Script::Respond(origin(
+        200,
+        &[("cache-control", "private")],
+        "mine",
+    )));
+    h.upstream
+        .push(origin(200, &[("cache-control", "private")], "yours"));
+    let leader = spawn_get(&h, "/p", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/p", &[]);
+    settle().await;
+    gate.notify_one();
+    assert_eq!(leader.await.unwrap().2, "mine");
+    let (st, _, b) = follower.await.unwrap();
+    assert_eq!(st, "edge; fwd=miss; fwd-status=200");
+    assert_eq!(b, "yours");
+    // A variant the follower's request does not select.
+    let gate = h.upstream.gated(Script::Respond(origin(
+        200,
+        &[("cache-control", "max-age=60"), ("vary", "accept-language")],
+        "en",
+    )));
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=60"), ("vary", "accept-language")],
+        "fr",
+    ));
+    let leader = spawn_get(&h, "/v", &[("accept-language", "en")]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/v", &[("accept-language", "fr")]);
+    settle().await;
+    gate.notify_one();
+    assert_eq!(leader.await.unwrap().2, "en");
+    let (st, _, b) = follower.await.unwrap();
+    assert_eq!(st, "edge; fwd=miss; fwd-status=200; stored; ttl=60");
+    assert_eq!(b, "fr");
+    assert_eq!(h.upstream.calls(), 4);
+}
+
+#[tokio::test]
+async fn followers_share_a_failure_or_its_stale_copy() {
+    let h = Arc::new(harness());
+    let gate = h.upstream.gated(Script::Fail("connect"));
+    let leader = spawn_get(&h, "/f", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/f", &[]);
+    settle().await;
+    gate.notify_one();
+    let (st, code, _) = leader.await.unwrap();
+    assert_eq!(
+        (st.as_str(), code),
+        ("edge; fwd=miss; detail=connect", StatusCode::BAD_GATEWAY)
+    );
+    let (st, code, b) = follower.await.unwrap();
+    assert_eq!(st, "edge; fwd=miss; collapsed; detail=connect");
+    assert_eq!(code, StatusCode::BAD_GATEWAY);
+    assert_eq!(b, "upstream failed\n");
+    // With a copy stale-if-error allows, everyone gets the copy.
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=1, stale-if-error=60")],
+        "old",
+    ));
+    h.get("/f").await;
+    h.clock.advance(5);
+    let gate = h.upstream.gated(Script::Respond(origin(503, &[], "down")));
+    let leader = spawn_get(&h, "/f", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/f", &[]);
+    settle().await;
+    gate.notify_one();
+    for t in [leader, follower] {
+        let (st, code, b) = t.await.unwrap();
+        assert_eq!(
+            st,
+            "edge; hit; ttl=-4; fwd=stale; fwd-status=503; detail=stale-if-error"
+        );
+        assert_eq!((code, b.as_ref()), (StatusCode::OK, &b"old"[..]));
+    }
+    assert_eq!(h.upstream.calls(), 3);
+}
+
+#[tokio::test]
+async fn a_refused_request_is_not_an_upstream_failure() {
+    let h = Arc::new(harness());
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=1, stale-if-error=60")],
+        "old",
+    ));
+    h.get("/b").await;
+    h.clock.advance(5);
+    let gate = h.upstream.gated(Script::Refuse);
+    h.upstream
+        .push(origin(200, &[("cache-control", "max-age=60")], "new"));
+    let leader = spawn_get(&h, "/b", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/b", &[]);
+    settle().await;
+    gate.notify_one();
+    // The refusal is about the leader's request: no stale copy for it, and
+    // the follower makes its own request.
+    let (st, code, _) = leader.await.unwrap();
+    assert_eq!(
+        (st.as_str(), code),
+        (
+            "edge; fwd=stale; detail=bad_request",
+            StatusCode::BAD_REQUEST
+        )
+    );
+    let (st, _, b) = follower.await.unwrap();
+    assert_eq!(st, "edge; fwd=stale; fwd-status=200; stored; ttl=60");
+    assert_eq!(b, "new");
+}
+
+#[tokio::test]
+async fn a_leader_that_goes_away_hands_over_to_a_follower() {
+    let h = Arc::new(harness());
+    let _gate = h.upstream.gated(Script::Respond(origin(
+        200,
+        &[("cache-control", "max-age=60")],
+        "never",
+    )));
+    h.upstream.push(origin(
+        200,
+        &[("cache-control", "max-age=60")],
+        "taken over",
+    ));
+    let leader = spawn_get(&h, "/a", &[]);
+    until(|| h.layer.in_flight() == 1).await;
+    let follower = spawn_get(&h, "/a", &[]);
+    settle().await;
+    leader.abort();
+    let (st, _, b) = follower.await.unwrap();
+    assert_eq!(st, "edge; fwd=miss; fwd-status=200; stored; ttl=60");
+    assert_eq!(b, "taken over");
+    assert_eq!(h.upstream.calls(), 2);
 }
 
 #[tokio::test]

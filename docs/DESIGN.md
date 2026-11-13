@@ -218,7 +218,26 @@ The cache is becoming a layer that each proxy route turns on, so its settings ar
   - A successful unsafe method invalidates its URL and its same-host `Location` and `Content-Location`.
 - **Deliver phase.** `stale-if-error` replacement, and `Cache-Status` on everything.
 
-A route's `max_ttl` caps every stored lifetime, its heuristic cap applies, and its `max_variants` limits variants per URL through `Cache::store_limited`. Two of cachet's behaviours are not in the layer yet: request collapsing, and the background refresh for `stale-while-revalidate`. Until they land, a copy inside its `stale-while-revalidate` window is revalidated before use, which RFC 5861 allows. `Via`, request IDs and forwarding headers stay with the proxy.
+A route's `max_ttl` caps every stored lifetime, its heuristic cap applies, and its `max_variants` limits variants per URL through `Cache::store_limited`.
+
+**Collapsing.** Concurrent fills of one URL share one upstream request, through `Collapser::lead_or_follow`.
+
+- The first request leads. It goes upstream as usual, and its exchange publishes the result once it has one: a stored object, a response only it could use, or a failure.
+- The others follow. They wait in their request phase, then answer from the published object (`collapsed` in `Cache-Status`) or share the failure, served stale where `stale-if-error` allows.
+- A follower goes upstream on its own when the result was not storable, or is a variant its request would not select.
+- In cachet the shared fetch ran on a task of its own. Here it is part of the leader's request, so a leader whose client goes away drops the flight, and a follower leads instead.
+- An error the proxy wrote about the leader's own request, such as a `400` for its body, is not shared, and its followers go upstream themselves.
+
+**Background refresh.** A copy inside its `stale-while-revalidate` window is answered with `Decision::Refresh`: the client gets the stale copy at once, and the request goes upstream in the background, leading the URL's flight, so there is one refresh per URL at a time.
+
+**In the proxy.** `Proxy::with_filters` attaches a `RouteFilters`; the router maps each request to its route index and its cluster. The phases sit in `Proxy::handle` as follows:
+
+- The request phase runs right after routing, before `max_requests`. A hit takes no place under the limit and never touches an upstream.
+- The upstream-response phase runs before the proxy adds the request ID, so a stored response never carries another request's ID.
+- The deliver phase runs on everything, including the proxy's own errors. These are named by their steer code (`bad_gateway`, `upstream_timeout`, `no_healthy_upstream`, `overloaded`, `bad_request`), and the cache treats only the 5xx ones as upstream failures.
+- A refresh runs on its own task. It takes a cluster permit and the cluster timeout like any request, carries the client request's ID, and has no body.
+
+`Via` and the forwarding headers stay with the proxy.
 
 ## Checking the cache against cachet 0.1
 
