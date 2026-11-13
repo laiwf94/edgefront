@@ -6,7 +6,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN mkdir -p src benches examples \
     && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
-    && echo 'fn main() {}' > benches/hit_path.rs \
+    && for b in hit_path layer_overhead; do echo 'fn main() {}' > benches/$b.rs; done \
     && echo 'fn main() {}' > examples/origin.rs \
     && cargo build --release --locked --bin cachet --example origin \
     && rm -rf src benches examples
