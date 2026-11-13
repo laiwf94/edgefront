@@ -25,6 +25,7 @@ jobs:
             .
             crates/edgefront-cache/fuzz
             crates/edgefront-core/fuzz
+            crates/edgefront-limiter/fuzz
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
@@ -77,7 +78,9 @@ jobs:
   fuzz:
     name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A target runs for `secs` seconds (default 600); `timeout` minutes
+    # (default 30) leave room for the build.
+    timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -91,6 +94,7 @@ jobs:
           - { crate: edgefront-core, target: request_id }
           - { crate: edgefront-core, target: base_url }
           - { crate: edgefront-core, target: bearer_token }
+          - { crate: edgefront-limiter, target: limiter_config, secs: 1800, timeout: 50 }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -99,11 +103,15 @@ jobs:
           tool: cargo-fuzz
       # The prebuilt cargo-fuzz is a musl binary and defaults to its own
       # target, where the sanitizers cannot link; name the gnu target.
-      - name: Fuzz for 10 minutes
-        run: >
-          cargo fuzz run --fuzz-dir crates/${{ matrix.crate }}/fuzz
-          ${{ matrix.target }} --target x86_64-unknown-linux-gnu
-          -- -max_total_time=600
+      # With the target's dictionary when it has one. An input that takes
+      # over 10 seconds fails the run, so a parse that loops is caught.
+      - name: Fuzz for ${{ matrix.secs || 600 }} seconds
+        run: |
+          dir=crates/${{ matrix.crate }}/fuzz
+          dict=
+          if [ -f "$dir/${{ matrix.target }}.dict" ]; then dict="-dict=$dir/${{ matrix.target }}.dict"; fi
+          cargo fuzz run --fuzz-dir "$dir" ${{ matrix.target }} --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=${{ matrix.secs || 600 }} -timeout=10 $dict
       - name: Keep the crashing input
         if: failure()
         uses: actions/upload-artifact@v4

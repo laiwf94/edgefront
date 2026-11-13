@@ -2,7 +2,7 @@
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
-FUZZ_DIRS := crates/edgefront-cache/fuzz crates/edgefront-core/fuzz
+FUZZ_DIRS := crates/edgefront-cache/fuzz crates/edgefront-core/fuzz crates/edgefront-limiter/fuzz
 FUZZ_SECS ?= 30
 
 # The full gate: format, lint with warnings as errors, tests with line coverage.
@@ -36,12 +36,17 @@ audit:
 	for d in $(FUZZ_DIRS); do cargo audit --file $$d/Cargo.lock || exit 1; done
 	scripts/direct-deps.sh $(DIRECT_DEPS)
 
-# Runs every target of every fuzz crate for FUZZ_SECS seconds. Needs a
-# nightly toolchain and cargo-fuzz.
+# Runs every target of every fuzz crate for FUZZ_SECS seconds, with the
+# target's dictionary (crates/<crate>/fuzz/<target>.dict) when it has one.
+# An input that takes longer than FUZZ_TIMEOUT seconds fails the run, so a
+# parser that loops is caught like a crash. Needs a nightly toolchain and
+# cargo-fuzz.
+FUZZ_TIMEOUT ?= 10
 fuzz:
 	for d in $(FUZZ_DIRS); do \
 		for t in $$(cargo +nightly fuzz list --fuzz-dir $$d); do \
-			cargo +nightly fuzz run --fuzz-dir $$d $$t -- -max_total_time=$(FUZZ_SECS) || exit 1; \
+			dict=; if [ -f $$d/$$t.dict ]; then dict=-dict=$$d/$$t.dict; fi; \
+			cargo +nightly fuzz run --fuzz-dir $$d $$t -- -max_total_time=$(FUZZ_SECS) -timeout=$(FUZZ_TIMEOUT) $$dict || exit 1; \
 		done; \
 	done
 

@@ -1,0 +1,29 @@
+[package]
+name = "edgefront-limiter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+toml = { version = "=1.1.8", default-features = false, features = ["display", "parse", "serde", "std"] }
+
+[dependencies.edgefront-limiter]
+path = ".."
+version = "0.1.0"
+
+# Keep the fuzz crate out of the main workspace: it needs nightly and
+# libFuzzer, and has its own Cargo.lock.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "limiter_config"
+path = "fuzz_targets/limiter_config.rs"
+test = false
+doc = false
+bench = false

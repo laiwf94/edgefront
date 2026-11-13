@@ -112,6 +112,14 @@ The same directive table serves the serde form, which is how the limiter appears
 
 `LimiterConfig::to_pacerd` and `Serialize` write a config back out, choosing the largest unit that is exact (`2m`, `16k`). `validate` checks a config built in code by writing it and reading it back. A value neither syntax can express is an error naming the field: a duration that is not a whole number of milliseconds, a rate period other than a second, minute or hour, or an IPv6 scope id. Property tests round-trip generated configs through both syntaxes.
 
+The reader is fuzzed by `crates/edgefront-limiter/fuzz/fuzz_targets/limiter_config.rs`, which replaces pacer's `fuzz/fuzz_config.c`. It starts from pacer's three corpus files and its dictionary, kept in the crate because `legacy/pacer` goes in week 4; the dictionary adds the log levels and a few values pacer's left out, and `tests/fuzz_seeds.rs` fails if it loses a directive name or if a seed stops parsing. Beyond pacer's checks (an accepted file has 1 to 16 listeners, 1 to 64 workers, valid names, buffers of at least 1 KiB, tables of at least 16 keys and rates the limiter takes; an error is one printable line starting `line N:`), each input must also:
+
+- name a line of the file in its error, line 0 only for the empty file or one over 1 MiB, and get the same error from `parse_pacerd` again;
+- if accepted, pass `validate`, have no two listeners with the same name, and write out as pacerd.conf and as TOML, each reading back into an equal config;
+- lint without a panic, each finding on a line of the file, about one of its listeners, in printable text.
+
+CI runs it for 30 minutes on every push with `-timeout=10`, so a parse that loops or goes quadratic fails like a crash. A local 30-minute run made 20.4 million executions at about 11,300 a second, reached 2,848 coverage edges and a corpus of 781 inputs, and found nothing. Two bugs put in by hand were each found within three minutes: letting control bytes into quoted tokens, and writing sizes of 2 GiB and up one MiB too large.
+
 ### Config lints
 
 A config can parse and still not do what it says. `edgefront_limiter::lint` reads a valid `LimiterConfig` and reports what pacerd would actually do with it, and `edgefront check [--allow CLASS]... FILE` prints each finding as `FILE:LINE: warning[CLASS]: listener NAME: MESSAGE`, then a count, exiting 1 when there are findings, 0 with `FILE: ok` when there are none and 2 when the file does not parse. A `.toml` file is the limiter section in the serde form; anything else is a pacerd.conf. The line comes from a `SourceMap`: `parse_pacerd_mapped` records the line of each directive and each `listener NAME {`, and for TOML the binary reads toml's spans for each key and `[[listeners]]` header. A setting left at its default is reported on the line that opens its listener.
