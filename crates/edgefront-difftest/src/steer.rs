@@ -269,16 +269,27 @@ impl Driver {
 impl Driver {
     /// Sends one query line and returns the answer line, with its newline.
     pub fn ask_line(&mut self, query: &str) -> io::Result<String> {
-        let stdin = self.stdin.as_mut().expect("stdin is open until drop");
-        stdin.write_all(query.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        self.line.clear();
-        if self.stdout.read_line(&mut self.line)? == 0 {
-            return Err(io::Error::new(
+        let exited = || {
+            io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "the driver exited without answering",
-            ));
+            )
+        };
+        let stdin = self.stdin.as_mut().expect("stdin is open until drop");
+        // A driver that has already exited closes its end of the pipe, so
+        // the write can fail before the read would see the end. Either way
+        // the driver is gone without an answer.
+        let sent = stdin
+            .write_all(query.as_bytes())
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush());
+        match sent {
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Err(exited()),
+            other => other?,
+        }
+        self.line.clear();
+        if self.stdout.read_line(&mut self.line)? == 0 {
+            return Err(exited());
         }
         Ok(std::mem::take(&mut self.line))
     }
@@ -866,16 +877,18 @@ mod tests {
         let q = Query::Validate {
             config: b"{}".to_vec(),
         };
+        // Whether the write hits a closed pipe or the read sees the end,
+        // the error says the driver exited.
         let mut silent = Driver::spawn("true", &[]).unwrap();
         let err = silent.ask(&q).unwrap_err();
-        // Either the write hits a closed pipe or the read sees the end.
-        assert!(
-            matches!(
-                err.kind(),
-                io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
-            ),
-            "{err}"
-        );
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert_eq!(err.to_string(), "the driver exited without answering");
+        // Once it has certainly exited, the write is the step that fails.
+        let mut gone = Driver::spawn("true", &[]).unwrap();
+        gone.child.wait().unwrap();
+        let err = gone.ask(&q).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert_eq!(err.to_string(), "the driver exited without answering");
 
         let mut babbler = Driver::spawn(
             "sh",
