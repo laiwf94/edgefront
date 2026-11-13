@@ -1334,7 +1334,9 @@ proptest! {
                 }
             }
             Err(e) => {
-                prop_assert!(e.line <= lines.len());
+                // A generated line can hold newlines of its own, so the
+                // bound is the lines of the text, not the pieces joined.
+                prop_assert!(e.line <= text.split(|&c| c == b'\n').count());
                 prop_assert!(e.message.bytes().all(|c| (0x20..0x7f).contains(&c)), "{}", e);
             }
         }
