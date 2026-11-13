@@ -87,6 +87,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+edgefront-proxy.workspace = true
 
 [[bench]]
 name = "hit_path"

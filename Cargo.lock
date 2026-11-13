@@ -73,6 +73,7 @@ dependencies = [
  "criterion",
  "edgefront-cache",
  "edgefront-core",
+ "edgefront-proxy",
  "hmac",
  "http",
  "http-body-util",

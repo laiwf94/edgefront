@@ -133,6 +133,18 @@ cachet is an HTTP caching reverse proxy for the edge, written in Rust. It follow
 
 It is a single binary: an S3-FIFO memory cache with a byte budget, an optional crash-safe disk tier, health-checked origins with failover, signed purge propagation between nodes, Prometheus metrics and JSON logs. The design, its trade-offs and the papers and RFCs behind it are in [docs/DESIGN.md](docs/DESIGN.md).
 
+### The cache as a layer on proxy routes
+
+The cache runs as a layer in the proxy's request path (`edgefront_cache::layer::CacheLayer` on the phases in `edgefront_core::filter`), turned on per route by a `[[cache.routes]]` entry. Routes without one bypass it at the cost of one table lookup. cachet's node serves through the same layer, with its origin pool as the upstream. `tests/e2e_cache_layer.rs` puts two edge nodes together from these parts. Each has a cached route and an uncached one, and a purge on one node reaches the other through the signed peer protocol:
+
+```rust
+let policies = cache_config.resolve(&proxy_config.routes)?;
+let layer = CacheLayer::new(cache, policies, LayerSettings::default(), Arc::new(SystemClock));
+let proxy = Proxy::new(&proxy_config).with_filters(layer.route_filters());
+```
+
+What the layer costs is measured in [docs/benchmarks/layer.md](docs/benchmarks/layer.md). On a 4-CPU VM, a bypassing route adds no measurable time over a direct upstream call. A 4 KiB hit takes 1.44 µs in-process against cachet 0.1's 1.70 µs. End to end with oha, the layered node serves 150,700 hits/s against cachet 0.1's 143,100.
+
 ## Running it
 
 You need Rust 1.88 or newer.
