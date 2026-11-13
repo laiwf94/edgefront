@@ -155,16 +155,10 @@ impl RouteFilters {
     }
 }
 
-/// An upstream call that could not produce a response, with the response
-/// the proxy writes instead.
-#[derive(Debug)]
-pub struct Generated {
-    pub reason: &'static str,
-    pub response: Response<Body>,
-}
-
 /// Runs `req` through the filter's phases around `send`, which makes the
-/// upstream call. Without a filter it is `send(req)`.
+/// upstream call and returns the response with where it came from: the
+/// upstream's, or one the caller wrote because there was no usable
+/// upstream response. Without a filter it is the response `send` returns.
 pub async fn run<B, S, Fut>(
     filter: Option<&dyn Filter>,
     route: usize,
@@ -173,13 +167,10 @@ pub async fn run<B, S, Fut>(
 ) -> Response<Body>
 where
     S: FnOnce(Request<B>) -> Fut,
-    Fut: Future<Output = Result<Response<Body>, Generated>>,
+    Fut: Future<Output = (Response<Body>, Delivery)>,
 {
     let Some(filter) = filter else {
-        return match send(req).await {
-            Ok(resp) => resp,
-            Err(g) => g.response,
-        };
+        return send(req).await.0;
     };
     let (mut parts, body) = req.into_parts();
     let decision = filter
@@ -195,12 +186,11 @@ where
         Decision::Forward(x) => x,
     };
     req = Request::from_parts(parts, body);
-    let (resp, from) = match send(req).await {
-        Ok(resp) => match &mut exchange {
-            Some(x) => (x.upstream_response(resp).await, Delivery::Upstream),
-            None => (resp, Delivery::Upstream),
-        },
-        Err(g) => (g.response, Delivery::Generated(g.reason)),
+    let (resp, from) = match (send(req).await, &mut exchange) {
+        ((resp, Delivery::Upstream), Some(x)) => {
+            (x.upstream_response(resp).await, Delivery::Upstream)
+        }
+        (sent, _) => sent,
     };
     match exchange {
         Some(x) => x.deliver(resp, from),
@@ -283,20 +273,18 @@ mod tests {
         Request::get(path).header("host", "a").body(()).unwrap()
     }
 
-    async fn upstream(req: Request<()>) -> Result<Response<Body>, Generated> {
+    async fn upstream(req: Request<()>) -> (Response<Body>, Delivery) {
         let filtered = req.headers().contains_key("x-filtered");
         if req.uri().path() == "/slow" {
-            return Err(Generated {
-                reason: "timeout",
-                response: text(StatusCode::GATEWAY_TIMEOUT, "timed out\n"),
-            });
+            let resp = text(StatusCode::GATEWAY_TIMEOUT, "timed out\n");
+            return (resp, Delivery::Generated("timeout"));
         }
         let mut resp = Response::new(full(Bytes::from_static(b"origin")));
         if filtered {
             resp.headers_mut()
                 .insert("x-filtered", HeaderValue::from_static("1"));
         }
-        Ok(resp)
+        (resp, Delivery::Upstream)
     }
 
     async fn body(resp: Response<Body>) -> Bytes {
@@ -372,7 +360,7 @@ mod tests {
             assert_eq!(r.version(), http::Version::HTTP_10);
             assert_eq!(r.extensions().get::<u32>(), Some(&7));
             assert_eq!(r.headers()["host"], "a");
-            Ok(Response::new(full("ok")))
+            (Response::new(full("ok")), Delivery::Upstream)
         })
         .await;
         assert_eq!(resp.status(), StatusCode::OK);

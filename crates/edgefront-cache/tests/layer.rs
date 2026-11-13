@@ -17,7 +17,7 @@ use edgefront_cache::purge::PurgeTarget;
 use edgefront_cache::store::{Cache, CacheSettings};
 use edgefront_core::body::{Body, full, text};
 use edgefront_core::config::Route;
-use edgefront_core::filter::{self, Decision, Filter, Generated, RequestHead};
+use edgefront_core::filter::{self, Decision, Delivery, Filter, RequestHead};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame};
@@ -73,7 +73,7 @@ impl Upstream {
         self.seen.lock().unwrap().last().unwrap().2.clone()
     }
 
-    async fn send(&self, req: Request<()>) -> Result<Response<Body>, Generated> {
+    async fn send(&self, req: Request<()>) -> (Response<Body>, Delivery) {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.seen.lock().unwrap().push((
             req.method().clone(),
@@ -81,11 +81,11 @@ impl Upstream {
             req.headers().clone(),
         ));
         match self.script.lock().unwrap().pop_front() {
-            Some(Script::Respond(r)) => Ok(r),
-            Some(Script::Fail(reason)) => Err(Generated {
-                reason,
-                response: text(StatusCode::BAD_GATEWAY, "proxy error\n"),
-            }),
+            Some(Script::Respond(r)) => (r, Delivery::Upstream),
+            Some(Script::Fail(reason)) => (
+                text(StatusCode::BAD_GATEWAY, "proxy error\n"),
+                Delivery::Generated(reason),
+            ),
             None => panic!("unexpected upstream request"),
         }
     }
@@ -706,7 +706,10 @@ async fn a_purge_during_the_fetch_wins() {
     let cache = h.layer.cache().clone();
     let resp = filter::run(filters.get(0), 0, req, |_| async move {
         cache.purge(&[PurgeTarget::Key("a/race".into())]).await;
-        Ok(origin(200, &[("cache-control", "max-age=60")], "late"))
+        (
+            origin(200, &[("cache-control", "max-age=60")], "late"),
+            Delivery::Upstream,
+        )
     })
     .await;
     assert_eq!(status(&resp), "edge; fwd=miss; fwd-status=200; ttl=60");
