@@ -190,6 +190,28 @@ The cache is becoming a layer that each proxy route turns on, so its settings ar
 
 `CacheConfig::resolve` ties the entries to the proxy's routes and returns each route's effective `RoutePolicy`, or every problem it found (up to the proxy config's 20), each with its field path in the proxy config's style: `cache.routes[2].max_variants: must be between 1 and 8, got 9`. An override may only tighten what the store allows (`max_object_bytes` and `max_variants` are bounded by the global values the store is built with), lifetimes are capped at a year, hosts compare without case and path prefixes exactly, two entries for one route are refused, and an entry that matches no route is an error, so a typo cannot quietly leave a route uncached. The heuristic cap is held under the route's lifetime cap, so a guessed lifetime never outlasts an explicit one.
 
+## Request phases: the cache as a route layer
+
+`edgefront_core::filter` defines the phases a layer runs in on a proxy route. It lives in edgefront-core so that neither edgefront-cache nor edgefront-proxy depends on the other. A `Filter` is attached per route in a `RouteFilters` table. A route without one skips the phases, so bypass costs one branch. For a route with a filter, a request goes through three phases:
+
+1. **Request**, after routing and before the upstream pick. `Filter::request` sees the route index, method, URI and headers, and may change the headers that go upstream. It returns `Decision::Respond` (the answer, final) or `Decision::Forward`, optionally with an `Exchange` that holds the request's state.
+2. **Upstream response**, when the upstream's head arrives and before any of it reaches the client. `Exchange::upstream_response` returns the response to send on.
+3. **Deliver**, once, on the response the client gets. `Exchange::deliver` also sees responses the proxy wrote itself (`Delivery::Generated` with a reason such as `connect` or `timeout`), so the cache can answer an upstream failure with a stale copy.
+
+`filter::run` drives the phases around an upstream call. Tests use it, and so can a server that has nothing of its own between the phases.
+
+`edgefront_cache::layer::CacheLayer` is the cache as such a filter. Each route has its own `RoutePolicy`, and `CacheLayer::route_filters` attaches the layer only to cached routes. The phases do what cachet's `proxy.rs` does for one request:
+
+- **Request phase.** Lookup, then the four freshness outcomes. A fill strips the client's conditionals and `Range` and adds the stored copy's validator. `only-if-cached` gets `504`. `no-store`, `HEAD` misses and other methods pass through.
+- **Upstream response phase.**
+  - A matching `304` refreshes the copy. A mismatched one drops the copy and gets `502`, because the layer cannot send the request again.
+  - A storable body is read within the route's `max_object_bytes` and `body_timeout`, then stored under the purge epoch taken in the request phase.
+  - A larger body streams through unstored.
+  - A successful unsafe method invalidates its URL and its same-host `Location` and `Content-Location`.
+- **Deliver phase.** `stale-if-error` replacement, and `Cache-Status` on everything.
+
+A route's `max_ttl` caps every stored lifetime, its heuristic cap applies, and its `max_variants` limits variants per URL through `Cache::store_limited`. Two of cachet's behaviours are not in the layer yet: request collapsing, and the background refresh for `stale-while-revalidate`. Until they land, a copy inside its `stale-while-revalidate` window is revalidated before use, which RFC 5861 allows. `Via`, request IDs and forwarding headers stay with the proxy.
+
 ## Checking the cache against cachet 0.1
 
 Moving the cache onto the shared runtime must not change anything a client sees, so `edgefront-difftest cache` (`make difftest-cache`, in CI on every push) replays a request log against cachet 0.1 and the edgefront binary and diffs every answer. cachet 0.1 is commit `ed77c32`, the last one before the workspace split: the repository has no release tags, so the Makefile pins the commit, exports it under `target/` and builds its `cachet` binary there.

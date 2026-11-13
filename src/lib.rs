@@ -4,7 +4,7 @@
 //! their old paths, so `cachet::range` and friends keep working.
 
 pub use edgefront_cache::{
-    cache_control, cluster, collapse, headers, object, policy, purge, range, respond, store,
+    cache_control, cluster, collapse, headers, layer, object, policy, purge, range, respond, store,
 };
 pub use edgefront_core::{ids, listener};
 

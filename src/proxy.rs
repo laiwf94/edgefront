@@ -5,21 +5,24 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime};
 
-use bytes::{Bytes, BytesMut};
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::uri::PathAndQuery;
 use http::{Method, Request, Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Limited};
-use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
+use hyper::body::{Body as HttpBody, Incoming};
 
 use crate::cache_control::CacheControl;
 use crate::cluster::{GossipEvent, PurgeHost};
 use crate::collapse::{Collapser, Role};
 use crate::headers::strip_hop_by_hop;
 use crate::ids::{REQUEST_ID, request_id};
+use crate::layer::{
+    CLIENT_CONDITIONALS, Prefixed, Read, is_error_status, read_limited, same_host_key,
+};
 use crate::metrics::{Metrics, Outcome};
 use crate::object::{CachedObject, Key, SURROGATE_KEY, primary_key};
 use crate::origin::{OriginError, OriginPool, Outbound};
@@ -28,18 +31,7 @@ use crate::purge::PurgeTarget;
 use crate::respond::{self, Body, BoxError, text};
 use crate::store::Cache;
 
-/// Wall-clock time, replaceable in tests.
-pub trait Clock: Send + Sync {
-    fn now(&self) -> SystemTime;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> SystemTime {
-        SystemTime::now()
-    }
-}
+pub use crate::layer::{Clock, SystemClock};
 
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
@@ -101,17 +93,6 @@ pub struct Proxy {
     via: HeaderValue,
     cache_name: String,
 }
-
-/// Request headers that only make sense for the client that sent them, so
-/// they are not forwarded on a shared fetch.
-const CLIENT_CONDITIONALS: [HeaderName; 6] = [
-    header::IF_NONE_MATCH,
-    header::IF_MODIFIED_SINCE,
-    header::IF_MATCH,
-    header::IF_UNMODIFIED_SINCE,
-    header::IF_RANGE,
-    header::RANGE,
-];
 
 fn is_token(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(crate::cache_control::is_tchar)
@@ -696,34 +677,10 @@ struct FetchRequest {
     stored: Option<Arc<CachedObject>>,
 }
 
-/// Origin statuses that count as errors for stale-if-error (RFC 5861 section 4).
-fn is_error_status(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 500 | 502 | 503 | 504)
-}
-
 fn path_of(uri: &Uri) -> PathAndQuery {
     uri.path_and_query()
         .cloned()
         .unwrap_or_else(|| PathAndQuery::from_static("/"))
-}
-
-/// The cache key for a Location or Content-Location value on the same host.
-fn same_host_key(
-    key: &Key,
-    uri: &Uri,
-    headers: &HeaderMap,
-    value: Option<&HeaderValue>,
-) -> Option<Key> {
-    let target: Uri = value?.to_str().ok()?.parse().ok()?;
-    let own = primary_key(uri, headers)?;
-    let host = &own[..own.len() - path_of(uri).as_str().len()];
-    let other = match target.authority() {
-        Some(a) if a.as_str().eq_ignore_ascii_case(host) => format!("{host}{}", path_of(&target)),
-        Some(_) => return None,
-        None if target.path().starts_with('/') => format!("{host}{}", path_of(&target)),
-        None => return None,
-    };
-    (other.as_str() != &**key).then(|| other.into())
 }
 
 fn error(status: StatusCode, message: &'static str, detail: &str) -> Answer {
@@ -750,60 +707,6 @@ fn origin_error(e: OriginError, fwd: &str) -> Answer {
         ),
     };
     error(status, message, &format!("{fwd}; detail={detail}"))
-}
-
-enum Read {
-    Complete(Bytes),
-    TooLarge(Bytes, Incoming),
-}
-
-/// Reads a body up to `limit` bytes. Past the limit, hands back what was
-/// read and the rest of the stream instead of buffering more.
-async fn read_limited(mut body: Incoming, limit: usize) -> Result<Read, hyper::Error> {
-    let mut buf = BytesMut::new();
-    while let Some(frame) = body.frame().await {
-        let Ok(data) = frame?.into_data() else {
-            continue;
-        };
-        buf.extend_from_slice(&data);
-        if buf.len() > limit {
-            return Ok(Read::TooLarge(buf.freeze(), body));
-        }
-    }
-    Ok(Read::Complete(buf.freeze()))
-}
-
-/// A body that yields a buffered prefix, then the rest of a stream.
-struct Prefixed {
-    prefix: Option<Bytes>,
-    rest: Incoming,
-}
-
-impl HttpBody for Prefixed {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
-        if let Some(prefix) = self.prefix.take() {
-            return Poll::Ready(Some(Ok(Frame::data(prefix))));
-        }
-        Pin::new(&mut self.rest).poll_frame(cx)
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        let mut hint = self.rest.size_hint();
-        if let Some(p) = &self.prefix {
-            let n = p.len() as u64;
-            hint.set_lower(hint.lower() + n);
-            if let Some(upper) = hint.upper() {
-                hint.set_upper(upper + n);
-            }
-        }
-        hint
-    }
 }
 
 impl crate::listener::Handler for Proxy {

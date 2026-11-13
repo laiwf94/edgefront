@@ -166,9 +166,23 @@ impl Cache {
     /// records itself before removing, so either the purge removes this
     /// insert or this check sees the purge.
     pub fn store(&self, key: Key, obj: Arc<CachedObject>, req: &HeaderMap, epoch: u64) -> bool {
+        self.store_limited(key, obj, req, epoch, self.max_variants)
+    }
+
+    /// [`Cache::store`] keeping at most `max_variants` variants of the URL,
+    /// never more than the cache's own limit: a route's tighter setting.
+    pub fn store_limited(
+        &self,
+        key: Key,
+        obj: Arc<CachedObject>,
+        req: &HeaderMap,
+        epoch: u64,
+        max_variants: usize,
+    ) -> bool {
+        let max_variants = max_variants.min(self.max_variants);
         let tags = obj.tags.clone();
         let entry = Arc::new(match self.memory.peek(&key) {
-            Some(existing) => existing.with_variant(obj, req, self.max_variants),
+            Some(existing) => existing.with_variant(obj, req, max_variants),
             None => Entry::single(obj),
         });
         let out = self.memory.insert(key.clone(), entry.clone());

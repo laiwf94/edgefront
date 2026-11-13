@@ -106,6 +106,7 @@ dependencies = [
  "edgefront-core",
  "hmac",
  "http",
+ "http-body-util",
  "httpdate",
  "hyper",
  "hyper-util",

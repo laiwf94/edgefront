@@ -15,12 +15,15 @@
 //! - [`body`]: the boxed response body handlers return;
 //! - [`metrics`]: atomic counters and histograms in the Prometheus text
 //!   format;
-//! - [`admin`]: the admin router, bearer tokens and JSON errors.
+//! - [`admin`]: the admin router, bearer tokens and JSON errors;
+//! - [`filter`]: the phases a layer such as the cache runs in on a
+//!   proxy route.
 
 pub mod admin;
 pub mod body;
 pub mod clock;
 pub mod config;
+pub mod filter;
 pub mod http1;
 pub mod ids;
 pub mod listener;
