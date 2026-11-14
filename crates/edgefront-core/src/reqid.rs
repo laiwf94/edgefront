@@ -1,4 +1,5 @@
-//! Request IDs, ported from steer's `internal/reqid`.
+//! Request IDs, ported from steer's `internal/reqid`, for the proxy and its
+//! admin API.
 //!
 //! An inbound `X-Request-Id` is kept when it is safe to log and forward:
 //! 1 to [`MAX_LENGTH`] bytes from `A-Z a-z 0-9 . _ : -`. Otherwise the

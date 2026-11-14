@@ -8,14 +8,16 @@
 //!   environment secrets the cache's config builds on;
 //! - [`clock`]: monotonic time and timers behind a trait, with a manual
 //!   clock for deterministic tests;
-//! - [`ids`]: request identifiers;
+//! - [`ids`]: request identifiers, and in [`reqid`] steer's rules for
+//!   `X-Request-Id`;
 //! - [`listener`] and [`http1`]: the HTTP/1.1 listener with its connection
 //!   limits and graceful drain, which the proxy and the cache both serve
 //!   on, and the pooled HTTP/1.1 client;
 //! - [`body`]: the boxed response body handlers return;
 //! - [`metrics`]: atomic counters and histograms in the Prometheus text
 //!   format;
-//! - [`admin`]: the admin router, bearer tokens and JSON errors;
+//! - [`admin`]: the admin router, bearer tokens and JSON errors, and
+//!   steer's operator API ([`admin::Api`]) with its JSON in Go's encoding;
 //! - [`filter`]: the phases a layer such as the cache runs in on a
 //!   proxy route.
 
@@ -28,3 +30,4 @@ pub mod http1;
 pub mod ids;
 pub mod listener;
 pub mod metrics;
+pub mod reqid;

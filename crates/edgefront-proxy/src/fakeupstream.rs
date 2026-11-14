@@ -21,7 +21,6 @@
 //! [`listener::serve`]: edgefront_core::listener::serve
 
 use std::fmt;
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,6 +39,9 @@ use tokio::sync::watch;
 
 use crate::balancer::rng::SplitMix64;
 use crate::path;
+
+/// Go's JSON strings and floats, which the bodies are written in.
+pub use edgefront_core::admin::go_json::{go_float, go_string};
 
 /// The largest control request body accepted.
 pub const MAX_CONTROL_BODY: usize = 4 << 10;
@@ -456,69 +458,9 @@ fn text(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     resp
 }
 
-/// A JSON string as Go's `encoding/json` writes it, HTML-safe: `<`, `>`
-/// and `&` become `\u003c`, `\u003e` and `\u0026`, and so do the line and
-/// paragraph separators, which JavaScript cannot hold in a string.
-pub fn go_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '<' | '>' | '&' | '\u{2028}' | '\u{2029}' => {
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
-            }
-            c if u32::from(c) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// A float64 as Go's `encoding/json` writes it: the shortest decimal that
-/// reads back the same, in exponent form below 1e-6 and from 1e21 up.
-pub fn go_float(f: f64) -> String {
-    let abs = f.abs();
-    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
-        let e = format!("{f:e}");
-        // Go writes a positive exponent with its sign.
-        match e.split_once('e') {
-            Some((m, x)) if !x.starts_with('-') => format!("{m}e+{x}"),
-            _ => e,
-        }
-    } else {
-        format!("{f}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn go_json_encoding() {
-        assert_eq!(go_string("a<b>&c"), r#""a\u003cb\u003e\u0026c""#);
-        assert_eq!(
-            go_string("\"\\\n\r\t\u{8}\u{c}\u{1}\u{2028}\u{2029}é"),
-            r#""\"\\\n\r\t\b\f\u0001\u2028\u2029é""#
-        );
-        assert_eq!(go_float(0.0), "0");
-        assert_eq!(go_float(1.0), "1");
-        assert_eq!(go_float(0.5), "0.5");
-        assert_eq!(go_float(0.000001), "0.000001");
-        assert_eq!(go_float(1.5e-7), "1.5e-7");
-        assert_eq!(go_float(1e21), "1e+21");
-        assert_eq!(go_float(-2.5e-9), "-2.5e-9");
-    }
 
     #[test]
     fn folding() {

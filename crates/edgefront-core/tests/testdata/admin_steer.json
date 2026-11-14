@@ -1,0 +1,744 @@
+[
+  {
+    "name": "healthz",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/healthz",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"status\": \"ok\"\n}\n"
+  },
+  {
+    "name": "readyz",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/readyz",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"status\": \"ready\"\n}\n"
+  },
+  {
+    "name": "readyz draining",
+    "token": true,
+    "state": "full",
+    "draining": true,
+    "method": "GET",
+    "target": "/readyz",
+    "status": 503,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"status\": \"draining\"\n}\n"
+  },
+  {
+    "name": "healthz by POST",
+    "token": true,
+    "state": "full",
+    "method": "POST",
+    "target": "/healthz",
+    "status": 405,
+    "response_header": {
+      "allow": "GET",
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"method_not_allowed\",\n    \"message\": \"use GET\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "readyz by HEAD",
+    "token": true,
+    "state": "full",
+    "method": "HEAD",
+    "target": "/readyz",
+    "status": 405,
+    "response_header": {
+      "allow": "GET",
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"method_not_allowed\",\n    \"message\": \"use GET\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "healthz with the token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/healthz",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"status\": \"ok\"\n}\n"
+  },
+  {
+    "name": "metrics without a token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics with a wrong token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Bearer wrong-token-0123456789"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics with a longer token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789x"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics with a prefix of the token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Bearer admin-token-012345678"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics by Basic",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Basic admin-token-0123456789"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics with an empty bearer",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Bearer "
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics with a lower-case scheme",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "bearer admin-token-0123456789"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics with two spaces",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Bearer  admin-token-0123456789"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "metrics",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "text/plain; version=0.0.4",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "# HELP steer_test_total Test.\n# TYPE steer_test_total counter\nsteer_test_total 1\n"
+  },
+  {
+    "name": "clusters",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/clusters",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"config_version\": 7,\n  \"loaded_at\": \"2026-11-15T01:02:03.45Z\",\n  \"clusters\": [\n    {\n      \"name\": \"web\",\n      \"policy\": \"least_loaded\",\n      \"in_flight\": 3,\n      \"max_requests\": 1024,\n      \"retry_budget_balance\": 12.5,\n      \"balancer\": {\n        \"healthy_per_priority\": [\n          1,\n          1\n        ],\n        \"total_per_priority\": [\n          2,\n          1\n        ],\n        \"priority_load_percent\": [\n          50,\n          50\n        ],\n        \"panic\": false\n      },\n      \"endpoints\": [\n        {\n          \"address\": \"10.0.0.1:8080\",\n          \"weight\": 3,\n          \"priority\": 0,\n          \"healthy\": true,\n          \"ejected\": false,\n          \"times_ejected\": 0,\n          \"consecutive_gateway_failures\": 0,\n          \"in_flight\": 2,\n          \"ewma_latency_ms\": 1.234,\n          \"available\": true\n        },\n        {\n          \"address\": \"10.0.0.2:8080\",\n          \"weight\": 1,\n          \"priority\": 0,\n          \"healthy\": true,\n          \"ejected\": true,\n          \"ejected_until\": \"2026-11-15T01:02:33.450000001Z\",\n          \"times_ejected\": 2,\n          \"last_eject_reason\": \"consecutive_gateway_failure\",\n          \"consecutive_gateway_failures\": 5,\n          \"in_flight\": 0,\n          \"ewma_latency_ms\": 5e-7,\n          \"available\": false\n        },\n        {\n          \"address\": \"[2001:db8::1]:8080\",\n          \"weight\": 1,\n          \"priority\": 1,\n          \"healthy\": false,\n          \"last_probe_error\": \"GET /healthz: status 503 \\u003c\\\"down\\\" \\u0026 out\\u003e\",\n          \"ejected\": false,\n          \"times_ejected\": 0,\n          \"consecutive_gateway_failures\": 0,\n          \"in_flight\": 1,\n          \"ewma_latency_ms\": 250,\n          \"available\": false\n        }\n      ]\n    },\n    {\n      \"name\": \"api\",\n      \"policy\": \"maglev\",\n      \"in_flight\": 0,\n      \"max_requests\": 1,\n      \"balancer\": {\n        \"healthy_per_priority\": [\n          0\n        ],\n        \"total_per_priority\": [\n          1\n        ],\n        \"priority_load_percent\": [\n          0\n        ],\n        \"panic\": true\n      },\n      \"endpoints\": [\n        {\n          \"address\": \"api.internal:443\",\n          \"weight\": 100,\n          \"priority\": 0,\n          \"healthy\": false,\n          \"ejected\": true,\n          \"ejected_until\": \"2026-11-15T01:03:00Z\",\n          \"times_ejected\": 1,\n          \"last_eject_reason\": \"success_rate\",\n          \"consecutive_gateway_failures\": 0,\n          \"in_flight\": 0,\n          \"ewma_latency_ms\": 1e+21,\n          \"available\": false\n        }\n      ]\n    }\n  ]\n}\n"
+  },
+  {
+    "name": "clusters without a token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/clusters",
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "clusters by POST without a token",
+    "token": true,
+    "state": "full",
+    "method": "POST",
+    "target": "/clusters",
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "clusters by DELETE",
+    "token": true,
+    "state": "full",
+    "method": "DELETE",
+    "target": "/clusters",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 405,
+    "response_header": {
+      "allow": "GET",
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"method_not_allowed\",\n    \"message\": \"use GET\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "reload",
+    "token": true,
+    "state": "full",
+    "method": "POST",
+    "target": "/reload",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"config_version\": 8,\n  \"status\": \"reloaded\"\n}\n"
+  },
+  {
+    "name": "reload refused",
+    "token": true,
+    "state": "full",
+    "reload_error": "invalid configuration:\nclusters[0].name: duplicate <web>",
+    "method": "POST",
+    "target": "/reload",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 400,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"invalid_config\",\n    \"message\": \"invalid configuration:\\nclusters[0].name: duplicate \\u003cweb\\u003e\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "reload by GET",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/reload",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 405,
+    "response_header": {
+      "allow": "POST",
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"method_not_allowed\",\n    \"message\": \"use POST\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "reload by GET without a token",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/reload",
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "reload without a token",
+    "token": true,
+    "state": "full",
+    "method": "POST",
+    "target": "/reload",
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "clusters open",
+    "token": false,
+    "state": "full",
+    "method": "GET",
+    "target": "/clusters",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"config_version\": 7,\n  \"loaded_at\": \"2026-11-15T01:02:03.45Z\",\n  \"clusters\": [\n    {\n      \"name\": \"web\",\n      \"policy\": \"least_loaded\",\n      \"in_flight\": 3,\n      \"max_requests\": 1024,\n      \"retry_budget_balance\": 12.5,\n      \"balancer\": {\n        \"healthy_per_priority\": [\n          1,\n          1\n        ],\n        \"total_per_priority\": [\n          2,\n          1\n        ],\n        \"priority_load_percent\": [\n          50,\n          50\n        ],\n        \"panic\": false\n      },\n      \"endpoints\": [\n        {\n          \"address\": \"10.0.0.1:8080\",\n          \"weight\": 3,\n          \"priority\": 0,\n          \"healthy\": true,\n          \"ejected\": false,\n          \"times_ejected\": 0,\n          \"consecutive_gateway_failures\": 0,\n          \"in_flight\": 2,\n          \"ewma_latency_ms\": 1.234,\n          \"available\": true\n        },\n        {\n          \"address\": \"10.0.0.2:8080\",\n          \"weight\": 1,\n          \"priority\": 0,\n          \"healthy\": true,\n          \"ejected\": true,\n          \"ejected_until\": \"2026-11-15T01:02:33.450000001Z\",\n          \"times_ejected\": 2,\n          \"last_eject_reason\": \"consecutive_gateway_failure\",\n          \"consecutive_gateway_failures\": 5,\n          \"in_flight\": 0,\n          \"ewma_latency_ms\": 5e-7,\n          \"available\": false\n        },\n        {\n          \"address\": \"[2001:db8::1]:8080\",\n          \"weight\": 1,\n          \"priority\": 1,\n          \"healthy\": false,\n          \"last_probe_error\": \"GET /healthz: status 503 \\u003c\\\"down\\\" \\u0026 out\\u003e\",\n          \"ejected\": false,\n          \"times_ejected\": 0,\n          \"consecutive_gateway_failures\": 0,\n          \"in_flight\": 1,\n          \"ewma_latency_ms\": 250,\n          \"available\": false\n        }\n      ]\n    },\n    {\n      \"name\": \"api\",\n      \"policy\": \"maglev\",\n      \"in_flight\": 0,\n      \"max_requests\": 1,\n      \"balancer\": {\n        \"healthy_per_priority\": [\n          0\n        ],\n        \"total_per_priority\": [\n          1\n        ],\n        \"priority_load_percent\": [\n          0\n        ],\n        \"panic\": true\n      },\n      \"endpoints\": [\n        {\n          \"address\": \"api.internal:443\",\n          \"weight\": 100,\n          \"priority\": 0,\n          \"healthy\": false,\n          \"ejected\": true,\n          \"ejected_until\": \"2026-11-15T01:03:00Z\",\n          \"times_ejected\": 1,\n          \"last_eject_reason\": \"success_rate\",\n          \"consecutive_gateway_failures\": 0,\n          \"in_flight\": 0,\n          \"ewma_latency_ms\": 1e+21,\n          \"available\": false\n        }\n      ]\n    }\n  ]\n}\n"
+  },
+  {
+    "name": "reload open",
+    "token": false,
+    "state": "full",
+    "method": "POST",
+    "target": "/reload",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"config_version\": 8,\n  \"status\": \"reloaded\"\n}\n"
+  },
+  {
+    "name": "metrics open",
+    "token": false,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "text/plain; version=0.0.4",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "# HELP steer_test_total Test.\n# TYPE steer_test_total counter\nsteer_test_total 1\n"
+  },
+  {
+    "name": "clusters with none",
+    "token": false,
+    "state": "empty",
+    "method": "GET",
+    "target": "/clusters",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"config_version\": 1,\n  \"loaded_at\": \"2026-11-15T01:02:03.45Z\",\n  \"clusters\": null\n}\n"
+  },
+  {
+    "name": "clusters with a NaN",
+    "token": false,
+    "state": "nan",
+    "method": "GET",
+    "target": "/clusters",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": ""
+  },
+  {
+    "name": "unknown path",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/nope",
+    "status": 404,
+    "response_header": {
+      "content-type": "application/json",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no such endpoint\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "unknown path with the token",
+    "token": true,
+    "state": "full",
+    "method": "POST",
+    "target": "/nope",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 404,
+    "response_header": {
+      "content-type": "application/json",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no such endpoint\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "trailing slash",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/healthz/",
+    "status": 404,
+    "response_header": {
+      "content-type": "application/json",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no such endpoint\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "root",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/",
+    "status": 404,
+    "response_header": {
+      "content-type": "application/json",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no such endpoint\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "double slash",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "//healthz",
+    "status": 307,
+    "response_header": {
+      "content-type": "text/html; charset=utf-8",
+      "location": "/healthz"
+    },
+    "body": "<a href=\"/healthz\">Temporary Redirect</a>.\n\n"
+  },
+  {
+    "name": "dot dot with a query",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/a/../healthz?x=1&y='2'%3C",
+    "status": 307,
+    "response_header": {
+      "content-type": "text/html; charset=utf-8",
+      "location": "/healthz?x=1&y='2'%3C"
+    },
+    "body": "<a href=\"/healthz?x=1&amp;y=&#39;2&#39;%3C\">Temporary Redirect</a>.\n\n"
+  },
+  {
+    "name": "dot",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/./readyz",
+    "status": 307,
+    "response_header": {
+      "content-type": "text/html; charset=utf-8",
+      "location": "/readyz"
+    },
+    "body": "<a href=\"/readyz\">Temporary Redirect</a>.\n\n"
+  },
+  {
+    "name": "dot dot by POST",
+    "token": true,
+    "state": "full",
+    "method": "POST",
+    "target": "/x/../reload",
+    "header": {
+      "Authorization": "Bearer admin-token-0123456789"
+    },
+    "status": 307,
+    "response_header": {
+      "location": "/reload"
+    },
+    "body": ""
+  },
+  {
+    "name": "dot dot by HEAD",
+    "token": true,
+    "state": "full",
+    "method": "HEAD",
+    "target": "/x/..//clusters",
+    "status": 307,
+    "response_header": {
+      "content-type": "text/html; charset=utf-8",
+      "location": "/clusters"
+    },
+    "body": ""
+  },
+  {
+    "name": "escaped letter",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/heal%74hz",
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"status\": \"ok\"\n}\n"
+  },
+  {
+    "name": "escaped dots",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/%2E%2E/healthz",
+    "status": 404,
+    "response_header": {
+      "content-type": "application/json",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no such endpoint\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  },
+  {
+    "name": "escaped specials",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/q/./%3Cb%3E&x%20y!",
+    "status": 307,
+    "response_header": {
+      "content-type": "text/html; charset=utf-8",
+      "location": "/q/%3Cb%3E&x%20y!"
+    },
+    "body": "<a href=\"/q/%3Cb%3E&amp;x%20y!\">Temporary Redirect</a>.\n\n"
+  },
+  {
+    "name": "unclean unknown",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/a//b/",
+    "status": 307,
+    "response_header": {
+      "content-type": "text/html; charset=utf-8",
+      "location": "/a/b/"
+    },
+    "body": "<a href=\"/a/b/\">Temporary Redirect</a>.\n\n"
+  },
+  {
+    "name": "kept request id",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/healthz",
+    "header": {
+      "X-Request-Id": "abc-123.x_y:z"
+    },
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "abc-123.x_y:z"
+    },
+    "body": "{\n  \"status\": \"ok\"\n}\n"
+  },
+  {
+    "name": "kept request id on an error",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/metrics",
+    "header": {
+      "X-Request-Id": "trace:1.2-3_4"
+    },
+    "status": 401,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "www-authenticate": "Bearer realm=\"steer-admin\"",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "trace:1.2-3_4"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"unauthenticated\",\n    \"message\": \"missing or invalid admin token\",\n    \"request_id\": \"trace:1.2-3_4\"\n  }\n}\n"
+  },
+  {
+    "name": "replaced request id",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/healthz",
+    "header": {
+      "X-Request-Id": "has space"
+    },
+    "status": 200,
+    "response_header": {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+      "x-content-type-options": "nosniff",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"status\": \"ok\"\n}\n"
+  },
+  {
+    "name": "request id on not found",
+    "token": true,
+    "state": "full",
+    "method": "GET",
+    "target": "/nope",
+    "header": {
+      "X-Request-Id": "abc-123"
+    },
+    "status": 404,
+    "response_header": {
+      "content-type": "application/json",
+      "x-request-id": "<generated>"
+    },
+    "body": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no such endpoint\",\n    \"request_id\": \"<generated>\"\n  }\n}\n"
+  }
+]
