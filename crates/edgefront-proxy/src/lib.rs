@@ -14,5 +14,6 @@ pub mod health;
 pub mod outlier;
 pub mod path;
 pub mod reqid;
+pub mod retry;
 pub mod route;
 pub mod server;
