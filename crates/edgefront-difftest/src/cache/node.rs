@@ -133,6 +133,26 @@ shutdown_ms = 2000
     )
 }
 
+/// How many times [`Node::start`] tries fresh ports.
+pub const START_ATTEMPTS: u32 = 5;
+
+/// What both binaries log when a listener's port is taken
+/// (`EADDRINUSE`'s message).
+const ADDR_IN_USE: &str = "Address already in use";
+
+/// How one start went.
+enum Started {
+    Up(Node),
+    /// The node exited because a port was taken.
+    PortTaken(Node),
+}
+
+/// Why a node did not come up.
+enum Exited {
+    PortTaken,
+    Failed(io::Error),
+}
+
 /// A running node, killed when dropped.
 #[derive(Debug)]
 pub struct Node {
@@ -160,6 +180,11 @@ impl Node {
     /// Starts `name` and waits until its admin listener answers. The
     /// node's name is the same for both binaries, since it appears in Via
     /// and Cache-Status.
+    ///
+    /// The ports are picked free and bound by the node a moment later, so
+    /// another socket can take one in between. A node that exits because
+    /// its port is in use is started again on fresh ports, up to
+    /// [`START_ATTEMPTS`] times.
     pub fn start(name: &str, file: &str, launch: &Launch<'_>) -> io::Result<Node> {
         if !launch.faketime.exists() {
             return Err(io::Error::new(
@@ -170,6 +195,24 @@ impl Node {
                 ),
             ));
         }
+        let mut attempt = 1;
+        loop {
+            match Node::start_once(name, file, launch)? {
+                Started::Up(node) => return Ok(node),
+                Started::PortTaken(node) if attempt < START_ATTEMPTS => {
+                    drop(node);
+                    attempt += 1;
+                }
+                Started::PortTaken(node) => {
+                    return Err(node.failed(&format!(
+                        "found a port in use on each of {START_ATTEMPTS} starts"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn start_once(name: &str, file: &str, launch: &Launch<'_>) -> io::Result<Started> {
         let proxy = free_port()?;
         let admin = free_port()?;
         let conf = launch.dir.join(format!("{file}.toml"));
@@ -204,15 +247,24 @@ impl Node {
             log,
             child,
         };
-        node.wait_listening(Duration::from_secs(30))?;
-        Ok(node)
+        match node.wait_listening(Duration::from_secs(30)) {
+            Ok(()) => Ok(Started::Up(node)),
+            Err(Exited::PortTaken) => Ok(Started::PortTaken(node)),
+            Err(Exited::Failed(e)) => Err(e),
+        }
     }
 
-    fn wait_listening(&mut self, limit: Duration) -> io::Result<()> {
+    fn wait_listening(&mut self, limit: Duration) -> Result<(), Exited> {
         let deadline = Instant::now() + limit;
         loop {
-            if let Some(status) = self.child.try_wait()? {
-                return Err(self.failed(&format!("exited with {status}")));
+            if let Some(status) = self.child.try_wait().map_err(Exited::Failed)? {
+                let log = fs::read_to_string(&self.log).unwrap_or_default();
+                if log.contains(ADDR_IN_USE) {
+                    return Err(Exited::PortTaken);
+                }
+                return Err(Exited::Failed(
+                    self.failed(&format!("exited with {status}")),
+                ));
             }
             let up = [self.proxy, self.admin].iter().all(|a| {
                 std::net::TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok()
@@ -221,7 +273,7 @@ impl Node {
                 return Ok(());
             }
             if Instant::now() > deadline {
-                return Err(self.failed("did not start listening"));
+                return Err(Exited::Failed(self.failed("did not start listening")));
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -347,6 +399,45 @@ mod tests {
         };
         let err = Node::start("n", "n", &launch).unwrap_err();
         assert!(err.to_string().contains("n exited with"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_port_taken_on_every_start_is_reported_after_the_last_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("difftest-taken-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let clock = Clock::create(dir.join("now"), 0).unwrap();
+        // Logs what a node logs when its listener's port is taken, counts
+        // the start, and exits.
+        let script = dir.join("taken");
+        let starts = dir.join("starts");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho 'cannot listen on 127.0.0.1:1: Address already in use (os error 98)'\nexit 1\n",
+                starts.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let launch = Launch {
+            binary: &script,
+            faketime: Path::new("/dev/null"),
+            dir: &dir,
+            clock: &clock,
+            origin: "127.0.0.1:1".parse().unwrap(),
+        };
+        let err = Node::start("n", "n", &launch).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("n found a port in use on each of 5 starts"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Address already in use"), "{err}");
+        let count = fs::read_to_string(&starts).unwrap().lines().count();
+        assert_eq!(count as u32, START_ATTEMPTS);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

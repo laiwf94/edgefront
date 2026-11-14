@@ -208,6 +208,45 @@ fn a_recorded_log_replays_through_the_command_line() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A node whose port is taken before it binds it exits, and the harness
+/// starts it again on fresh ports (#247). The wrapper's first start fails
+/// as the binary does on `EADDRINUSE`; the second runs the binary.
+#[test]
+fn a_node_that_finds_its_port_taken_is_started_again() {
+    let dir = scratch("taken");
+    let marker = dir.join("failed-once");
+    let flaky = wrapper(
+        &dir,
+        "flaky",
+        &format!(
+            "if [ ! -e {m} ]; then touch {m}; echo 'cannot listen on 127.0.0.1:1: Address already in use (os error 98)'; exit 1; fi",
+            m = marker.display()
+        ),
+    );
+    let args: Vec<String> = [
+        "--requests",
+        "300",
+        "--seed",
+        "5",
+        "--dir",
+        dir.join("run").to_str().unwrap(),
+        "--",
+        BIN,
+        flaky.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let cmd = cli::parse(&args, true, 0).unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = cli::run(&cmd, &mut out, &mut err);
+    let (out, err) = (text(out), text(err));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains(": 0 divergent\n"), "{out}");
+    assert!(marker.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn a_divergent_run_exits_one() {
     let dir = scratch("exit");
