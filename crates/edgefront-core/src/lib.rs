@@ -19,7 +19,10 @@
 //! - [`admin`]: the admin router, bearer tokens and JSON errors, and
 //!   steer's operator API ([`admin::Api`]) with its JSON in Go's encoding;
 //! - [`filter`]: the phases a layer such as the cache runs in on a
-//!   proxy route.
+//!   proxy route;
+//! - [`l4`]: the base TCP relay, pacerd's data path: bidirectional copy
+//!   through one fixed buffer per direction, half-close, and connect and
+//!   idle timeouts.
 
 pub mod admin;
 pub mod body;
@@ -28,6 +31,7 @@ pub mod config;
 pub mod filter;
 pub mod http1;
 pub mod ids;
+pub mod l4;
 pub mod listener;
 pub mod metrics;
 pub mod reqid;

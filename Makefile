@@ -59,7 +59,7 @@ TSAN_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 TSAN_CARGO ?= cargo +nightly
 TSAN_CRATES := cachet edgefront-cache edgefront-core edgefront-limiter edgefront-proxy edgefront-difftest edgefront-bench
 TSAN_TESTS_cachet := proxy revalidation failure cluster
-TSAN_TESTS_edgefront-core := listener admin client
+TSAN_TESTS_edgefront-core := listener admin client l4
 TSAN_TESTS_edgefront-cache := layer proxy_layer
 TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier filters retry
 
