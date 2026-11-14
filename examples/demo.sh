@@ -147,11 +147,19 @@ get "$B" /static/tagged
 result=$(curl -fsS -X POST -H "authorization: Bearer $CACHET_ADMIN_TOKEN" \
     -d '{"tags": ["static"]}' "http://$A_ADMIN/purge")
 echo "   POST edge-a /purge {\"tags\": [\"static\"]} -> $result"
+# The metrics are read whole before grep looks at them: under pipefail,
+# `curl | grep -q` fails whenever grep exits on its match while curl is
+# still writing, and curl dies of SIGPIPE (#241).
+peer_purge_applied() {
+    local metrics
+    metrics=$(curl -fsS "http://$B_ADMIN/metrics") || return 1
+    grep -q '^cachet_purges_peer_total 1$' <<<"$metrics"
+}
 for _ in $(seq 50); do
-    curl -fsS "http://$B_ADMIN/metrics" | grep -q '^cachet_purges_peer_total 1$' && break
+    peer_purge_applied && break
     sleep 0.1
 done
-curl -fsS "http://$B_ADMIN/metrics" | grep -q '^cachet_purges_peer_total 1$' || fail "edge-b never applied the purge"
+peer_purge_applied || fail "edge-b never applied the purge"
 get "$A" /static/tagged
 [[ $CACHE_STATUS == *"fwd=miss"* ]] || fail "edge-a should have dropped the object"
 get "$B" /static/tagged
