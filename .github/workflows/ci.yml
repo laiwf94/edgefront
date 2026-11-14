@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The full fuzz campaign runs nightly; pushes and pull requests run a short
+  # smoke pass per target so a push's checks finish in minutes.
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -78,9 +83,10 @@ jobs:
   fuzz:
     name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
     runs-on: ubuntu-latest
-    # A target runs for `secs` seconds (default 600); `timeout` minutes
-    # (default 30) leave room for the build.
-    timeout-minutes: ${{ matrix.timeout || 30 }}
+    # Nightly and on manual runs a target runs for `secs` seconds (default
+    # 600) within `timeout` minutes (default 30), which leave room for the
+    # build. Pushes and pull requests run each target for 60 seconds.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (matrix.timeout || 30) || 15 }}
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +117,7 @@ jobs:
           dict=
           if [ -f "$dir/${{ matrix.target }}.dict" ]; then dict="-dict=$dir/${{ matrix.target }}.dict"; fi
           cargo fuzz run --fuzz-dir "$dir" ${{ matrix.target }} --target x86_64-unknown-linux-gnu \
-            -- -max_total_time=${{ matrix.secs || 600 }} -timeout=10 $dict
+            -- -max_total_time=${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (matrix.secs || 600) || 60 }} -timeout=10 $dict
       - name: Keep the crashing input
         if: failure()
         uses: actions/upload-artifact@v4
