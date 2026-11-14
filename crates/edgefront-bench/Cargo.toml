@@ -1,0 +1,21 @@
+[package]
+name = "edgefront-bench"
+description = "The shared benchmark harness: an open-loop load generator with HDR latency histograms."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+# HTTP/2 for the h2 client; the edge binary itself does not take it.
+hyper = { workspace = true, features = ["http2"] }
+hyper-util.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

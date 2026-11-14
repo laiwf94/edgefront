@@ -27,6 +27,7 @@ repository = "https://github.com/laiwf94/edgefront"
 [workspace.dependencies]
 # Workspace crates.
 cachet = { path = ".", version = "0.1.0" }
+edgefront-bench = { path = "crates/edgefront-bench", version = "0.1.0" }
 edgefront-cache = { path = "crates/edgefront-cache", version = "0.1.0" }
 edgefront-core = { path = "crates/edgefront-core", version = "0.1.0" }
 edgefront-difftest = { path = "crates/edgefront-difftest", version = "0.1.0" }
