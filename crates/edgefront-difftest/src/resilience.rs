@@ -1032,12 +1032,12 @@ fn compare(t: &Trace, theirs: &Answer, ours: &Answer) -> Option<(usize, String)>
     let n = theirs.lines.len().max(ours.lines.len());
     let k = (0..n).find(|&k| theirs.lines.get(k) != ours.lines.get(k))?;
     let mut before = String::new();
-    for j in k.saturating_sub(CONTEXT)..k {
+    let first = k.saturating_sub(CONTEXT);
+    for (j, line) in ours.lines.iter().enumerate().take(k).skip(first) {
         before.push_str(&format!(
-            "\n  {:>6}  {:<28} {}",
+            "\n  {:>6}  {:<28} {line}",
             j + 1,
             t.op(j).unwrap_or_default(),
-            ours.lines[j]
         ));
     }
     let show = |l: Option<&String>| l.map_or("(no line)".to_string(), Clone::clone);
