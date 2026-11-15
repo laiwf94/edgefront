@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use edgefront_core::clock::Clock;
 use edgefront_core::config;
 use edgefront_core::http1::ClientError;
+use edgefront_core::telemetry::metrics::AttemptResult;
 use http::{HeaderMap, Method};
 
 /// Counts requests and retries in one-second buckets over a sliding window
@@ -266,6 +267,13 @@ impl Outcome {
     }
 }
 
+impl From<Outcome> for AttemptResult {
+    /// The series of `steer_upstream_attempts_total` an attempt counts in.
+    fn from(o: Outcome) -> AttemptResult {
+        AttemptResult::ALL[o.index()]
+    }
+}
+
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -441,6 +449,19 @@ pub async fn per_try<F: Future>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcomes_count_under_their_own_label() {
+        for o in [
+            Outcome::Success,
+            Outcome::Http5xx(503),
+            Outcome::ConnectError,
+            Outcome::Timeout,
+            Outcome::Reset,
+        ] {
+            assert_eq!(AttemptResult::from(o).as_str(), o.as_str());
+        }
+    }
     use edgefront_core::clock::ManualClock;
 
     fn budget(ratio: f64, min: u32, window: u64) -> (Budget, Arc<ManualClock>) {

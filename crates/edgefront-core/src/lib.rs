@@ -15,7 +15,8 @@
 //!   on, and the pooled HTTP/1.1 client;
 //! - [`body`]: the boxed response body handlers return;
 //! - [`metrics`]: atomic counters and histograms in the Prometheus text
-//!   format;
+//!   format, and in [`telemetry::metrics`] steer's labelled registry and
+//!   its metric families, rendered as steer rendered them;
 //! - [`admin`]: the admin router, bearer tokens and JSON errors, and
 //!   steer's operator API ([`admin::Api`]) with its JSON in Go's encoding;
 //! - [`filter`]: the phases a layer such as the cache runs in on a
@@ -35,3 +36,4 @@ pub mod l4;
 pub mod listener;
 pub mod metrics;
 pub mod reqid;
+pub mod telemetry;

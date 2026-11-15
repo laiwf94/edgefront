@@ -1,0 +1,123 @@
+# HELP steer_config_reloads_total Configuration reloads.
+# TYPE steer_config_reloads_total counter
+steer_config_reloads_total{result="failure"} 1
+steer_config_reloads_total{result="success"} 1
+# HELP steer_health_transitions_total Active health check verdict changes.
+# TYPE steer_health_transitions_total counter
+steer_health_transitions_total{cluster="api",to="healthy"} 1
+steer_health_transitions_total{cluster="api",to="unhealthy"} 1
+# HELP steer_no_route_total Requests that matched no route.
+# TYPE steer_no_route_total counter
+steer_no_route_total 1
+# HELP steer_outlier_ejections_total Endpoints ejected by outlier detection.
+# TYPE steer_outlier_ejections_total counter
+steer_outlier_ejections_total{cluster="web",reason="consecutive_gateway_failure"} 1
+# HELP steer_overflow_total Requests refused by the cluster concurrency limit.
+# TYPE steer_overflow_total counter
+steer_overflow_total{cluster="api"} 0
+steer_overflow_total{cluster="web"} 0
+# HELP steer_requests_total Requests by cluster and response status class.
+# TYPE steer_requests_total counter
+steer_requests_total{cluster="api",code_class="1xx"} 0
+steer_requests_total{cluster="api",code_class="2xx"} 0
+steer_requests_total{cluster="api",code_class="3xx"} 0
+steer_requests_total{cluster="api",code_class="4xx"} 0
+steer_requests_total{cluster="api",code_class="5xx"} 1
+steer_requests_total{cluster="api",code_class="unknown"} 0
+steer_requests_total{cluster="web",code_class="1xx"} 0
+steer_requests_total{cluster="web",code_class="2xx"} 4
+steer_requests_total{cluster="web",code_class="3xx"} 0
+steer_requests_total{cluster="web",code_class="4xx"} 0
+steer_requests_total{cluster="web",code_class="5xx"} 0
+steer_requests_total{cluster="web",code_class="unknown"} 0
+# HELP steer_retries_total Retry attempts sent.
+# TYPE steer_retries_total counter
+steer_retries_total{cluster="api"} 0
+steer_retries_total{cluster="web"} 1
+# HELP steer_retry_budget_exhausted_total Retries skipped because the retry budget was spent.
+# TYPE steer_retry_budget_exhausted_total counter
+steer_retry_budget_exhausted_total{cluster="api"} 0
+steer_retry_budget_exhausted_total{cluster="web"} 0
+# HELP steer_tls_handshakes_total TLS handshakes on the proxy listener by result.
+# TYPE steer_tls_handshakes_total counter
+steer_tls_handshakes_total{result="error"} 1
+steer_tls_handshakes_total{result="ok"} 1
+steer_tls_handshakes_total{result="timeout"} 0
+# HELP steer_upstream_attempts_total Upstream attempts by endpoint and result.
+# TYPE steer_upstream_attempts_total counter
+steer_upstream_attempts_total{cluster="api",endpoint="127.0.0.1:19102",result="connect_error"} 0
+steer_upstream_attempts_total{cluster="api",endpoint="127.0.0.1:19102",result="http_5xx"} 1
+steer_upstream_attempts_total{cluster="api",endpoint="127.0.0.1:19102",result="reset"} 0
+steer_upstream_attempts_total{cluster="api",endpoint="127.0.0.1:19102",result="success"} 0
+steer_upstream_attempts_total{cluster="api",endpoint="127.0.0.1:19102",result="timeout"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:1",result="connect_error"} 1
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:1",result="http_5xx"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:1",result="reset"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:1",result="success"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:1",result="timeout"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:19101",result="connect_error"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:19101",result="http_5xx"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:19101",result="reset"} 0
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:19101",result="success"} 4
+steer_upstream_attempts_total{cluster="web",endpoint="127.0.0.1:19101",result="timeout"} 0
+# HELP steer_config_version Version of the configuration being served.
+# TYPE steer_config_version gauge
+steer_config_version 2
+# HELP steer_tls_handshakes_in_progress TLS handshakes running on the proxy listener.
+# TYPE steer_tls_handshakes_in_progress gauge
+steer_tls_handshakes_in_progress 0
+# HELP steer_request_duration_seconds Request latency as seen by the client, including retries.
+# TYPE steer_request_duration_seconds histogram
+steer_request_duration_seconds_bucket{cluster="api",le="0.00005"} 0
+steer_request_duration_seconds_bucket{cluster="api",le="0.0001"} 0
+steer_request_duration_seconds_bucket{cluster="api",le="0.00025"} 0
+steer_request_duration_seconds_bucket{cluster="api",le="0.0005"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.001"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.0025"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.005"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.01"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.025"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.05"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.1"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="0.25"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="1"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="2.5"} 1
+steer_request_duration_seconds_bucket{cluster="api",le="+Inf"} 1
+steer_request_duration_seconds_sum{cluster="api"} 0.00027
+steer_request_duration_seconds_count{cluster="api"} 1
+steer_request_duration_seconds_bucket{cluster="web",le="0.00005"} 0
+steer_request_duration_seconds_bucket{cluster="web",le="0.0001"} 1
+steer_request_duration_seconds_bucket{cluster="web",le="0.00025"} 3
+steer_request_duration_seconds_bucket{cluster="web",le="0.0005"} 3
+steer_request_duration_seconds_bucket{cluster="web",le="0.001"} 3
+steer_request_duration_seconds_bucket{cluster="web",le="0.0025"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="0.005"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="0.01"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="0.025"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="0.05"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="0.1"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="0.25"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="1"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="2.5"} 4
+steer_request_duration_seconds_bucket{cluster="web",le="+Inf"} 4
+steer_request_duration_seconds_sum{cluster="web"} 0.002013
+steer_request_duration_seconds_count{cluster="web"} 4
+# HELP steer_tls_handshake_duration_seconds Time to complete a TLS handshake on the proxy listener.
+# TYPE steer_tls_handshake_duration_seconds histogram
+steer_tls_handshake_duration_seconds_bucket{le="0.00005"} 0
+steer_tls_handshake_duration_seconds_bucket{le="0.0001"} 0
+steer_tls_handshake_duration_seconds_bucket{le="0.00025"} 0
+steer_tls_handshake_duration_seconds_bucket{le="0.0005"} 0
+steer_tls_handshake_duration_seconds_bucket{le="0.001"} 0
+steer_tls_handshake_duration_seconds_bucket{le="0.0025"} 1
+steer_tls_handshake_duration_seconds_bucket{le="0.005"} 1
+steer_tls_handshake_duration_seconds_bucket{le="0.01"} 1
+steer_tls_handshake_duration_seconds_bucket{le="0.025"} 1
+steer_tls_handshake_duration_seconds_bucket{le="0.05"} 1
+steer_tls_handshake_duration_seconds_bucket{le="0.1"} 1
+steer_tls_handshake_duration_seconds_bucket{le="0.25"} 1
+steer_tls_handshake_duration_seconds_bucket{le="1"} 1
+steer_tls_handshake_duration_seconds_bucket{le="2.5"} 1
+steer_tls_handshake_duration_seconds_bucket{le="+Inf"} 1
+steer_tls_handshake_duration_seconds_sum 0.001247
+steer_tls_handshake_duration_seconds_count 1
