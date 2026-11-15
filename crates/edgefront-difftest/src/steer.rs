@@ -212,12 +212,21 @@ pub fn answer(q: &Query) -> Answer {
 /// per query line, until `input` ends. This is the Rust twin of
 /// `cmd/diffdrive`, used to test the harness end to end. `picks` queries,
 /// written by [`Scenario::to_line`](crate::balancer::Scenario::to_line),
-/// are answered by [`balancer::answer_line`](crate::balancer::answer_line).
+/// are answered by [`balancer::answer_line`](crate::balancer::answer_line),
+/// and `outlier` and `retry` queries by
+/// [`resilience::answer_line`](crate::resilience::answer_line).
 pub fn serve(input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     for (n, line) in input.lines().enumerate() {
         let line = line?;
         let bad =
             |e: String| io::Error::new(io::ErrorKind::InvalidData, format!("line {}: {e}", n + 1));
+        if line.starts_with(r#"{"op":"outlier""#) || line.starts_with(r#"{"op":"retry""#) {
+            let a = crate::resilience::answer_line(&line).map_err(bad)?;
+            serde_json::to_writer(&mut output, &a)?;
+            output.write_all(b"\n")?;
+            output.flush()?;
+            continue;
+        }
         if line.starts_with(r#"{"op":"picks""#) {
             let a = crate::balancer::answer_line(&line).map_err(bad)?;
             serde_json::to_writer(&mut output, &a)?;

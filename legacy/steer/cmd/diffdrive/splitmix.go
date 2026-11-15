@@ -29,3 +29,9 @@ func (s *splitMix) IntN(n int) int {
 	hi, _ := bits.Mul64(s.Uint64(), uint64(n))
 	return int(hi)
 }
+
+// Float64 returns a float in [0, 1): the top 53 bits of the next output,
+// scaled. The retry query draws its backoff jitter from it.
+func (s *splitMix) Float64() float64 {
+	return float64(s.Uint64()>>11) / (1 << 53)
+}

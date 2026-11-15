@@ -293,9 +293,7 @@ func (s *Server) buildCluster(cc config.Cluster, prev *cluster) (*cluster, error
 		} else {
 			c.budget = retry.NewBudget(r.Budget.Ratio, r.Budget.MinPerSecond, r.Budget.Window, s.clk)
 		}
-		for _, code := range r.RetryOn {
-			c.retryOn[code-500] = true
-		}
+		c.retryOn = RetryOnSet(r)
 	}
 
 	name := cc.Name

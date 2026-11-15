@@ -23,7 +23,9 @@
 // which the Rust side leaves to its caller, so it is not a useful query.
 //
 // A picks query runs a balancing scenario through steer's balancer.LB and
-// answers one line per script operation; balance.go documents it.
+// answers one line per script operation; balance.go documents it. Outlier
+// and retry queries run failure traces through steer's outlier detector and
+// retry decisions in the same way; resilience.go documents them.
 //
 // The class of a rejection is "size" (over config.MaxFileBytes), "json" (the
 // decoder refused the document) or "invalid" (validation found problems; the
@@ -63,6 +65,10 @@ type query struct {
 	TableSize      int            `json:"table_size"`
 	Endpoints      []endpointSpec `json:"endpoints"`
 	Script         string         `json:"script"`
+	// An outlier or retry query.
+	Hosts   int          `json:"hosts"`
+	Outlier *outlierSpec `json:"outlier"`
+	Retry   *retrySpec   `json:"retry"`
 }
 
 type request struct {
@@ -157,6 +163,10 @@ func handle(q *query) (answer, error) {
 		return a, nil
 	case "picks":
 		return picks(q)
+	case "outlier":
+		return outliers(q)
+	case "retry":
+		return retries(q)
 	default:
 		return answer{}, fmt.Errorf("unknown op %q", q.Op)
 	}

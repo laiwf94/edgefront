@@ -10,6 +10,9 @@
 //!   `legacy/steer/cmd/diffdrive`.
 //! - [`balancer`]: pick sequences of steer's load balancer, scenario by
 //!   scenario, against the same driver's `picks` query.
+//! - [`resilience`]: outlier ejection and decay, and retry decisions with
+//!   their budget and backoff, on generated failure traces against the same
+//!   driver's `outlier` and `retry` queries.
 //! - [`pacer`]: libpacer's GCRA, keyed table and sliding window, against
 //!   `legacy/pacer/tests/diffdrive.c`. The driver reads one operation per
 //!   line on stdin and prints one line per operation; this crate's build
@@ -33,6 +36,7 @@ pub mod cache;
 pub mod driver;
 pub mod pacer;
 pub mod pacer_config;
+pub mod resilience;
 pub mod rng;
 pub mod steer;
 

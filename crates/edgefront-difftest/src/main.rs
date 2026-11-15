@@ -5,6 +5,8 @@
 //! edgefront-difftest rust-driver
 //! edgefront-difftest balancer [--scenarios N] [--requests N] [--seed N] -- DRIVER [ARGS...]
 //! edgefront-difftest balancer-scenario [--requests N] [--seed N]
+//! edgefront-difftest resilience [--traces N] [--steps N] [--requests N] [--long N] [--seed N] -- DRIVER [ARGS...]
+//! edgefront-difftest resilience-trace (outlier [--steps N] | retry [--requests N] [--long N]) [--seed N]
 //! edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
 //! edgefront-difftest pacer-script [--ops N] [--seed N]
 //! edgefront-difftest pacer-rust-driver
@@ -31,6 +33,19 @@
 //! that differs, prints it with the scenario's seed, the step and a replay
 //! command, and exits 1. `balancer-scenario` prints the `picks` query a
 //! seed generates, to feed a driver by hand.
+//!
+//! `resilience` diffs edgefront's outlier detection and retry decisions
+//! against steer's through the same driver: `--traces` seeded traces of
+//! each kind (default 5,000). An outlier trace has `--steps` operations
+//! (default 2,000) of attempt reports, ticks, clock moves, cleared
+//! ejections and state reads; a retry trace has `--requests` requests
+//! (default 1,000), and one whose seed is a multiple of 100 has `--long`
+//! (default 100,000). Every ejection, multiplier, retry decision, backoff
+//! and budget balance must match, and every budget decision must agree
+//! with an independent ledger of the window. It stops at the first
+//! difference, prints it with the trace's seed, the step and a replay
+//! command, and exits 1. `resilience-trace` prints the query a seed
+//! generates, to feed a driver by hand.
 //!
 //! `pacer` diffs edgefront-limiter against libpacer: it generates `--scripts`
 //! scripts of `--ops` random operations (default 100 of 10,000), runs each
@@ -66,6 +81,7 @@ use edgefront_difftest::balancer;
 use edgefront_difftest::cache;
 use edgefront_difftest::pacer::{self, DriverCommand, Script};
 use edgefront_difftest::pacer_config;
+use edgefront_difftest::resilience;
 use edgefront_difftest::steer::{self, Driver, Plan};
 
 const USAGE: &str = "usage:
@@ -73,6 +89,8 @@ const USAGE: &str = "usage:
   edgefront-difftest rust-driver
   edgefront-difftest balancer [--scenarios N] [--requests N] [--seed N] -- DRIVER [ARGS...]
   edgefront-difftest balancer-scenario [--requests N] [--seed N]
+  edgefront-difftest resilience [--traces N] [--steps N] [--requests N] [--long N] [--seed N] -- DRIVER [ARGS...]
+  edgefront-difftest resilience-trace (outlier [--steps N] | retry [--requests N] [--long N]) [--seed N]
   edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
   edgefront-difftest pacer-script [--ops N] [--seed N]
   edgefront-difftest pacer-rust-driver
@@ -109,6 +127,28 @@ fn main() -> ExitCode {
             }
             Err(e) => usage(&e),
         },
+        Some("resilience") => match parse_resilience(&args[1..], true) {
+            Ok((plan, Some(driver))) => run_resilience(plan, &driver),
+            Ok((_, None)) => usage("missing -- DRIVER"),
+            Err(e) => usage(&e),
+        },
+        Some("resilience-trace") => {
+            let kind = args.get(1).map(String::as_str);
+            match (kind, parse_resilience(args.get(2..).unwrap_or(&[]), false)) {
+                (Some("outlier"), Ok((plan, _))) => {
+                    let t = resilience::generate_outlier(plan.seed, plan.steps);
+                    println!("{}", resilience::Trace::Outlier(t).to_line());
+                    ExitCode::SUCCESS
+                }
+                (Some("retry"), Ok((plan, _))) => {
+                    let t = resilience::generate_retry(plan.seed, plan.requests_for(plan.seed));
+                    println!("{}", resilience::Trace::Retry(t).to_line());
+                    ExitCode::SUCCESS
+                }
+                (_, Err(e)) => usage(&e),
+                _ => usage("resilience-trace needs outlier or retry"),
+            }
+        }
         Some("pacer") => match parse_pacer(&args[1..], true) {
             Ok((plan, driver)) => run_pacer(plan, &driver),
             Err(e) => usage(&e),
@@ -296,6 +336,67 @@ fn run_balancer(plan: balancer::Plan, driver: &[String]) -> ExitCode {
     let started = Instant::now();
     let result =
         Driver::spawn(&driver[0], &driver[1..]).and_then(|mut d| balancer::run(&mut d, plan));
+    let report = match result {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!(
+                "edgefront-difftest: driver {:?}: {e} (seed {})",
+                driver.join(" "),
+                plan.seed
+            );
+            return ExitCode::from(2);
+        }
+    };
+    println!("{report}");
+    println!("took {:.1}s", started.elapsed().as_secs_f64());
+    if report.divergence.is_some() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn parse_resilience(
+    args: &[String],
+    driver: bool,
+) -> Result<(resilience::Plan, Option<Vec<String>>), String> {
+    let mut plan = resilience::Plan {
+        traces: 5_000,
+        steps: 2_000,
+        requests: 1_000,
+        long: 100_000,
+        seed: clock_seed(),
+    };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" && driver {
+            let command: Vec<String> = it.cloned().collect();
+            if command.is_empty() {
+                return Err("no driver command after --".into());
+            }
+            return Ok((plan, Some(command)));
+        }
+        let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
+        let number = |v: &str| {
+            v.parse::<u64>()
+                .map_err(|_| format!("{arg}: {v:?} is not a number"))
+        };
+        match arg.as_str() {
+            "--traces" if driver => plan.traces = number(value)? as usize,
+            "--steps" => plan.steps = number(value)? as usize,
+            "--requests" => plan.requests = number(value)? as usize,
+            "--long" => plan.long = number(value)? as usize,
+            "--seed" => plan.seed = number(value)?,
+            _ => return Err(format!("unknown option {arg}")),
+        }
+    }
+    Ok((plan, None))
+}
+
+fn run_resilience(plan: resilience::Plan, driver: &[String]) -> ExitCode {
+    let started = Instant::now();
+    let result =
+        Driver::spawn(&driver[0], &driver[1..]).and_then(|mut d| resilience::run(&mut d, plan));
     let report = match result {
         Ok(report) => report,
         Err(e) => {

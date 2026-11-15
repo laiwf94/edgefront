@@ -40,14 +40,6 @@ func (e *upstreamError) Unwrap() error { return e.err }
 // retrying on another endpoint when that is safe and the budget allows.
 type roundTripper struct{ s *Server }
 
-func idempotent(r *http.Request) bool {
-	switch r.Method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
-		return true
-	}
-	return r.Header.Get("Idempotency-Key") != ""
-}
-
 // RoundTrip implements http.RoundTripper.
 func (t roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	st := stateFrom(req.Context())
@@ -85,7 +77,7 @@ func (t roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if c.budget != nil {
 		c.budget.Deposit()
 	}
-	safe := idempotent(req)
+	safe := Idempotent(req)
 
 	var tried []int
 	idx := c.lb.Pick(key, hasKey, tried)
@@ -135,7 +127,11 @@ func (t roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		result := classify(resp, err, tryCtx)
 		st.results = append(st.results, resultNames[result])
 		c.attempts[idx][result].Inc()
-		gateway := result != resultSuccess && result != resultHTTP5xx || resp != nil && isGatewayStatus(resp.StatusCode)
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		gateway := GatewayFailure(result, status)
 		if c.detector != nil {
 			c.detector.Report(ep, gateway, result != resultSuccess)
 		}
@@ -145,19 +141,8 @@ func (t roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			ep.ObserveLatency(max(elapsed, failurePenalty), t.s.clk.Now())
 		}
 
-		retryable := false
-		if pol != nil && attempt < pol.MaxRetries && replayable {
-			switch result {
-			case resultConnectError:
-				retryable = true // the request never reached the upstream
-			case resultTimeout, resultReset:
-				retryable = safe
-			case resultHTTP5xx:
-				retryable = safe && c.retryOn[resp.StatusCode-500]
-			}
-		}
 		next := -1
-		if retryable {
+		if Retryable(pol, &c.retryOn, attempt, replayable, safe, result, status) {
 			next = c.lb.Pick(key, hasKey, tried)
 		}
 		if next >= 0 && !c.budget.TryWithdraw() {
