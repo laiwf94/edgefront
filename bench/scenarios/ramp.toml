@@ -1,0 +1,31 @@
+# A stepped ramp over HTTP/2 to find where latency turns: each step holds
+# its rate for 15 seconds, so the report shows p99 against offered load.
+name = "ramp"
+description = "10,000 small objects under a Zipf 1.0 law, 95% hits over HTTP/2, from 5,000 to 40,000 requests per second in eight steps."
+protocol = "http2"
+connections = 16
+timeout = "5s"
+seed = 5
+
+[warmup]
+rate = 5000
+duration = "20s"
+
+[load]
+start = 5000
+step = 5000
+steps = 8
+step_duration = "15s"
+
+[keys]
+count = 10000
+zipf = 1.0
+hit_ratio = 0.95
+
+[[objects]]
+size = "2KiB"
+weight = 3
+
+[[objects]]
+size = "8KiB"
+weight = 1

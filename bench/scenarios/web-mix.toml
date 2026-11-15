@@ -1,0 +1,42 @@
+# A web site's mix: mostly small assets, some images, a few large downloads,
+# with a long tail of objects asked for rarely. Exercises eviction and the
+# fill path as well as hits.
+name = "web-mix"
+description = "10,000 objects from 1 KiB to 2 MiB under a Zipf 0.9 law, 90% hits at 5,000 requests per second."
+protocol = "http1"
+connections = 128
+timeout = "10s"
+seed = 2
+
+[warmup]
+rate = 5000
+duration = "60s"
+
+[load]
+rate = 5000
+duration = "120s"
+
+[keys]
+count = 10000
+zipf = 0.9
+hit_ratio = 0.9
+
+[[objects]]
+size = "1KiB"
+weight = 40
+
+[[objects]]
+size = "8KiB"
+weight = 30
+
+[[objects]]
+size = "64KiB"
+weight = 20
+
+[[objects]]
+size = "512KiB"
+weight = 9
+
+[[objects]]
+size = "2MiB"
+weight = 1

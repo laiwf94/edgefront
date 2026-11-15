@@ -8,6 +8,11 @@
 //! - [`histogram`]: the high dynamic range histogram each phase records
 //!   its latencies in, three significant digits from a nanosecond to an
 //!   hour.
+//! - [`scenario`]: benchmark scenarios read from TOML under
+//!   `bench/scenarios/`: the schedule, the object size mix, Zipf key
+//!   popularity and a hit ratio target, turned into a schedule and a
+//!   deterministic request source for [`load`].
 
 pub mod histogram;
 pub mod load;
+pub mod scenario;

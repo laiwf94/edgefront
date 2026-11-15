@@ -1,0 +1,35 @@
+# The hit path: a small hot set of small objects, nearly every request a
+# hit. The cache's best case and the number the hit-path p99 targets are
+# measured on. Short enough to run against two targets on a laptop in under
+# five minutes.
+name = "cache-hit"
+description = "1,000 small objects under a Zipf 1.0 law, 98% hits at a constant 5,000 requests per second."
+protocol = "http1"
+connections = 64
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 2000
+duration = "10s"
+
+[load]
+rate = 5000
+duration = "60s"
+
+[keys]
+count = 1000
+zipf = 1.0
+hit_ratio = 0.98
+
+[[objects]]
+size = "1KiB"
+weight = 5
+
+[[objects]]
+size = "4KiB"
+weight = 4
+
+[[objects]]
+size = "16KiB"
+weight = 1

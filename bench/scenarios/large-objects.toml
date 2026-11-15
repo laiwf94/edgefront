@@ -1,0 +1,34 @@
+# Large objects: bandwidth and memory per byte rather than requests per
+# second. Measures how a target streams a body it holds and how much memory
+# a large body costs it in flight.
+name = "large-objects"
+description = "200 objects of 1 to 16 MiB under a Zipf 0.8 law, 95% hits at 200 requests per second."
+protocol = "http1"
+connections = 32
+timeout = "30s"
+seed = 3
+
+[warmup]
+rate = 200
+duration = "30s"
+
+[load]
+rate = 200
+duration = "60s"
+
+[keys]
+count = 200
+zipf = 0.8
+hit_ratio = 0.95
+
+[[objects]]
+size = "1MiB"
+weight = 6
+
+[[objects]]
+size = "4MiB"
+weight = 3
+
+[[objects]]
+size = "16MiB"
+weight = 1
