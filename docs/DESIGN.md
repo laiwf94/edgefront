@@ -198,6 +198,19 @@ Before two changes the table was 15 to 30% slower than the C on the same machine
 
 The absolute targets of 300 million GCRA and 18 million keyed-table decisions per second come from pacer's own numbers (313 and 19) on its reference machine, the Docker Desktop Linux VM on an Apple M4 Max; that machine still has to run these benchmarks. On the Xeon above the table reaches 18 million and the GCRA does not reach 300 million, and the C is further from both. To compare on any machine, run `cargo bench -p edgefront-limiter --bench decisions` and `make -C legacy/pacer bench-build && legacy/pacer/build/release/bench_limiter`, and read the 1-thread column.
 
+### Admission at accept
+
+`edgefront_limiter::conn` ports pacerd's `admit` from `proxy.c` and the per-listener state from `daemon.c`. One `Admission` per listener is shared by every worker, and `admit(peer, now_ns)` runs pacerd's checks in pacerd's order, before any byte is read:
+
+1. The listener's open count, one `AtomicU32` incremented first and given back on refusal, against `max_conns`: `listener_full`.
+2. One `Table::hold` on the client key, with a cap of `per_ip_max_conns` (or no cap) and one token of `per_ip_conn_rate`: `per_ip_conns` at the cap and `per_ip_rate` with no token, both taking nothing, or `table_full` for a new client with no room under the deny policy. With neither limit set the table is not called. A limit that is off is still a table, at pacerd's unlimited rate of 10^9 per second, so a reload can switch it on in place.
+
+The client key is `pd_client_key`: 4 bytes for IPv4 and for IPv4-mapped IPv6, or 16 bytes of IPv6 cut to `ipv6_prefix` bits. An admitted connection holds a `Permit`, whose drop releases the hold and then the listener slot, so a client that saw its connection close and reconnects at once is admitted, as pacerd guaranteed by logging the close only after both. Holds are never reclaimed or evicted, so the evict policy cannot hand an open client's slot to someone else.
+
+pacerd read the caps from the worker's config pointer, so one accept saw one reload. Here `max_conns` and `per_ip_max_conns` share one `AtomicU64`, and the prefix and whether a rate is on share one `AtomicU32`, so each accept reads both caps from the same reload without a lock. `reconfigure` refuses a change of `table_size` or `table_full` with pacerd's message (`listener web: table_size cannot change without a restart`), since the table is fixed memory.
+
+`Counters` are pacerd's sixteen per-listener stats, with `pd_stat_names` as `Stat::name`, and `Stat::for_reason` is pacerd's `stat_for`: the close reasons that `edgefront_core::l4::CloseReason::as_str` gives and the refusal reasons map to the same counters as in pacerd. pacerd kept one set per worker, written with plain stores; here every worker adds to one set with relaxed atomic adds, a few per connection, none per byte. `per_ip_conn_quota` (TOML only) is not enforced yet; it is the next task of week 3.
+
 `legacy/pacer` stays until its L4 data path and `pacerctl` are ported too (week 4).
 
 ## What cachet is for

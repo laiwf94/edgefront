@@ -8,6 +8,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod conn;
 pub mod gcra;
 pub mod lint;
 pub mod rate;
@@ -19,6 +20,7 @@ pub use config::{
     ConnQuota, LimiterConfig, Lines, ListenerConfig, ListenerLines, LogLevel, MinRate, SourceMap,
     parse_pacerd, parse_pacerd_mapped,
 };
+pub use conn::{Admission, ClientKey, Counters, Permit, Refusal, Stat};
 pub use gcra::{Decision, Error, Gcra, Rate};
 pub use lint::{Class, Lint, lint};
 pub use rate::{Limiter, Plan, Quota, RateError, RateSpec};
