@@ -13,6 +13,10 @@
 //! did. SIGTERM or SIGINT stops accepting, lets requests in flight finish
 //! for up to 30 seconds and exits.
 //!
+//! Health checks and outlier detection run beside the listener from the
+//! start and stop after it has drained; retries run on the request path
+//! (see [`edgefront_proxy::server`]).
+//!
 //! The admin listener and TLS termination are ported in later weeks; until
 //! then `admin_listen` is validated but not served, and a file with a `tls`
 //! block is refused rather than served in plain text.
@@ -103,6 +107,17 @@ pub fn run(args: &[String]) -> ExitCode {
             "listening"
         );
         let proxy = Arc::new(Proxy::new(&config));
+        let (stop_checks, checks_stopped) = tokio::sync::oneshot::channel::<()>();
+        let checks = tokio::spawn({
+            let proxy = Arc::clone(&proxy);
+            async move {
+                proxy
+                    .run_checks(async move {
+                        let _ = checks_stopped.await;
+                    })
+                    .await;
+            }
+        });
         let report = listener::serve(
             socket,
             proxy,
@@ -110,6 +125,8 @@ pub fn run(args: &[String]) -> ExitCode {
             crate::cli::wait_for_signal(),
         )
         .await;
+        drop(stop_checks);
+        let _ = checks.await;
         tracing::info!(
             accepted = report.accepted,
             forced = report.forced,

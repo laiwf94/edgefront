@@ -53,10 +53,29 @@
 //! `{"error":{"code":...,"message":...,"request_id":...}}`, and steer's
 //! headers. Each request is logged once, as steer's access log was.
 //!
-//! What steer did on top of this arrives with W03: health checks, outlier
-//! detection, retries with their budget and per-try timeout, the admin API
-//! and metrics. Until then every endpoint stays healthy and admitted unless
-//! something drives its state through [`Proxy::endpoints`].
+//! # Resilience
+//!
+//! A cluster with a `health_check` probes its endpoints and one with
+//! `outlier_detection` ejects them, both into the endpoint state the
+//! balancer reads. The probes and the detectors' ticks run in
+//! [`Proxy::run_checks`], which the binary spawns beside the listener;
+//! the consecutive-failure detector also runs on every attempt. A cluster
+//! without them keeps every endpoint healthy and admitted.
+//!
+//! A cluster with `retry` runs steer's attempt loop (its
+//! `transport.go`): every request deposits into the retry budget, each
+//! attempt is held to the per-try timeout and classified (`success`,
+//! `http_5xx`, `connect_error`, `timeout` or `reset`), reported to the
+//! outlier detector and observed as latency, and a retryable outcome
+//! picks another endpoint not tried yet, withdraws from the budget,
+//! waits the full-jitter backoff and tries again. A connect error is
+//! always retryable; a timeout, a reset or a `5xx` in `retry_on` only for
+//! an idempotent request; and only a body that is empty or was buffered
+//! whole can be sent again. When nothing more may be tried, the last
+//! response is delivered, or the last failure answered: `504
+//! upstream_timeout` for a timeout and `502 bad_gateway` otherwise. The
+//! response of an attempt that is retried is dropped after its first
+//! 4 KiB are read, as steer drained it.
 
 use std::future::Future as _;
 use std::net::SocketAddr;
@@ -71,7 +90,7 @@ use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
 use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
-use edgefront_core::http1::{Client, ClientError, ClientLimits};
+use edgefront_core::http1::{Client, ClientLimits};
 use edgefront_core::listener::Handler;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
@@ -84,8 +103,11 @@ use crate::balancer::rng::{Rng, SplitMix64};
 use crate::balancer::{Balancer, Options};
 use crate::endpoint::{Endpoint, InFlight};
 use crate::forwarded;
+use crate::health::{self, Checker};
+use crate::outlier::Detector;
 use crate::path::RequestTarget;
 use crate::reqid;
+use crate::retry::{self, Budget, Outcome, Policy};
 use crate::route::Router;
 
 /// The header naming the limit that refused a request with `503`.
@@ -135,8 +157,20 @@ struct Cluster {
     timeout: Option<Duration>,
     in_flight: Arc<AtomicU32>,
     max_requests: u32,
-    /// The largest body buffered for replay, when retries are on.
-    replay_limit: Option<u64>,
+    /// The retry policy and budget, when the cluster retries.
+    retry: Option<Retrying>,
+    /// Outlier detection, when configured.
+    detector: Option<Arc<Detector>>,
+    /// Active health checks, when configured.
+    checker: Option<Arc<Checker>>,
+    /// The draws behind each retry's backoff.
+    jitter: SplitMix64,
+}
+
+/// A cluster's retry settings and the budget its retries draw on.
+struct Retrying {
+    policy: Policy,
+    budget: Budget,
 }
 
 impl Cluster {
@@ -154,6 +188,52 @@ impl Cluster {
         // Validation keeps every weight in 1..=1000, every priority at most
         // 7 and at most 1,024 endpoints, below Maglev's default table size.
         let balancer = Balancer::new(endpoints, opts).expect("a validated cluster");
+        let retry = cfg.retry.as_ref().map(|r| Retrying {
+            policy: Policy::new(r),
+            budget: Budget::new(&r.budget, Arc::clone(clock)),
+        });
+        let name = cfg.name.clone();
+        let detector = cfg.outlier_detection.as_ref().map(|od| {
+            let cluster = name.clone();
+            let timer = Arc::clone(clock);
+            let on_eject: crate::outlier::EjectFn = Box::new(move |ep, reason, until| {
+                let ejected_for_ms = until.saturating_duration_since(timer.now()).as_millis();
+                tracing::warn!(
+                    cluster,
+                    endpoint = &*ep.address,
+                    reason,
+                    ejected_for_ms,
+                    "endpoint ejected"
+                );
+            });
+            Arc::new(Detector::new(
+                od.clone(),
+                balancer.endpoints().to_vec(),
+                Arc::clone(clock),
+                Some(on_eject),
+            ))
+        });
+        let checker = cfg.health_check.as_ref().map(|hc| {
+            let cluster = name.clone();
+            let on_change: health::ChangeFn = Box::new(move |ep, healthy, reason| {
+                if healthy {
+                    tracing::info!(cluster, endpoint = &*ep.address, "endpoint healthy");
+                } else {
+                    tracing::warn!(
+                        cluster,
+                        endpoint = &*ep.address,
+                        reason,
+                        "endpoint unhealthy"
+                    );
+                }
+            });
+            Arc::new(Checker::new(
+                hc.clone(),
+                balancer.endpoints().to_vec(),
+                Arc::clone(clock),
+                Some(on_change),
+            ))
+        });
         let limits = ClientLimits {
             connect_timeout: cfg.connect_timeout,
             // The cluster timeout bounds the whole exchange instead.
@@ -172,12 +252,16 @@ impl Cluster {
             timeout: Some(cfg.timeout).filter(|t| !t.is_zero()),
             in_flight: Arc::new(AtomicU32::new(0)),
             max_requests: cfg.max_requests,
-            replay_limit: cfg
-                .retry
-                .as_ref()
-                .filter(|r| r.max_retries > 0)
-                .map(|r| r.max_body_bytes),
+            retry,
+            detector,
+            checker,
+            jitter: SplitMix64::from_entropy(),
         }
+    }
+
+    /// How much of a body of `length` to buffer for replay, if any.
+    fn buffer_limit(&self, length: Option<u64>) -> Option<u64> {
+        self.retry.as_ref()?.policy.buffer_limit(length)
     }
 
     /// The request's hash key: steer's `HashKey` of the first value of the
@@ -267,6 +351,38 @@ impl Proxy {
             .iter()
             .find(|c| c.name == name)
             .map(|c| c.balancer.endpoints())
+    }
+
+    /// Runs every cluster's health checks and outlier detection ticks
+    /// until `shutdown` resolves, then returns once each has stopped. The
+    /// binary spawns it beside the listener; without it endpoints are
+    /// never probed and ejections never decay, though consecutive
+    /// failures still eject.
+    pub async fn run_checks(&self, shutdown: impl std::future::Future<Output = ()>) {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let mut tasks = tokio::task::JoinSet::new();
+        for c in &self.clusters {
+            if let Some(checker) = &c.checker {
+                let checker = Arc::clone(checker);
+                let until = until_stopped(stopped.clone());
+                tasks.spawn(async move { checker.run(until).await });
+            }
+            if let Some(detector) = &c.detector {
+                let detector = Arc::clone(detector);
+                let until = until_stopped(stopped.clone());
+                tasks.spawn(async move { detector.run(until).await });
+            }
+        }
+        shutdown.await;
+        stop.send_replace(true);
+        while tasks.join_next().await.is_some() {}
+    }
+
+    /// The retry budget's balance in the cluster named `name`, when it
+    /// retries: how many retries it would allow now.
+    pub fn retry_budget_balance(&self, name: &str) -> Option<f64> {
+        let c = self.clusters.iter().find(|c| c.name == name)?;
+        c.retry.as_ref().map(|r| r.budget.balance())
     }
 
     /// The balancer of the cluster named `name`.
@@ -399,11 +515,12 @@ impl Proxy {
         fwd.apply(&mut headers);
 
         let deadline = cluster.timeout.map(|t| started + t);
-        let mut picked = None;
+        let mut tried = Vec::new();
         let upstream_target = target.upstream_target();
         let exchange_fut = async {
             // steer reads a body it may replay before it picks.
-            let Ok(body) = upstream_body(incoming, length, cluster.replay_limit).await else {
+            let Ok(body) = upstream_body(incoming, length, cluster.buffer_limit(length)).await
+            else {
                 return Err(Failure::ClientBody);
             };
             cluster
@@ -414,7 +531,7 @@ impl Proxy {
                     body,
                     length,
                     key,
-                    &mut picked,
+                    &mut tried,
                 )
                 .await
         };
@@ -424,10 +541,7 @@ impl Proxy {
                 .unwrap_or(Err(Failure::Timeout)),
             None => exchange_fut.await,
         };
-        let access = match picked {
-            Some(i) => access.endpoint(&cluster.balancer.endpoints()[i].address),
-            None => access,
-        };
+        let access = access.tried(&cluster.balancer, &tried);
 
         let failure = match result {
             Ok((resp, in_flight)) => {
@@ -525,15 +639,15 @@ impl Again<'_> {
             );
             return x.deliver(resp, Delivery::Generated("overloaded"));
         };
-        let mut picked = None;
+        let mut tried = Vec::new();
         let send = self.cluster.forward(
             self.method,
             headers,
             self.target,
-            body::empty(),
+            UpstreamBody::Empty,
             Some(0),
             self.key,
-            &mut picked,
+            &mut tried,
         );
         let result = match self.deadline {
             Some(at) => tokio::time::timeout_at(at, send)
@@ -566,51 +680,129 @@ impl Again<'_> {
 }
 
 impl Cluster {
-    /// Picks an endpoint and sends it the request, recording the pick in
-    /// `picked` as soon as it is made, and the time to the response head
-    /// on the endpoint.
+    /// Sends the request to the endpoints the balancer picks, as steer's
+    /// round tripper did: one attempt, then retries while the policy, the
+    /// balancer and the budget allow. Each endpoint tried is pushed onto
+    /// `tried` as it is picked. Every attempt is reported to the outlier
+    /// detector and observed as latency (at least [`FAILURE_PENALTY`] when
+    /// it failed or answered 5xx). An attempt cancelled by the cluster
+    /// timeout observes nothing, as steer skipped requests whose context
+    /// ended.
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
         method: &Method,
         mut headers: HeaderMap,
         target: &[u8],
-        body: Body,
+        body: UpstreamBody,
         length: Option<u64>,
         key: Option<u64>,
-        picked: &mut Option<usize>,
+        tried: &mut Vec<usize>,
     ) -> Result<(Response<Incoming>, InFlight), Failure> {
-        let Some(i) = self.balancer.pick(key, &[]) else {
+        let uri_for = |address: &str| {
+            Uri::try_from(format!(
+                "http://{address}{}",
+                String::from_utf8_lossy(target)
+            ))
+            .map_err(|_| Failure::Proxy)
+        };
+        if let Some(r) = &self.retry {
+            r.budget.deposit();
+        }
+        let safe = retry::idempotent(method, &headers);
+        let replayable = body.replayable();
+        set_framing(&mut headers, method, length);
+        let per_try = self.retry.as_ref().and_then(|r| r.policy.per_try_timeout());
+        let mut stream = Some(body);
+
+        let Some(mut i) = self.balancer.pick(key, tried) else {
             return Err(Failure::NoHealthyUpstream);
         };
-        *picked = Some(i);
-        let endpoint = &self.balancer.endpoints()[i];
-        let in_flight = endpoint.state.track();
-        set_framing(&mut headers, method, length);
-        let uri = format!(
-            "http://{}{}",
-            endpoint.address,
-            String::from_utf8_lossy(target)
-        );
-        let mut out = Request::new(body);
-        *out.method_mut() = method.clone();
-        *out.uri_mut() = Uri::try_from(uri).map_err(|_| Failure::Proxy)?;
-        *out.version_mut() = Version::HTTP_11;
-        *out.headers_mut() = headers;
-        let began = self.clock.now();
-        let result = self.client.send(out).await;
-        // A cancelled exchange (the cluster timeout) observes nothing,
-        // as steer skipped requests whose context ended.
-        let now = self.clock.now();
-        let elapsed = now.saturating_duration_since(began);
-        let sample = match &result {
-            Ok(r) if !r.status().is_server_error() => elapsed,
-            _ => elapsed.max(FAILURE_PENALTY),
-        };
-        endpoint.state.observe_latency(sample, now);
-        match result {
-            Ok(resp) => Ok((resp, in_flight)),
-            Err(e) => Err(Failure::Upstream(e)),
+        for attempt in 0u32.. {
+            tried.push(i);
+            let endpoint = &self.balancer.endpoints()[i];
+            let in_flight = endpoint.state.track();
+            let body = match stream.as_ref() {
+                Some(UpstreamBody::Empty) => body::empty(),
+                Some(UpstreamBody::Buffered(b)) => body::full(b.clone()),
+                // Only a body that cannot be replayed streams, and it
+                // is never sent twice.
+                Some(UpstreamBody::Stream(_)) | None => match stream.take() {
+                    Some(UpstreamBody::Stream(b)) => b,
+                    _ => body::empty(),
+                },
+            };
+            let mut out = Request::new(body);
+            *out.method_mut() = method.clone();
+            *out.uri_mut() = uri_for(&endpoint.address)?;
+            *out.version_mut() = Version::HTTP_11;
+            *out.headers_mut() = headers.clone();
+            let began = self.clock.now();
+            let result = match retry::per_try(&*self.clock, per_try, self.client.send(out)).await {
+                Ok(r) => r.map_err(Outcome::of_error),
+                Err(retry::PerTryTimeout) => Err(Outcome::Timeout),
+            };
+            let now = self.clock.now();
+            let outcome = match &result {
+                Ok(resp) => Outcome::of_status(resp.status().as_u16()),
+                Err(o) => *o,
+            };
+            if let Some(d) = &self.detector {
+                d.report(endpoint, outcome.is_gateway_failure(), outcome.is_failure());
+            }
+            let elapsed = now.saturating_duration_since(began);
+            let sample = if outcome == Outcome::Success {
+                elapsed
+            } else {
+                elapsed.max(FAILURE_PENALTY)
+            };
+            endpoint.state.observe_latency(sample, now);
+
+            let next = self.retry.as_ref().and_then(|r| {
+                if !r.policy.retryable(attempt, replayable, safe, outcome) {
+                    return None;
+                }
+                let next = self.balancer.pick(key, tried)?;
+                if !r.budget.try_withdraw() {
+                    tracing::debug!(cluster = self.name, "retry budget exhausted");
+                    return None;
+                }
+                Some((
+                    next,
+                    r.policy
+                        .backoff(attempt, health::unit(self.jitter.next_u64())),
+                ))
+            });
+            let Some((next, wait)) = next else {
+                return match result {
+                    Ok(resp) => Ok((resp, in_flight)),
+                    Err(o) => Err(Failure::Attempt(o)),
+                };
+            };
+            if let Ok(resp) = result {
+                drain(resp).await;
+            }
+            drop(in_flight);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            i = next;
+        }
+        unreachable!("the attempt counter ends the loop long before it wraps")
+    }
+}
+
+/// Reads up to 4 KiB of a response that will not be delivered, so a short
+/// body leaves its connection ready for reuse, as steer did before a
+/// retry, then drops it.
+async fn drain(resp: Response<Incoming>) {
+    const DRAIN: usize = 4 << 10;
+    let mut body = resp.into_body();
+    let mut read = 0;
+    while read < DRAIN {
+        match body.frame().await {
+            Some(Ok(frame)) => read += frame.data_ref().map_or(0, Bytes::len),
+            Some(Err(_)) | None => return,
         }
     }
 }
@@ -690,15 +882,15 @@ impl Refresh {
             return;
         };
         let deadline = cluster.timeout.map(|t| Instant::now() + t);
-        let mut picked = None;
+        let mut tried = Vec::new();
         let send = cluster.forward(
             &method,
             headers,
             &target,
-            body::empty(),
+            UpstreamBody::Empty,
             Some(0),
             key,
-            &mut picked,
+            &mut tried,
         );
         let result = match deadline {
             Some(at) => tokio::time::timeout_at(at, send)
@@ -729,6 +921,11 @@ impl Refresh {
     }
 }
 
+/// Resolves once `stopped` turns true or its sender is gone.
+async fn until_stopped(mut stopped: tokio::sync::watch::Receiver<bool>) {
+    let _ = stopped.wait_for(|s| *s).await;
+}
+
 impl Handler for Proxy {
     type Body = Body;
 
@@ -742,7 +939,8 @@ enum Failure {
     NoHealthyUpstream,
     Timeout,
     ClientBody,
-    Upstream(ClientError),
+    /// The last attempt got no response.
+    Attempt(Outcome),
     Proxy,
 }
 
@@ -769,15 +967,19 @@ impl Failure {
                 "could not read the request body",
                 "client_body",
             ),
-            Failure::Upstream(e) => (
+            // steer's error handler: an attempt that timed out, by the
+            // per-try timeout or the upstream's, is a 504.
+            Failure::Attempt(Outcome::Timeout) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "the upstream did not answer in time",
+                "upstream_timeout",
+            ),
+            Failure::Attempt(o) => (
                 StatusCode::BAD_GATEWAY,
                 "bad_gateway",
                 "the upstream failed to answer",
-                match e {
-                    ClientError::Connect | ClientError::ConnectTimeout => "connect_error",
-                    ClientError::Timeout => "timeout",
-                    ClientError::HeadersTooLarge | ClientError::Protocol => "reset",
-                },
+                o.as_str(),
             ),
             Failure::Proxy => (
                 StatusCode::BAD_GATEWAY,
@@ -937,6 +1139,23 @@ fn set_framing(headers: &mut HeaderMap, method: &Method, length: Option<u64>) {
     }
 }
 
+/// The body to send upstream, as read before the first attempt.
+enum UpstreamBody {
+    /// No body: it can be sent again.
+    Empty,
+    /// A body read whole within the replay limit: it can be sent again.
+    Buffered(Bytes),
+    /// A body that streams to the first endpoint only.
+    Stream(Body),
+}
+
+impl UpstreamBody {
+    /// Whether every attempt can send the whole body.
+    fn replayable(&self) -> bool {
+        !matches!(self, UpstreamBody::Stream(_))
+    }
+}
+
 /// The body to send upstream. With a replay limit, a body of at most that
 /// many bytes is read first, as steer buffered the bodies it might retry;
 /// a longer one is sent as read so far followed by the rest. `Err` means
@@ -945,17 +1164,19 @@ async fn upstream_body(
     mut incoming: Incoming,
     length: Option<u64>,
     replay_limit: Option<u64>,
-) -> Result<Body, ()> {
+) -> Result<UpstreamBody, ()> {
     if length == Some(0) {
-        return Ok(body::empty());
+        return Ok(UpstreamBody::Empty);
     }
-    let Some(limit) = replay_limit.filter(|&l| length.is_none_or(|n| n <= l)) else {
-        return Ok(incoming.map_err(BoxError::from).boxed());
+    let Some(limit) = replay_limit else {
+        return Ok(UpstreamBody::Stream(
+            incoming.map_err(BoxError::from).boxed(),
+        ));
     };
     let mut buf = BytesMut::new();
     while (buf.len() as u64) <= limit {
         match incoming.frame().await {
-            None => return Ok(body::full(buf.freeze())),
+            None => return Ok(UpstreamBody::Buffered(buf.freeze())),
             Some(Ok(frame)) => {
                 if let Ok(data) = frame.into_data() {
                     buf.extend_from_slice(&data);
@@ -968,7 +1189,7 @@ async fn upstream_body(
         prefix: Some(buf.freeze()),
         rest: incoming,
     };
-    Ok(BodyExt::boxed(body))
+    Ok(UpstreamBody::Stream(BodyExt::boxed(body)))
 }
 
 /// A body that was partly read: the bytes read, then the rest.
@@ -1069,7 +1290,8 @@ struct Access<'a> {
     host: String,
     path: String,
     cluster: &'a str,
-    endpoint: &'a str,
+    /// The endpoints tried, in order, as steer's `endpoints`.
+    endpoints: Vec<&'a str>,
 }
 
 impl<'a> Access<'a> {
@@ -1096,7 +1318,7 @@ impl<'a> Access<'a> {
             host: String::from_utf8_lossy(host.unwrap_or_default()).into_owned(),
             path: String::from_utf8_lossy(path).into_owned(),
             cluster: "",
-            endpoint: "",
+            endpoints: Vec::new(),
         }
     }
 
@@ -1104,8 +1326,10 @@ impl<'a> Access<'a> {
         Access { cluster, ..self }
     }
 
-    fn endpoint(self, endpoint: &'a str) -> Self {
-        Access { endpoint, ..self }
+    fn tried(self, balancer: &'a Balancer, tried: &[usize]) -> Self {
+        let eps = balancer.endpoints();
+        let endpoints = tried.iter().map(|&i| &*eps[i].address).collect();
+        Access { endpoints, ..self }
     }
 }
 
@@ -1123,7 +1347,9 @@ fn log<B>(a: &Access<'_>, started: Instant, resp: &Response<B>, failure: &str) {
                 host = a.host,
                 path = a.path,
                 cluster = a.cluster,
-                endpoint = a.endpoint,
+                endpoint = a.endpoints.last().copied().unwrap_or_default(),
+                endpoints = ?a.endpoints,
+                attempts = a.endpoints.len(),
                 status,
                 duration_ms,
                 failure,
