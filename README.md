@@ -38,7 +38,25 @@ The log is JSON on stdout (`EDGEFRONT_LOG` sets the filter, default `info`), one
 
 Each cluster balances as steer did: its `policy` is `round_robin` (smooth weighted, the default), `least_loaded` (power of two choices on in-flight requests times peak-EWMA latency) or `maglev` (consistent hashing on `hash_header`). Endpoints are grouped by `priority`; a level takes traffic in proportion to its share of available endpoints with an overprovisioning factor of 1.4, the rest spills to the next level, and below `panic_threshold_percent` (default 50) of total health every endpoint takes traffic. `crates/edgefront/tests/e2e_port_balancer.rs` sends 20,000 requests per policy over three priority levels with a manual clock and checks every pick against steer's balancer. [docs/DESIGN.md](docs/DESIGN.md#balancing) describes the balancers.
 
-Still to come from steer: health checks, outlier detection, retries, the admin API and metrics (week 3), and TLS termination, reload and drain (week 4). A configuration with a `tls` block is refused rather than served in plain text.
+Health checks, outlier detection and retries run as steer's did, and steer's admin API listens on `admin_listen` (default `127.0.0.1:9901`) with steer's routes, JSON and token rules:
+
+| route | auth | answer |
+|---|---|---|
+| `GET /healthz` | open | `{"status": "ok"}` |
+| `GET /readyz` | open | `{"status": "ready"}`, or 503 `draining` after SIGTERM |
+| `GET /clusters` | token | every cluster's balancer state and every endpoint's health, ejection and latency |
+| `GET /metrics` | token | steer's Prometheus series, names and labels unchanged |
+| `POST /reload` | token | re-reads the file; 400 `invalid_config` keeps the running configuration |
+
+| variable | meaning |
+|---|---|
+| `EDGEFRONT_ADMIN_TOKEN` | bearer token for the admin API, at least 16 characters; required when `admin_listen` is not a loopback address |
+| `EDGEFRONT_DRAIN_PERIOD` | how long `/readyz` reports draining before the listeners close (default `5s`, at most `10m`) |
+| `EDGEFRONT_SHUTDOWN_TIMEOUT` | how long requests in flight then get to finish (default `30s`, at most `1h`) |
+
+SIGHUP reloads like `POST /reload`. A reload keeps each endpoint's health, ejection and latency state by cluster name and address, and `listen` and `admin_listen` cannot change. SIGTERM or SIGINT drains: `/readyz` turns 503 and every response closes its connection for the drain period, then both listeners stop accepting. `crates/edgefront/tests/e2e_proxy_admin.rs` runs all of this against the binary.
+
+Still to come from steer: the failover drill run against both binaries in CI (week 3) and TLS termination (week 4). A configuration with a `tls` block is refused rather than served in plain text.
 
 ## Limiter (port of pacer)
 

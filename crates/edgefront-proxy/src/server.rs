@@ -76,26 +76,39 @@
 //! upstream_timeout` for a timeout and `502 bad_gateway` otherwise. The
 //! response of an attempt that is retried is dropped after its first
 //! 4 KiB are read, as steer drained it.
+//!
+//! # Operating
+//!
+//! The configuration in force is a runtime that [`Proxy::reload`] swaps
+//! for a new one, carrying endpoint state, in-flight counts, connection
+//! pools and retry budgets over as steer's reload did; a request finishes
+//! on the runtime it started with. Every step above records steer's
+//! metric series ([`Proxy::metrics`]), [`Proxy::state`] is the live state
+//! the admin API's `/clusters` reports, and [`Proxy::drain`] closes each
+//! connection after its response while the process drains.
 
 use std::future::Future as _;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::{Bytes, BytesMut};
+use edgefront_core::admin::{BalancerState, ClusterState, EndpointState, ProxyState};
 use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
 use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
 use edgefront_core::http1::{Client, ClientLimits};
 use edgefront_core::listener::Handler;
+use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
+use tokio::sync::watch;
 use tokio::time::{Instant, Sleep};
 
 use crate::balancer::maglev::hash_key;
@@ -136,25 +149,100 @@ const HOP_BY_HOP: [&str; 9] = [
     "upgrade",
 ];
 
-/// The proxy for one configuration. It is a [`Handler`] for
-/// [`edgefront_core::listener::serve`].
+/// The proxy for one configuration at a time. It is a [`Handler`] for
+/// [`edgefront_core::listener::serve`], and [`Proxy::reload`] swaps in a
+/// new configuration while it serves.
 pub struct Proxy {
+    /// The configuration in force. A request takes the runtime it starts
+    /// with and finishes on it, as steer's did; [`Proxy::run_checks`]
+    /// follows the changes.
+    current: watch::Sender<Arc<Runtime>>,
+    clock: Arc<dyn Clock>,
+    rng: Arc<dyn Rng>,
+    metrics: Arc<SteerMetrics>,
+    /// The version `steer_config_version` reads on each scrape.
+    version: Arc<AtomicU64>,
+    /// The layers on each route, such as the cache.
+    filters: RouteFilters,
+    /// Held while a reload builds and swaps a runtime.
+    reloading: Mutex<()>,
+    /// Set by [`Proxy::drain`].
+    draining: AtomicBool,
+}
+
+/// One loaded configuration, never changed after it is built (steer's
+/// `runtime`).
+struct Runtime {
+    version: u64,
+    loaded_at: SystemTime,
+    listen: String,
+    admin_listen: String,
+    routes: usize,
     /// Each route's index and its cluster's.
     router: Router<(usize, usize)>,
     clusters: Vec<Arc<Cluster>>,
     trusted: Arc<[IpPrefix]>,
-    /// The layers on each route, such as the cache.
-    filters: RouteFilters,
+}
+
+impl Runtime {
+    /// The runtime for `cfg`, carrying state over from `old` by cluster
+    /// name and endpoint address.
+    fn build(cfg: &Config, old: Option<&Runtime>, version: u64, src: &Sources<'_>) -> Runtime {
+        let clusters: Vec<Arc<Cluster>> = cfg
+            .clusters
+            .iter()
+            .map(|c| {
+                let prev = old.and_then(|o| o.clusters.iter().find(|p| p.config.name == c.name));
+                Arc::new(Cluster::new(c, prev.map(|p| &**p), src))
+            })
+            .collect();
+        let index = |name: &str| {
+            clusters
+                .iter()
+                .position(|c| c.config.name == name)
+                .expect("validation ties every route to a cluster")
+        };
+        let router = Router::new(cfg.routes.iter().enumerate().map(|(ri, r)| {
+            (
+                r.host.as_str(),
+                r.path_prefix.as_str(),
+                (ri, index(&r.cluster)),
+            )
+        }));
+        Runtime {
+            version,
+            loaded_at: SystemTime::now(),
+            listen: cfg.listen.clone(),
+            admin_listen: cfg.admin_listen.clone(),
+            routes: cfg.routes.len(),
+            router,
+            clusters,
+            trusted: cfg.trusted_proxies.clone().into(),
+        }
+    }
+
+    fn cluster(&self, name: &str) -> Option<&Arc<Cluster>> {
+        self.clusters.iter().find(|c| c.config.name == name)
+    }
+}
+
+/// What every cluster is built with.
+struct Sources<'a> {
+    clock: &'a Arc<dyn Clock>,
+    rng: &'a Arc<dyn Rng>,
+    metrics: &'a Arc<SteerMetrics>,
 }
 
 struct Cluster {
-    name: String,
+    config: ClusterConfig,
     balancer: Balancer,
     /// The header Maglev hashes, when the policy is Maglev.
     hash_header: Option<HeaderName>,
     clock: Arc<dyn Clock>,
     client: Client<Body>,
     timeout: Option<Duration>,
+    /// Requests holding a permit; shared with the cluster of the same name
+    /// in the next runtime, so a reload keeps the count right.
     in_flight: Arc<AtomicU32>,
     max_requests: u32,
     /// The retry policy and budget, when the cluster retries.
@@ -165,38 +253,81 @@ struct Cluster {
     checker: Option<Arc<Checker>>,
     /// The draws behind each retry's backoff.
     jitter: SplitMix64,
+    /// steer's per-cluster series.
+    metrics: ClusterMetrics,
 }
 
 /// A cluster's retry settings and the budget its retries draw on.
 struct Retrying {
     policy: Policy,
-    budget: Budget,
+    /// Shared with the next runtime when a reload keeps the budget's
+    /// settings.
+    budget: Arc<Budget>,
 }
 
 impl Cluster {
-    fn new(cfg: &ClusterConfig, clock: &Arc<dyn Clock>, rng: &Arc<dyn Rng>) -> Self {
+    /// The cluster for `cfg`. With `prev`, the cluster of the same name in
+    /// the runtime being replaced, it carries on as steer's reload did:
+    /// endpoints that keep their address keep their health, ejection and
+    /// latency state; the in-flight count is shared; the connection pool
+    /// is kept while `connect_timeout` is unchanged; and the retry budget
+    /// is kept while its settings are. An endpoint nothing will probe is
+    /// made healthy again, and one nothing will eject is let back in.
+    fn new(cfg: &ClusterConfig, prev: Option<&Cluster>, src: &Sources<'_>) -> Self {
+        let clock = src.clock;
         let epoch = clock.now();
         let endpoints: Vec<Endpoint> = cfg
             .endpoints
             .iter()
-            .map(|e| Endpoint::new(&e.address, e.weight, e.priority.into(), epoch))
+            .map(|e| {
+                let kept = prev.and_then(|p| {
+                    p.balancer
+                        .endpoints()
+                        .iter()
+                        .find(|o| *o.address == *e.address)
+                });
+                let ep = match kept {
+                    Some(o) => Endpoint::with_state(
+                        &e.address,
+                        e.weight,
+                        e.priority.into(),
+                        Arc::clone(&o.state),
+                    ),
+                    None => Endpoint::new(&e.address, e.weight, e.priority.into(), epoch),
+                };
+                if cfg.health_check.is_none() && !ep.state.healthy() {
+                    ep.state.set_healthy(true);
+                }
+                if cfg.outlier_detection.is_none() {
+                    ep.state.clear_ejection();
+                }
+                ep
+            })
             .collect();
         let opts = Options::new(cfg.policy)
             .panic_threshold(cfg.panic_threshold_percent)
             .clock(Arc::clone(clock))
-            .rng(Arc::clone(rng));
+            .rng(Arc::clone(src.rng));
         // Validation keeps every weight in 1..=1000, every priority at most
         // 7 and at most 1,024 endpoints, below Maglev's default table size.
         let balancer = Balancer::new(endpoints, opts).expect("a validated cluster");
-        let retry = cfg.retry.as_ref().map(|r| Retrying {
-            policy: Policy::new(r),
-            budget: Budget::new(&r.budget, Arc::clone(clock)),
+        let retry = cfg.retry.as_ref().map(|r| {
+            let kept = prev.and_then(|p| match (&p.config.retry, &p.retry) {
+                (Some(old), Some(rt)) if old.budget == r.budget => Some(Arc::clone(&rt.budget)),
+                _ => None,
+            });
+            Retrying {
+                policy: Policy::new(r),
+                budget: kept.unwrap_or_else(|| Arc::new(Budget::new(&r.budget, Arc::clone(clock)))),
+            }
         });
         let name = cfg.name.clone();
         let detector = cfg.outlier_detection.as_ref().map(|od| {
             let cluster = name.clone();
             let timer = Arc::clone(clock);
+            let metrics = Arc::clone(src.metrics);
             let on_eject: crate::outlier::EjectFn = Box::new(move |ep, reason, until| {
+                metrics.outlier_ejection(&cluster, reason);
                 let ejected_for_ms = until.saturating_duration_since(timer.now()).as_millis();
                 tracing::warn!(
                     cluster,
@@ -215,7 +346,9 @@ impl Cluster {
         });
         let checker = cfg.health_check.as_ref().map(|hc| {
             let cluster = name.clone();
+            let metrics = Arc::clone(src.metrics);
             let on_change: health::ChangeFn = Box::new(move |ep, healthy, reason| {
+                metrics.health_transition(&cluster, healthy);
                 if healthy {
                     tracing::info!(cluster, endpoint = &*ep.address, "endpoint healthy");
                 } else {
@@ -234,28 +367,34 @@ impl Cluster {
                 Some(on_change),
             ))
         });
-        let limits = ClientLimits {
-            connect_timeout: cfg.connect_timeout,
-            // The cluster timeout bounds the whole exchange instead.
-            response_header_timeout: None,
-            ..ClientLimits::default()
+        let client = match prev {
+            Some(p) if p.config.connect_timeout == cfg.connect_timeout => p.client.clone(),
+            _ => Client::new(&ClientLimits {
+                connect_timeout: cfg.connect_timeout,
+                // The cluster timeout bounds the whole exchange instead.
+                response_header_timeout: None,
+                ..ClientLimits::default()
+            }),
         };
+        let addresses: Vec<&str> = cfg.endpoints.iter().map(|e| e.address.as_str()).collect();
         Cluster {
-            name: cfg.name.clone(),
-            balancer,
+            config: cfg.clone(),
             hash_header: cfg
                 .hash_header
                 .as_deref()
                 .and_then(|h| HeaderName::from_bytes(h.as_bytes()).ok()),
             clock: Arc::clone(clock),
-            client: Client::new(&limits),
+            client,
             timeout: Some(cfg.timeout).filter(|t| !t.is_zero()),
-            in_flight: Arc::new(AtomicU32::new(0)),
+            in_flight: prev
+                .map_or_else(|| Arc::new(AtomicU32::new(0)), |p| Arc::clone(&p.in_flight)),
             max_requests: cfg.max_requests,
             retry,
             detector,
             checker,
             jitter: SplitMix64::from_entropy(),
+            metrics: src.metrics.cluster(&cfg.name, &addresses),
+            balancer,
         }
     }
 
@@ -275,9 +414,72 @@ impl Cluster {
         let prev = self.in_flight.fetch_add(1, Ordering::AcqRel);
         if prev >= self.max_requests {
             self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.metrics.overflow();
             return None;
         }
         Some(Permit(self.in_flight.clone()))
+    }
+
+    /// The cluster as `GET /clusters` shows it, as of `now` on the
+    /// cluster's clock and `wall` on the system clock.
+    fn state(&self, now: std::time::Instant, wall: SystemTime) -> ClusterState {
+        let b = self.balancer.state();
+        let widen = |v: &[u32]| v.iter().map(|&n| u64::from(n)).collect();
+        ClusterState {
+            name: self.config.name.clone(),
+            policy: policy_name(self.config.policy).to_owned(),
+            in_flight: i64::from(self.in_flight.load(Ordering::Acquire)),
+            max_requests: u64::from(self.max_requests),
+            retry_budget_balance: self.retry.as_ref().map(|r| r.budget.balance()),
+            balancer: BalancerState {
+                healthy_per_priority: widen(&b.healthy),
+                total_per_priority: widen(&b.total),
+                priority_load_percent: b.priority_load.iter().map(|&n| u64::from(n)).collect(),
+                panic: b.panic,
+            },
+            endpoints: self
+                .balancer
+                .endpoints()
+                .iter()
+                .map(|ep| {
+                    let s = ep.state.snapshot(now);
+                    EndpointState {
+                        address: ep.address.to_string(),
+                        weight: u64::from(ep.weight),
+                        priority: u64::from(ep.priority),
+                        healthy: s.healthy,
+                        last_probe_error: s.last_probe_error,
+                        ejected: s.ejected,
+                        ejected_until: s.ejected_until.map(|at| wall_time(at, now, wall)),
+                        times_ejected: s.times_ejected,
+                        last_eject_reason: s.last_eject_reason,
+                        consecutive_gateway_failures: u64::from(s.consecutive_gateway_failures),
+                        in_flight: s.in_flight,
+                        ewma_latency_ms: s.latency_ms,
+                        available: s.available,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The policy as the configuration names it.
+fn policy_name(policy: edgefront_core::config::Policy) -> &'static str {
+    use edgefront_core::config::Policy as P;
+    match policy {
+        P::RoundRobin => "round_robin",
+        P::LeastLoaded => "least_loaded",
+        P::Maglev => "maglev",
+    }
+}
+
+/// The wall-clock time of `at` on a monotonic clock that reads `now` when
+/// the system clock reads `wall`.
+fn wall_time(at: std::time::Instant, now: std::time::Instant, wall: SystemTime) -> SystemTime {
+    match at.checked_duration_since(now) {
+        Some(ahead) => wall + ahead,
+        None => wall - now.duration_since(at),
     }
 }
 
@@ -288,6 +490,73 @@ struct Permit(Arc<AtomicU32>);
 impl Drop for Permit {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Records a routed request in `steer_requests_total` and
+/// `steer_request_duration_seconds` when it is dropped: when the response
+/// body is done, as steer recorded once its handler returned. A request
+/// whose client goes away first is counted as steer counted it, with
+/// nginx's 499.
+struct Record {
+    cluster: Arc<Cluster>,
+    status: u16,
+    started: Instant,
+}
+
+impl Record {
+    /// The record of a request to `cluster`, a 499 until it is answered.
+    fn new(cluster: &Arc<Cluster>, started: Instant) -> Record {
+        Record {
+            cluster: Arc::clone(cluster),
+            status: 499,
+            started,
+        }
+    }
+
+    /// Records the request when `resp`'s body is done.
+    fn attach(mut self, resp: Response<Body>) -> Response<Body> {
+        self.status = resp.status().as_u16();
+        resp.map(|inner| {
+            BodyExt::boxed(Recorded {
+                inner,
+                _record: self,
+            })
+        })
+    }
+}
+
+impl Drop for Record {
+    fn drop(&mut self) {
+        self.cluster
+            .metrics
+            .request(self.status, self.started.elapsed());
+    }
+}
+
+/// A response body that records its request when dropped.
+struct Recorded {
+    inner: Body,
+    _record: Record,
+}
+
+impl HttpBody for Recorded {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -308,94 +577,198 @@ impl Proxy {
     /// from. A manual clock and a seeded generator make the picks
     /// repeatable, which is how they are diffed against steer.
     pub fn with_sources(cfg: &Config, clock: Arc<dyn Clock>, rng: Arc<dyn Rng>) -> Self {
-        let clusters: Vec<Arc<Cluster>> = cfg
-            .clusters
-            .iter()
-            .map(|c| Arc::new(Cluster::new(c, &clock, &rng)))
-            .collect();
-        let index = |name: &str| {
-            clusters
-                .iter()
-                .position(|c| c.name == name)
-                .expect("validation ties every route to a cluster")
-        };
-        let router = Router::new(cfg.routes.iter().enumerate().map(|(ri, r)| {
-            (
-                r.host.as_str(),
-                r.path_prefix.as_str(),
-                (ri, index(&r.cluster)),
-            )
+        let version = Arc::new(AtomicU64::new(1));
+        let metrics = Arc::new(SteerMetrics::new(Arc::new(Registry::new()), {
+            let version = Arc::clone(&version);
+            move || version.load(Ordering::Acquire)
         }));
+        let runtime = Runtime::build(
+            cfg,
+            None,
+            1,
+            &Sources {
+                clock: &clock,
+                rng: &rng,
+                metrics: &metrics,
+            },
+        );
         Proxy {
-            router,
-            clusters,
-            trusted: cfg.trusted_proxies.clone().into(),
+            current: watch::Sender::new(Arc::new(runtime)),
+            clock,
+            rng,
+            metrics,
+            version,
             filters: RouteFilters::new(cfg.routes.len()),
+            reloading: Mutex::new(()),
+            draining: AtomicBool::new(false),
         }
     }
 
     /// Runs requests on each route through that route's filter in
     /// `filters`, indexed as the configuration's routes are. Routes with
-    /// no filter are proxied as before, at the cost of one branch.
+    /// no filter are proxied as before, at the cost of one branch. A proxy
+    /// with filters refuses [`Proxy::reload`], since a new configuration
+    /// can number its routes differently.
     #[must_use]
     pub fn with_filters(mut self, filters: RouteFilters) -> Self {
         self.filters = filters;
         self
     }
 
-    /// The live endpoints of the cluster named `name`, in configuration
-    /// order, or `None` when there is no such cluster. Their state is what
-    /// the balancer reads on every pick.
-    pub fn endpoints(&self, name: &str) -> Option<&[Endpoint]> {
-        self.clusters
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.balancer.endpoints())
+    fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.current.borrow())
+    }
+
+    /// steer's metric families, which the request path, the health
+    /// checkers, the outlier detectors and reloads record into, and
+    /// `/metrics` renders.
+    pub fn metrics(&self) -> &Arc<SteerMetrics> {
+        &self.metrics
+    }
+
+    /// The version of the configuration in force: 1 for the first, and
+    /// one more for each reload applied.
+    pub fn config_version(&self) -> u64 {
+        self.current.borrow().version
+    }
+
+    /// Swaps in `cfg`, already validated, as steer's `Server.Reload` did,
+    /// and returns its version. Endpoints keep their state by cluster name
+    /// and address, and so do in-flight counts, connection pools and
+    /// retry budgets whose settings are unchanged (see [`Cluster::new`]);
+    /// requests already in flight finish on the configuration they started
+    /// with, and [`Proxy::run_checks`] moves its checks to the new one.
+    /// `listen` and `admin_listen` cannot change. A refusal is counted as
+    /// a failed reload and leaves the current configuration serving.
+    pub fn reload(&self, cfg: &Config) -> Result<u64, String> {
+        let _held = self
+            .reloading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = self.runtime();
+        let refusal = if cfg.listen != old.listen || cfg.admin_listen != old.admin_listen {
+            Some("listen and admin_listen cannot change on reload; restart edgefront instead")
+        } else if self.filters.filtered() > 0 {
+            Some("routes with filters cannot be reloaded; restart edgefront instead")
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
+            self.metrics.reload_failed();
+            return Err(why.to_owned());
+        }
+        let version = old.version + 1;
+        let runtime = Runtime::build(
+            cfg,
+            Some(&old),
+            version,
+            &Sources {
+                clock: &self.clock,
+                rng: &self.rng,
+                metrics: &self.metrics,
+            },
+        );
+        let (clusters, routes) = (runtime.clusters.len(), runtime.routes);
+        self.current.send_replace(Arc::new(runtime));
+        self.version.store(version, Ordering::Release);
+        self.metrics.reload_succeeded();
+        tracing::info!(version, clusters, routes, "configuration loaded");
+        Ok(version)
+    }
+
+    /// Starts draining: from now on every response the proxy gives,
+    /// through its [`Handler`], closes its connection, as steer's
+    /// `SetKeepAlivesEnabled(false)` did, so clients go elsewhere for
+    /// their next request while the listener is still open.
+    pub fn drain(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Proxy::drain`] was called.
+    pub fn draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Counts a reload that failed before reaching [`Proxy::reload`], such
+    /// as an unreadable or invalid file (steer's `RecordFailedReload`).
+    pub fn record_failed_reload(&self) {
+        self.metrics.reload_failed();
+    }
+
+    /// The live state `GET /clusters` reports (steer's `Server.State`).
+    pub fn state(&self) -> ProxyState {
+        let rt = self.runtime();
+        let now = self.clock.now();
+        let wall = SystemTime::now();
+        ProxyState {
+            config_version: rt.version,
+            loaded_at: rt.loaded_at,
+            clusters: rt.clusters.iter().map(|c| c.state(now, wall)).collect(),
+        }
+    }
+
+    /// The live endpoints of the cluster named `name` in the configuration
+    /// in force, in configuration order, or `None` when there is no such
+    /// cluster. Their state is what the balancer reads on every pick.
+    pub fn endpoints(&self, name: &str) -> Option<Vec<Endpoint>> {
+        let rt = self.runtime();
+        rt.cluster(name).map(|c| c.balancer.endpoints().to_vec())
     }
 
     /// Runs every cluster's health checks and outlier detection ticks
     /// until `shutdown` resolves, then returns once each has stopped. The
     /// binary spawns it beside the listener; without it endpoints are
     /// never probed and ejections never decay, though consecutive
-    /// failures still eject.
+    /// failures still eject. After a reload the checks of the replaced
+    /// configuration stop and those of the new one start.
     pub async fn run_checks(&self, shutdown: impl std::future::Future<Output = ()>) {
-        let (stop, stopped) = tokio::sync::watch::channel(false);
-        let mut tasks = tokio::task::JoinSet::new();
-        for c in &self.clusters {
-            if let Some(checker) = &c.checker {
-                let checker = Arc::clone(checker);
-                let until = until_stopped(stopped.clone());
-                tasks.spawn(async move { checker.run(until).await });
+        let mut changes = self.current.subscribe();
+        tokio::pin!(shutdown);
+        loop {
+            let rt = Arc::clone(&changes.borrow_and_update());
+            let (stop, stopped) = watch::channel(false);
+            let mut tasks = tokio::task::JoinSet::new();
+            for c in &rt.clusters {
+                if let Some(checker) = &c.checker {
+                    let checker = Arc::clone(checker);
+                    let until = until_stopped(stopped.clone());
+                    tasks.spawn(async move { checker.run(until).await });
+                }
+                if let Some(detector) = &c.detector {
+                    let detector = Arc::clone(detector);
+                    let until = until_stopped(stopped.clone());
+                    tasks.spawn(async move { detector.run(until).await });
+                }
             }
-            if let Some(detector) = &c.detector {
-                let detector = Arc::clone(detector);
-                let until = until_stopped(stopped.clone());
-                tasks.spawn(async move { detector.run(until).await });
+            let done = tokio::select! {
+                () = &mut shutdown => true,
+                changed = changes.changed() => changed.is_err(),
+            };
+            stop.send_replace(true);
+            while tasks.join_next().await.is_some() {}
+            if done {
+                return;
             }
         }
-        shutdown.await;
-        stop.send_replace(true);
-        while tasks.join_next().await.is_some() {}
     }
 
     /// The retry budget's balance in the cluster named `name`, when it
     /// retries: how many retries it would allow now.
     pub fn retry_budget_balance(&self, name: &str) -> Option<f64> {
-        let c = self.clusters.iter().find(|c| c.name == name)?;
+        let rt = self.runtime();
+        let c = rt.cluster(name)?;
         c.retry.as_ref().map(|r| r.budget.balance())
     }
 
-    /// The balancer of the cluster named `name`.
-    pub fn balancer(&self, name: &str) -> Option<&Balancer> {
-        self.clusters
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| &c.balancer)
+    /// How many priority levels the cluster named `name` balances over.
+    pub fn priority_levels(&self, name: &str) -> Option<usize> {
+        let rt = self.runtime();
+        rt.cluster(name).map(|c| c.balancer.levels())
     }
-
     /// Answers one request from `peer`.
     pub async fn handle(&self, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         let started = Instant::now();
+        let rt = self.runtime();
         let (mut parts, incoming) = req.into_parts();
 
         if parts.method == Method::CONNECT {
@@ -411,7 +784,7 @@ impl Proxy {
             // Go's server closes a connection after a CONNECT it answered.
             h.insert(header::CONNECTION, HeaderValue::from_static("close"));
             log(
-                &Access::new(&parts, &id, peer, &self.trusted, b"/"),
+                &Access::new(&parts, &id, peer, &rt.trusted, b"/"),
                 started,
                 &resp,
                 "connect_method",
@@ -434,8 +807,9 @@ impl Proxy {
         };
 
         let id = reqid::from_request(&parts.headers);
-        let access = Access::new(&parts, &id, peer, &self.trusted, target.clean_path());
-        let Some(&(ri, ci)) = self.router.route(&host, target.clean_path()) else {
+        let access = Access::new(&parts, &id, peer, &rt.trusted, target.clean_path());
+        let Some(&(ri, ci)) = rt.router.route(&host, target.clean_path()) else {
+            self.metrics.no_route();
             let resp = error(
                 &id,
                 StatusCode::NOT_FOUND,
@@ -445,10 +819,11 @@ impl Proxy {
             log(&access, started, &resp, "no_route");
             return resp;
         };
-        let cluster = &self.clusters[ci];
-        let access = access.cluster(&cluster.name);
+        let cluster = &rt.clusters[ci];
+        let record = Record::new(cluster, started);
+        let access = access.cluster(&cluster.config.name);
         let fwd = Forwarding {
-            trusted: Arc::clone(&self.trusted),
+            trusted: Arc::clone(&rt.trusted),
             peer: access.peer,
             host: host.clone(),
             id: id.clone(),
@@ -491,7 +866,7 @@ impl Proxy {
             if let Some(mut resp) = resp {
                 resp.headers_mut().insert(reqid::HEADER, id);
                 log(&access, started, &resp, "");
-                return resp;
+                return record.attach(resp);
             }
         }
         let Some(permit) = cluster.acquire() else {
@@ -507,7 +882,7 @@ impl Proxy {
             );
             let resp = deliver_generated(exchange, resp, "overloaded", &id);
             log(&access, started, &resp, "overflow");
-            return resp;
+            return record.attach(resp);
         };
         let key = cluster.key(&parts.headers);
         let mut headers = parts.headers;
@@ -545,22 +920,27 @@ impl Proxy {
 
         let failure = match result {
             Ok((resp, in_flight)) => {
-                let mut resp = proxied(resp, deadline, permit, in_flight);
-                if let Some(mut x) = exchange {
-                    let next = x.upstream_response(resp).await;
-                    let again = Again {
-                        cluster,
-                        method: &parts.method,
-                        target: &upstream_target,
-                        key,
-                        fwd: &fwd,
-                        deadline,
-                    };
-                    resp = again.finish(x, next).await;
-                }
+                let Some(mut x) = exchange else {
+                    // The common case records in the body it already has.
+                    let mut resp = proxied(resp, deadline, permit, in_flight, Some(record));
+                    resp.headers_mut().insert(reqid::HEADER, id);
+                    log(&access, started, &resp, "");
+                    return resp;
+                };
+                let resp = proxied(resp, deadline, permit, in_flight, None);
+                let next = x.upstream_response(resp).await;
+                let again = Again {
+                    cluster,
+                    method: &parts.method,
+                    target: &upstream_target,
+                    key,
+                    fwd: &fwd,
+                    deadline,
+                };
+                let mut resp = again.finish(x, next).await;
                 resp.headers_mut().insert(reqid::HEADER, id);
                 log(&access, started, &resp, "");
-                return resp;
+                return record.attach(resp);
             }
             Err(f) => f,
         };
@@ -568,7 +948,7 @@ impl Proxy {
         let resp = error(&id, status, code, message);
         let resp = deliver_generated(exchange, resp, code, &id);
         log(&access, started, &resp, logged);
-        resp
+        record.attach(resp)
     }
 }
 
@@ -657,7 +1037,7 @@ impl Again<'_> {
         };
         match result {
             Ok((resp, in_flight)) => {
-                let resp = proxied(resp, self.deadline, permit, in_flight);
+                let resp = proxied(resp, self.deadline, permit, in_flight, None);
                 match x.upstream_response(resp).await {
                     Upstream::Respond(resp) => x.deliver(resp, Delivery::Upstream),
                     Upstream::Resend(_) => {
@@ -747,6 +1127,7 @@ impl Cluster {
                 Ok(resp) => Outcome::of_status(resp.status().as_u16()),
                 Err(o) => *o,
             };
+            self.metrics.attempt(i, outcome.into());
             if let Some(d) = &self.detector {
                 d.report(endpoint, outcome.is_gateway_failure(), outcome.is_failure());
             }
@@ -764,7 +1145,8 @@ impl Cluster {
                 }
                 let next = self.balancer.pick(key, tried)?;
                 if !r.budget.try_withdraw() {
-                    tracing::debug!(cluster = self.name, "retry budget exhausted");
+                    self.metrics.budget_exhausted();
+                    tracing::debug!(cluster = self.config.name, "retry budget exhausted");
                     return None;
                 }
                 Some((
@@ -786,6 +1168,7 @@ impl Cluster {
             if !wait.is_zero() {
                 tokio::time::sleep(wait).await;
             }
+            self.metrics.retry();
             i = next;
         }
         unreachable!("the attempt counter ends the loop long before it wraps")
@@ -814,16 +1197,22 @@ fn proxied(
     deadline: Option<Instant>,
     permit: Permit,
     in_flight: InFlight,
+    record: Option<Record>,
 ) -> Response<Body> {
     let (mut head, incoming) = resp.into_parts();
     strip_hop_by_hop(&mut head.headers, false);
     // Go writes the standard reason phrase whatever the upstream sent.
     head.extensions.remove::<hyper::ext::ReasonPhrase>();
+    let record = record.map(|mut r| {
+        r.status = head.status.as_u16();
+        r
+    });
     let body = Proxied {
         inner: incoming,
         deadline: deadline.map(|at| Box::pin(tokio::time::sleep_until(at))),
         _permit: permit,
         _in_flight: in_flight,
+        _record: record,
     };
     Response::from_parts(head, BodyExt::boxed(body))
 }
@@ -900,7 +1289,7 @@ impl Refresh {
         };
         match result {
             Ok((resp, in_flight)) => {
-                let resp = proxied(resp, deadline, permit, in_flight);
+                let resp = proxied(resp, deadline, permit, in_flight, None);
                 let next = exchange.upstream_response(resp).await;
                 let again = Again {
                     cluster: &cluster,
@@ -930,7 +1319,12 @@ impl Handler for Proxy {
     type Body = Body;
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
-        self.handle(req, peer).await
+        let mut resp = self.handle(req, peer).await;
+        if self.draining() {
+            resp.headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        }
+        resp
     }
 }
 
@@ -1240,6 +1634,9 @@ struct Proxied {
     deadline: Option<Pin<Box<Sleep>>>,
     _permit: Permit,
     _in_flight: InFlight,
+    /// Records the request once the body is done, when nothing replaces
+    /// the body on its way to the client.
+    _record: Option<Record>,
 }
 
 /// The error that cuts a response body at the cluster's timeout.

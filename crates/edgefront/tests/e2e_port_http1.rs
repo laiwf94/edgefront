@@ -676,9 +676,12 @@ fn matches_steer() {
     let cfg = example_config(&dir, &ups);
 
     let mut cmd = Command::new(EDGEFRONT);
+    // No drain period, as steer runs below, so SIGTERM stops it at once.
     cmd.arg("proxy")
         .arg("--config")
         .arg(&cfg)
+        .env("EDGEFRONT_DRAIN_PERIOD", "0s")
+        .env_remove("EDGEFRONT_ADMIN_TOKEN")
         .env_remove("EDGEFRONT_LOG");
     #[allow(unused_mut)]
     let mut proxy = spawn(cmd);
@@ -807,16 +810,30 @@ fn command_line() {
         )
     );
 
-    // A listen address in use: the proxy cannot start.
+    assert_eq!(
+        edgefront(&["proxy", "--config", tls]),
+        (
+            2,
+            String::new(),
+            format!(
+                "edgefront: {tls}: tls is not supported by the proxy yet; remove the tls block\n"
+            )
+        )
+    );
+
+    // A listen or admin address in use: the proxy cannot start.
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut cfg: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(STEER_EXAMPLE).unwrap()).unwrap();
-    cfg["listen"] = taken.local_addr().unwrap().to_string().into();
-    let busy = dir.join("busy.json");
-    std::fs::write(&busy, cfg.to_string()).unwrap();
-    let (code, out, _) = edgefront(&["proxy", "--config", busy.to_str().unwrap()]);
-    assert_eq!(code, 1);
-    assert!(out.contains("\"message\":\"cannot listen\""), "{out}");
+    for field in ["listen", "admin_listen"] {
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(STEER_EXAMPLE).unwrap()).unwrap();
+        cfg["listen"] = "127.0.0.1:0".into();
+        cfg[field] = taken.local_addr().unwrap().to_string().into();
+        let busy = dir.join("busy.json");
+        std::fs::write(&busy, cfg.to_string()).unwrap();
+        let (code, out, _) = edgefront(&["proxy", "--config", busy.to_str().unwrap()]);
+        assert_eq!(code, 1, "{field}");
+        assert!(out.contains("\"message\":\"cannot listen\""), "{out}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

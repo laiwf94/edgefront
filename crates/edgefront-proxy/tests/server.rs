@@ -400,8 +400,8 @@ async fn traffic_spills_to_the_next_priority_and_stops_when_nothing_is_left() {
     let get = b"GET / HTTP/1.1\r\nHost: x\r\nX-Request-Id: rid-9\r\nConnection: close\r\n\r\n";
     let eps = proxy.proxy.endpoints("web").expect("the cluster");
     assert!(proxy.proxy.endpoints("nope").is_none());
-    assert!(proxy.proxy.balancer("nope").is_none());
-    assert_eq!(proxy.proxy.balancer("web").unwrap().levels(), 2);
+    assert!(proxy.proxy.priority_levels("nope").is_none());
+    assert_eq!(proxy.proxy.priority_levels("web").unwrap(), 2);
 
     // The preferred level is down: everything goes to priority 1.
     eps[0].state.set_healthy(false);
