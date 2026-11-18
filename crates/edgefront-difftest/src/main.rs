@@ -14,6 +14,8 @@
 //! edgefront-difftest pacer-config-mutant [--seed N]
 //! edgefront-difftest cache [--log FILE | --requests N --seed N] [--faketime LIB] [--dir DIR] [--keep N] -- REFERENCE CANDIDATE
 //! edgefront-difftest cache-record [--requests N] [--seed N]
+//! edgefront-difftest upstream [-name NAME] [-addr ADDR] [-control ADDR]
+//! edgefront-difftest loadgen -url URL [-rate N] [-duration D] [-timeout D] [-method M] [-H 'Name: value'] [-max-inflight N] [-format text|row|json] [-label TEXT]
 //! ```
 //!
 //! `steer` diffs the Rust crates against steer's driver, started as
@@ -72,6 +74,11 @@
 //! or `--requests` generated requests (default 50,000) from `--seed`. It
 //! prints the first `--keep` divergences (default 20) and exits 1 if there
 //! was any. `cache-record` writes the log a seed generates to stdout.
+//!
+//! `upstream` and `loadgen` are the failover drill's tools, ported from
+//! steer's `cmd/upstream` and `cmd/loadgen` with the same flags (see
+//! [`edgefront_difftest::drill`]). `upstream` serves a fake upstream until
+//! SIGTERM or SIGINT; `loadgen` sends load open loop and prints its report.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -79,6 +86,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use edgefront_difftest::balancer;
 use edgefront_difftest::cache;
+use edgefront_difftest::drill;
 use edgefront_difftest::pacer::{self, DriverCommand, Script};
 use edgefront_difftest::pacer_config;
 use edgefront_difftest::resilience;
@@ -97,7 +105,9 @@ const USAGE: &str = "usage:
   edgefront-difftest pacer-config [--mutants N] [--seed N] [-- DRIVER [ARGS...]]
   edgefront-difftest pacer-config-mutant [--seed N]
   edgefront-difftest cache [--log FILE | --requests N --seed N] [--faketime LIB] [--dir DIR] [--keep N] -- REFERENCE CANDIDATE
-  edgefront-difftest cache-record [--requests N] [--seed N]";
+  edgefront-difftest cache-record [--requests N] [--seed N]
+  edgefront-difftest upstream [-name NAME] [-addr ADDR] [-control ADDR]
+  edgefront-difftest loadgen -url URL [-rate N] [-duration D] [-timeout D] [-method M] [-H 'Name: value'] [-max-inflight N] [-format text|row|json] [-label TEXT]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -202,8 +212,77 @@ fn main() -> ExitCode {
                 Err(e) => usage(&e),
             }
         }
+        Some("upstream") => match drill::parse_upstream_args(&args[1..]) {
+            Ok(a) => run_upstream(&a),
+            Err(e) => {
+                eprintln!("upstream: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("loadgen") => match drill::parse_load_args(&args[1..]) {
+            Ok((o, format)) => run_loadgen(&o, &format),
+            Err(e) => {
+                eprintln!("loadgen: {e}");
+                ExitCode::from(2)
+            }
+        },
         _ => usage("expected a command"),
     }
+}
+
+fn runtime() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+}
+
+/// Waits for SIGTERM or SIGINT.
+async fn stopped() {
+    let int = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = int => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = int.await;
+}
+
+fn run_upstream(a: &drill::UpstreamArgs) -> ExitCode {
+    let served = runtime().and_then(|rt| {
+        rt.block_on(async {
+            let up = drill::Upstream::start(&a.name, &a.addr, &a.control).await?;
+            print!("{}", drill::listening_line(&a.name, &up));
+            io::stdout().flush()?;
+            stopped().await;
+            up.kill().await;
+            Ok(())
+        })
+    });
+    match served {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("upstream: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_loadgen(o: &drill::LoadOptions, format: &str) -> ExitCode {
+    let report = match runtime() {
+        Ok(rt) => rt.block_on(drill::load(o)),
+        Err(e) => {
+            eprintln!("loadgen: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    print!("{}", report.format(format).unwrap_or_default());
+    ExitCode::SUCCESS
 }
 
 fn parse_pacer_config(

@@ -56,7 +56,27 @@ Health checks, outlier detection and retries run as steer's did, and steer's adm
 
 SIGHUP reloads like `POST /reload`. A reload keeps each endpoint's health, ejection and latency state by cluster name and address, and `listen` and `admin_listen` cannot change. SIGTERM or SIGINT drains: `/readyz` turns 503 and every response closes its connection for the drain period, then both listeners stop accepting. `crates/edgefront/tests/e2e_proxy_admin.rs` runs all of this against the binary.
 
-Still to come from steer: the failover drill run against both binaries in CI (week 3) and TLS termination (week 4). A configuration with a `tls` block is refused rather than served in plain text.
+### Failover drill
+
+`examples/failover.sh` is steer's failover drill run against `edgefront proxy`. Two primary upstreams and one backup sit behind the proxy, the load runs at 200 requests per second, and one fault lands in each 10-second phase while the load runs. The drill runs once with `examples/failover/resilient.json` (health checks, outlier detection, retries, priority failover) and once with `examples/failover/plain.json` (the same endpoints and timeouts, none of those features); both are steer's `examples/steer.json` and `steer-plain.json` unchanged. The upstreams and the load generator are `edgefront-difftest upstream` and `edgefront-difftest loadgen`, ports of steer's `cmd/upstream` and `cmd/loadgen` with the same flags and the same open-loop measurement, so the drill needs no Go. Both drills, measured one after the other on the same 4-vCPU Xeon at 2.1 GHz, with every process on one machine:
+
+| Phase, resilience on | edgefront success | p50 | p99 | p99.9 | steer success | p50 | p99 | p99.9 |
+|---|---|---|---|---|---|---|---|---|
+| 1. baseline | 100.00% | 1.9 ms | 2.7 ms | 4.2 ms | 100.00% | 1.3 ms | 2.0 ms | 2.5 ms |
+| 2. kill -9 primary-a | 100.00% | 2.0 ms | 2.7 ms | 5.2 ms | 100.00% | 1.4 ms | 2.1 ms | 4.2 ms |
+| 3. primary-b fails 50% of requests | 100.00% | 1.8 ms | 9.0 ms | 12.1 ms | 100.00% | 1.4 ms | 2.0 ms | 8.1 ms |
+| 4. primary-b blackholed | 100.00% | 2.0 ms | 258.3 ms | 263.8 ms | 100.00% | 1.3 ms | 256.7 ms | 262.3 ms |
+
+| Phase, resilience off | edgefront success | p50 | p99 | p99.9 | steer success | p50 | p99 | p99.9 |
+|---|---|---|---|---|---|---|---|---|
+| 1. baseline | 100.00% | 2.0 ms | 2.7 ms | 6.8 ms | 100.00% | 1.3 ms | 2.1 ms | 2.8 ms |
+| 2. kill -9 primary-a | 55.00% | 1.8 ms | 2.6 ms | 4.3 ms | 55.00% | 1.3 ms | 2.0 ms | 3.6 ms |
+| 3. primary-b fails 50% of requests | 26.50% | 1.9 ms | 2.6 ms | 3.0 ms | 27.95% | 1.3 ms | 2.0 ms | 3.5 ms |
+| 4. primary-b blackholed | 2.70% | 2.3 ms | 1004.1 ms | 1004.4 ms | 2.70% | 1.6 ms | 1002.5 ms | 1003.0 ms |
+
+Each phase sends 2,000 requests. With the features on, edgefront keeps every request through every fault, as steer did in its published table, and ends in the same state: both primaries out by health check, primary-b ejected twice, the backup taking 100% of the load. Phase 4's tail is the 250 ms per-try timeout moving a request off the blackholed primary before health checks take it out. With them off, the faults reach the client in the same proportions. edgefront's median is about 0.6 ms above steer's at this rate. `crates/edgefront/tests/e2e_port_failover.rs` runs the same drill in process under `make test` and asserts the success rates, the tails and the end state, and CI's `failover-drill` job runs both scripts, each checked by `scripts/check-failover.sh`. `CHECK=1 examples/failover.sh` does the same locally.
+
+Still to come from steer: TLS termination (week 4). A configuration with a `tls` block is refused rather than served in plain text.
 
 ## Limiter (port of pacer)
 
@@ -279,7 +299,7 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 
 `make difftest-cache` holds the cache to cachet 0.1, the binary from before the workspace split. It replays 50,000 generated requests against both binaries on one logical clock, and diffs each response's status, headers except `Date` and body SHA-256, and the origin requests it took. `DIFFTEST_ARGS="--log FILE"` replays a recorded log instead, and `edgefront-difftest cache-record --seed N` writes the log a seed generates. The run and `make test` need libfaketime (`apt install libfaketime`). See [docs/DESIGN.md](docs/DESIGN.md#checking-the-cache-against-cachet-01).
 
-While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus four comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, `make difftest-balancer` diffs the pick sequences of 1,000 seeded balancing scenarios of 10,000 requests each (health changes, ejections, priority spill and panic included) between steer's `balancer.LB` and `edgefront_proxy::balancer::Balancer`, `make difftest-resilience` diffs every ejection, multiplier, retry decision, backoff and budget balance on 5,000 generated failure traces and 5,000 request traces (every hundredth of 100,000 requests) between steer's outlier detector and retry code and `edgefront_proxy::outlier` and `edgefront_proxy::retry`, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary, and the end-to-end balancing run against steer's balancer.
+While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus four comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, `make difftest-balancer` diffs the pick sequences of 1,000 seeded balancing scenarios of 10,000 requests each (health changes, ejections, priority spill and panic included) between steer's `balancer.LB` and `edgefront_proxy::balancer::Balancer`, `make difftest-resilience` diffs every ejection, multiplier, retry decision, backoff and budget balance on 5,000 generated failure traces and 5,000 request traces (every hundredth of 100,000 requests) between steer's outlier detector and retry code and `edgefront_proxy::outlier` and `edgefront_proxy::retry`, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary, and the end-to-end balancing run against steer's balancer. The `failover-drill` job runs steer's failover drill against steer and `examples/failover.sh` against edgefront, and fails unless both keep 100.00% of requests in all four phases with the resilience features on.
 
 While `legacy/pacer` exists, its gate runs as well (format, lint, the tests under ASan+UBSan and TSan with coverage, short fuzzing, its demo and its image), and the pacer differential test needs only a C compiler: `make test` already runs a million operations through it, and `make difftest-pacer` runs ten times more from a clock seed. pacerd's config reader is diffed the same way: `make test` puts every file under legacy/pacer's `tests`, `examples` and `fuzz/corpus`, every string literal in its tests and 3,000 seeded mutants through `diffdrive config` and the Rust parser, comparing accept or reject, the error message and line, and every parsed value, and `make difftest-pacer-config` adds 2,000 mutants from a clock seed (`DIFFTEST_ARGS="--mutants N"` for more).
 

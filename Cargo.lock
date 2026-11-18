@@ -352,6 +352,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "sha2",

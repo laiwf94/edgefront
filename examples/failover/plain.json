@@ -1,0 +1,21 @@
+{
+  "listen": "127.0.0.1:18080",
+  "admin_listen": "127.0.0.1:19901",
+  "routes": [
+    {"host": "*", "path_prefix": "/", "cluster": "web"}
+  ],
+  "clusters": [
+    {
+      "name": "web",
+      "policy": "round_robin",
+      "endpoints": [
+        {"address": "127.0.0.1:19101", "priority": 0},
+        {"address": "127.0.0.1:19102", "priority": 0},
+        {"address": "127.0.0.1:19103", "priority": 1}
+      ],
+      "connect_timeout": "250ms",
+      "timeout": "1s",
+      "max_requests": 1024
+    }
+  ]
+}

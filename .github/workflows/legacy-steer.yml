@@ -57,3 +57,26 @@ jobs:
         run: make difftest-resilience
       - name: End-to-end HTTP/1.1 and balancing against a live steer
         run: make e2e-steer
+
+  # steer's failover drill against both binaries: legacy/steer's own script
+  # against steer, and examples/failover.sh against edgefront. Each must
+  # succeed 100.00% in all four phases with the resilience features on, and
+  # show every fault with them off (scripts/check-failover.sh).
+  failover-drill:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: legacy/steer/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Drill against steer
+        run: |
+          legacy/steer/examples/failover.sh | tee "$RUNNER_TEMP/steer.txt"
+          scripts/check-failover.sh "$RUNNER_TEMP/steer.txt"
+      - name: Drill against edgefront
+        run: CHECK=1 examples/failover.sh

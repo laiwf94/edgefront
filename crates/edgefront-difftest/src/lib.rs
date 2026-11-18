@@ -28,11 +28,16 @@
 //!   replayed against both binaries on one logical clock, and status,
 //!   headers, body digest and origin fetches are diffed per request.
 //!
+//! - [`drill`]: not a diff but the tools of steer's failover drill, its
+//!   fake upstream and its open-loop load generator, so the drill runs
+//!   against the Rust binary without Go.
+//!
 //! Every run is seeded, and the seed is printed with its report, so a
 //! divergence found in CI can be replayed locally with `--seed`.
 
 pub mod balancer;
 pub mod cache;
+pub mod drill;
 pub mod driver;
 pub mod pacer;
 pub mod pacer_config;

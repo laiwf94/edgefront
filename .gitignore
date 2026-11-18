@@ -6,3 +6,4 @@
 /crates/*/fuzz/coverage
 *.profraw
 lcov.info
+/examples/failover/.run
