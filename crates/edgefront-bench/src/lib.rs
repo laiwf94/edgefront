@@ -25,10 +25,14 @@
 //!   Markdown report made from many.
 //! - [`tls`]: the TLS client a scenario with `[tls]` loads its target
 //!   through.
+//! - [`gate`]: the regression gate: repeated runs against the baseline
+//!   commit's, judged metric by metric with a Mann-Whitney U test and a
+//!   tolerance, and fixed size ceilings.
 //! - [`cli`]: the `edgefront-bench` command line.
 
 pub mod cli;
 pub mod client;
+pub mod gate;
 pub mod histogram;
 pub mod load;
 pub mod measure;

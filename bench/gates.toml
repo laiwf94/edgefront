@@ -1,0 +1,60 @@
+# The benchmark regression gate (crates/edgefront-bench/src/gate.rs), run on
+# pull requests by .github/workflows/bench.yml.
+#
+# Each pull request runs `scenario` against `target` `runs` times on a
+# GitHub-hosted runner and compares each metric with the committed
+# `baseline`, recorded the same way from main. A metric fails when a
+# one-sided Mann-Whitney U test gives p < p_value AND its median is worse by
+# more than its tolerance. Sizes have fixed ceilings.
+scenario = "bench/ci/gate.toml"
+target = "edgefront"
+target_cpus = 1
+runs = 5
+p_value = 0.01
+baseline = "bench/baseline/gate.json"
+baseline_commit = "0f4230eb560a25a1e5e06d27b6a9d206d949de1b"
+# CPU models whose committed samples are steady enough to judge against:
+# none, by the measurements below.
+committed_models = []
+
+# How it was calibrated, on GitHub's hosted runners, 19 and 20 Nov 2026, with
+# edgefront as at baseline_commit:
+#
+# - Committed samples. 18 runs of five on unchanged code. For each run, its
+#   median against the pooled median of the other runs on the same CPU model,
+#   worse direction:
+#     AMD EPYC 7763 (6 runs)   p99 -4.9 to +2.2%   requests per CPU s -3.0 to +3.2%
+#     AMD EPYC 9V74 (10 runs)  p99 -17.8 to +27.2% requests per CPU s -6.7 to +18.5%
+#   plus one run each on an EPYC 9V45 and a Xeon 8573C. The models differ by up
+#   to 60% from each other, so samples are kept per model. On the 9V74 an
+#   unchanged run failed the gate at p99 +23.3%, requests per CPU s +6.1%; and
+#   with the 7763 judged against its committed samples, an unchanged run
+#   failed at p99 +6.8% (p = 0.0077). Committed samples are too noisy on
+#   every model, so committed_models is empty and bench/baseline/gate.json is
+#   the record of these runs, not what a pull request is judged against.
+# - Same runner. So the gate builds baseline_commit and
+#   alternates five of its runs with five of the candidate's. Four unchanged
+#   runs of that (Xeon 6973P, EPYC 7763, two EPYC 9V74) differed by p99 -1.5 to
+#   +2.2% and requests per CPU s -7.6 to +0.8%, none of them significant (lowest
+#   p = 0.21), and all passed.
+#
+# The tolerances are the issue's 5%: a change fails only when it is both
+# significant and over 5%, and the measured noise did neither at once.
+
+# Response-time p99 at a fixed 2,000 requests per second.
+[metrics.p99_ms]
+better = "lower"
+tolerance = 0.05
+
+# Completed requests per second of edgefront's CPU time: the throughput
+# one CPU buys, which falls when the hit path gets slower.
+[metrics.requests_per_cpu_second]
+better = "higher"
+tolerance = 0.05
+
+# Fixed ceilings, about 10% above the sizes on 20 Nov 2026 (x86_64 release
+# build on the runner): the binary was 7,905,712 bytes and the image
+# 13,807,092. Raising one is a decision a pull request states.
+[ceilings]
+binary_bytes = 8700000
+image_bytes = 15200000

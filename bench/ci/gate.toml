@@ -1,0 +1,31 @@
+# The regression gate's scenario: the hit path. 20 seconds of 1 and 4 KiB
+# hits against edgefront on one CPU, run five times per pull request beside
+# five runs of the baseline commit (see bench/gates.toml). 8-second runs were
+# too noisy on hosted runners to show a 10% slowdown at p < 0.01.
+name = "gate"
+description = "The hit path: 1,000 objects of 1 to 4 KiB under a Zipf 1.0 law, 98% hits, 2,000 requests per second."
+protocol = "http1"
+connections = 16
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 2000
+duration = "2s"
+
+[load]
+rate = 2000
+duration = "20s"
+
+[keys]
+count = 1000
+zipf = 1.0
+hit_ratio = 0.98
+
+[[objects]]
+size = "1KiB"
+weight = 1
+
+[[objects]]
+size = "4KiB"
+weight = 1

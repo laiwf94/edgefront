@@ -8,11 +8,22 @@
 //!     --out DIR           default target/bench/<run>
 //!     --run NAME          default <date>-<first scenario>
 //!     --target-cpus N     CPUs per target, default 4
+//!     --repeat N          run each scenario N times, writing <target>-<i>.json
 //!     --machine TEXT      how the report names the machine
 //!     --harness-image IMG default edgefront-bench/harness:local
 //!     --rebuild           rebuild the images built from this repository
 //! edgefront-bench report --results DIR --out FILE [--title TEXT] [--intro FILE]
 //!     Renders every result under DIR into one Markdown report.
+//! edgefront-bench gate --config bench/gates.toml --results DIR --machine CPU
+//!                      [--binary FILE] [--baseline FILE] [--verdict FILE] [--summary FILE]
+//!     Judges repeated gate runs against the committed baseline for the
+//!     CPU model they ran on; exit 1 on a regression. With --plan, prints
+//!     `committed` or `measure`: how that CPU model is judged. See
+//!     [`crate::gate`].
+//! edgefront-bench baseline --config bench/gates.toml --results DIR... --machine CPU
+//!                          --commit SHA [--out FILE]
+//!     Records one CPU model's baseline from the pooled results (of --target,
+//!     default the gate's target), keeping the other models' already there.
 //! edgefront-bench validate FILE...
 //!     Checks result files against bench/schema/result.schema.json.
 //! edgefront-bench origin [--listen ADDR]
@@ -28,12 +39,16 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
+use crate::gate::{Baseline, GateConfig};
 use crate::report::{self, BenchResult};
 use crate::scenario::Scenario;
 use crate::targets::{self, Docker, LoadOptions, Runner, RunnerConfig, Target};
 
 /// The usage text.
-pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets NAME,... [--targets-dir DIR] [--out DIR] [--run NAME] [--target-cpus N] [--machine TEXT] [--harness-image IMAGE] [--rebuild]
+pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets NAME,... [--targets-dir DIR] [--out DIR] [--run NAME] [--target-cpus N] [--repeat N] [--machine TEXT] [--harness-image IMAGE] [--rebuild]
+       edgefront-bench gate --config bench/gates.toml --results DIR --machine CPU [--baseline FILE] [--binary FILE] [--verdict FILE] [--summary FILE]
+       edgefront-bench gate --config bench/gates.toml --machine CPU --plan
+       edgefront-bench baseline --config bench/gates.toml --results DIR... --machine CPU --commit SHA [--target NAME] [--out FILE]
        edgefront-bench report --results DIR --out FILE [--title TEXT] [--intro FILE]
        edgefront-bench validate FILE...
        edgefront-bench origin [--listen ADDR]
@@ -142,6 +157,8 @@ pub fn run(args: &[String]) -> Result<(), Failure> {
         "run" => run_targets(rest),
         "report" => render_report(rest),
         "validate" => validate(rest),
+        "gate" => gate(rest),
+        "baseline" => baseline(rest),
         "origin" => serve_origin(rest),
         "load" => load(rest),
         "--help" | "help" => {
@@ -184,6 +201,7 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
             "target-cpus",
             "machine",
             "harness-image",
+            "repeat",
         ],
         &["rebuild"],
     )?;
@@ -215,6 +233,14 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
             ))
         })?,
         None => 4,
+    };
+    let repeat = match flags.one("repeat")? {
+        Some(n) => n
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| usage(format!("--repeat {n:?} must be a whole number above 0")))?,
+        None => 1,
     };
     let scenarios: Vec<(Scenario, PathBuf)> = scenario_paths
         .iter()
@@ -269,16 +295,32 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
         .map_err(failed)?;
     let mut results = Vec::new();
     for (scenario, path) in &scenarios {
-        for target in &targets {
-            eprintln!(
-                "edgefront-bench: {} against {} ({:.0} s)",
-                scenario.name,
-                target.name,
-                scenario.schedule().duration().as_secs_f64()
-            );
-            let result = runner.run(scenario, path, target).map_err(failed)?;
-            eprintln!("{}", summary(&result));
-            results.push(result);
+        // Repeats take turns across the targets, so a drift in the
+        // machine during the run lands on all of them alike.
+        for round in 1..=repeat {
+            for target in &targets {
+                eprintln!(
+                    "edgefront-bench: {} against {}{} ({:.0} s)",
+                    scenario.name,
+                    target.name,
+                    if repeat > 1 {
+                        format!(", run {round} of {repeat}")
+                    } else {
+                        String::new()
+                    },
+                    scenario.schedule().duration().as_secs_f64()
+                );
+                let stem = if repeat > 1 {
+                    format!("{}-{round}", target.name)
+                } else {
+                    target.name.clone()
+                };
+                let result = runner
+                    .run_as(scenario, path, target, &stem)
+                    .map_err(failed)?;
+                eprintln!("{}", summary(&result));
+                results.push(result);
+            }
         }
     }
     let text = report::render(&format!("Benchmark run {run_name}"), "", &results);
@@ -326,6 +368,95 @@ fn render_report(args: &[String]) -> Result<(), Failure> {
     let title = flags.one("title")?.unwrap_or("Benchmark report");
     std::fs::write(out, report::render(title, &intro, &results))
         .map_err(|e| failed(format!("{out}: {e}")))?;
+    Ok(())
+}
+
+fn gate(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(
+        args,
+        &[
+            "config", "results", "baseline", "binary", "verdict", "summary", "machine",
+        ],
+        &["plan"],
+    )?;
+    flags.no_positional()?;
+    let config = GateConfig::load(Path::new(flags.required("config")?)).map_err(failed)?;
+    if flags.switch("plan") {
+        println!("{}", config.plan_line(flags.required("machine")?));
+        return Ok(());
+    }
+    let baseline_path = flags
+        .one("baseline")?
+        .unwrap_or(&config.baseline)
+        .to_owned();
+    let baseline = Baseline::load(Path::new(&baseline_path)).map_err(failed)?;
+    let results = report::load_dir(Path::new(flags.required("results")?)).map_err(failed)?;
+    let binary = match flags.one("binary")? {
+        Some(path) => Some(
+            std::fs::metadata(path)
+                .map_err(|e| failed(format!("{path}: {e}")))?
+                .len(),
+        ),
+        None => None,
+    };
+    let machine = flags.required("machine")?;
+    let verdict =
+        crate::gate::evaluate(&config, &baseline, machine, &results, binary).map_err(failed)?;
+    let json = serde_json::to_string_pretty(&verdict).map_err(|e| failed(e.to_string()))?;
+    if let Some(path) = flags.one("verdict")? {
+        std::fs::write(path, format!("{json}\n")).map_err(|e| failed(format!("{path}: {e}")))?;
+    }
+    let markdown = verdict.markdown();
+    if let Some(path) = flags.one("summary")? {
+        std::fs::write(path, &markdown).map_err(|e| failed(format!("{path}: {e}")))?;
+    }
+    print!("{markdown}");
+    if verdict.pass {
+        Ok(())
+    } else {
+        Err(failed(format!(
+            "the benchmark gate failed on {}",
+            verdict.failing.join(", ")
+        )))
+    }
+}
+
+fn baseline(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(
+        args,
+        &["config", "results", "commit", "out", "machine", "target"],
+        &[],
+    )?;
+    flags.no_positional()?;
+    let config = GateConfig::load(Path::new(flags.required("config")?)).map_err(failed)?;
+    let dirs = flags.all("results");
+    if dirs.is_empty() {
+        return Err(usage("--results is required"));
+    }
+    let mut results = Vec::new();
+    for dir in dirs {
+        results.extend(report::load_dir(Path::new(dir)).map_err(failed)?);
+    }
+    let out = flags.one("out")?.unwrap_or(&config.baseline).to_owned();
+    // Another machine's samples already in the file are kept.
+    let mut baseline = if Path::new(&out).exists() {
+        Baseline::load(Path::new(&out)).map_err(failed)?
+    } else {
+        Baseline::new(&config)
+    };
+    let target = flags.one("target")?.unwrap_or(&config.target).to_owned();
+    baseline
+        .record_target(
+            &config,
+            &target,
+            flags.required("machine")?,
+            &results,
+            flags.required("commit")?,
+        )
+        .map_err(failed)?;
+    let json = serde_json::to_string_pretty(&baseline).map_err(|e| failed(e.to_string()))?;
+    std::fs::write(&out, format!("{json}\n")).map_err(|e| failed(format!("{out}: {e}")))?;
+    eprintln!("edgefront-bench: wrote {out}");
     Ok(())
 }
 
@@ -640,5 +771,208 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(planned(&[s], 2), Duration::from_secs(140));
+    }
+
+    #[test]
+    fn records_a_baseline_and_gates_against_it() {
+        let dir = scratch("gate");
+        let write = |sub: &str, p99s: &[f64]| {
+            let d = dir.join(sub).join("gate");
+            std::fs::create_dir_all(&d).unwrap();
+            for (i, p99) in p99s.iter().enumerate() {
+                let mut r = crate::report::tests::sample("edgefront", "cache", "gate");
+                r.measured.latency.p99_ms = *p99;
+                std::fs::write(d.join(format!("edgefront-{i}.json")), r.to_json().unwrap())
+                    .unwrap();
+            }
+            dir.join(sub).display().to_string()
+        };
+        let base = write("base", &[1.0, 1.01, 0.99, 1.02, 0.98]);
+        let same = write("same", &[1.0, 1.02, 0.99, 1.01, 0.98]);
+        let slow = write("slow", &[1.2, 1.21, 1.19, 1.22, 1.18]);
+        let config = dir.join("gates.toml");
+        let baseline = dir.join("baseline.json").display().to_string();
+        std::fs::write(
+            &config,
+            format!(
+                "scenario = \"bench/ci/gate.toml\"\ntarget = \"edgefront\"\ntarget_cpus = 1\nruns = 5\np_value = 0.01\nbaseline = \"{baseline}\"\nbaseline_commit = \"0f4230eb560a25a1e5e06d27b6a9d206d949de1b\"\n[metrics.p99_ms]\nbetter = \"lower\"\ntolerance = 0.05\n[ceilings]\nbinary_bytes = 100\n"
+            ),
+        )
+        .unwrap();
+        let config = config.display().to_string();
+        let ok = |args: &[&str]| run(&strings(args)).unwrap();
+        let err = |args: &[&str]| run(&strings(args)).unwrap_err();
+        ok(&[
+            "baseline",
+            "--config",
+            &config,
+            "--results",
+            &base,
+            "--machine",
+            "cpu",
+            "--commit",
+            "abc",
+        ]);
+        // A second model joins the file without replacing the first, pooled
+        // over two result directories.
+        ok(&[
+            "baseline",
+            "--config",
+            &config,
+            "--results",
+            &base,
+            "--results",
+            &same,
+            "--machine",
+            "other",
+            "--commit",
+            "abc",
+        ]);
+        let recorded = Baseline::load(Path::new(&baseline)).unwrap();
+        assert_eq!(recorded.machines.len(), 2);
+        ok(&["gate", "--config", &config, "--machine", "cpu", "--plan"]);
+        let e = err(&[
+            "baseline",
+            "--config",
+            &config,
+            "--results",
+            &base,
+            "--machine",
+            "x",
+            "--commit",
+            "x",
+            "--target",
+            "nope",
+        ]);
+        assert!(
+            matches!(&e, Failure::Failed(m) if m.contains("against nope")),
+            "{e:?}"
+        );
+        assert_eq!(recorded.machines["other"].samples["p99_ms"].len(), 10);
+        let binary = dir.join("binary");
+        std::fs::write(&binary, [0u8; 10]).unwrap();
+        let binary = binary.display().to_string();
+        let verdict = dir.join("verdict.json").display().to_string();
+        let summary_file = dir.join("summary.md").display().to_string();
+        ok(&[
+            "gate",
+            "--config",
+            &config,
+            "--results",
+            &same,
+            "--machine",
+            "cpu",
+            "--binary",
+            &binary,
+            "--verdict",
+            &verdict,
+            "--summary",
+            &summary_file,
+        ]);
+        assert!(
+            std::fs::read_to_string(&verdict)
+                .unwrap()
+                .contains("\"pass\": true")
+        );
+        assert!(
+            std::fs::read_to_string(&summary_file)
+                .unwrap()
+                .contains("Benchmark gate: pass")
+        );
+        let e = err(&[
+            "gate",
+            "--config",
+            &config,
+            "--results",
+            &slow,
+            "--machine",
+            "cpu",
+            "--binary",
+            &binary,
+        ]);
+        assert!(
+            matches!(&e, Failure::Failed(m) if m.contains("failed on p99_ms")),
+            "{e:?}"
+        );
+        let e = err(&[
+            "gate",
+            "--config",
+            &config,
+            "--results",
+            &same,
+            "--machine",
+            "cpu",
+            "--binary",
+            "/no/binary",
+        ]);
+        assert!(matches!(e, Failure::Failed(_)));
+        let e = err(&[
+            "gate",
+            "--config",
+            &config,
+            "--results",
+            &same,
+            "--machine",
+            "cpu",
+        ]);
+        assert!(
+            matches!(&e, Failure::Failed(m) if m.contains("--binary")),
+            "{e:?}"
+        );
+        let e = err(&["gate", "--config", &config, "--results", &same]);
+        assert!(matches!(e, Failure::Usage(_)), "{e:?}");
+        let e = err(&[
+            "baseline",
+            "--config",
+            &config,
+            "--machine",
+            "x",
+            "--commit",
+            "x",
+        ]);
+        assert!(matches!(e, Failure::Usage(_)), "{e:?}");
+        let e = err(&[
+            "gate",
+            "--config",
+            "/no/gates.toml",
+            "--results",
+            &same,
+            "--machine",
+            "cpu",
+        ]);
+        assert!(matches!(e, Failure::Failed(_)));
+        let none = dir.join("none").display().to_string();
+        let e = err(&[
+            "baseline",
+            "--config",
+            &config,
+            "--results",
+            &none,
+            "--machine",
+            "x",
+            "--commit",
+            "x",
+        ]);
+        assert!(matches!(e, Failure::Failed(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repeat_must_be_a_count() {
+        let scenario = format!(
+            "{}/../../bench/scenarios/cache-hit.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let err = run(&strings(&[
+            "run",
+            "--scenario",
+            &scenario,
+            "--targets",
+            "varnish",
+            "--repeat",
+            "0",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, Failure::Usage(_)), "{err:?}");
     }
 }
