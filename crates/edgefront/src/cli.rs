@@ -58,6 +58,16 @@ pub fn run(args: &[String]) -> ExitCode {
     {
         return crate::check::run(rest);
     }
+    if let [command, rest @ ..] = args
+        && command == "limits"
+    {
+        return crate::limits::run(rest);
+    }
+    if let [command, rest @ ..] = args
+        && command == "ctl"
+    {
+        return crate::ctl::run(rest);
+    }
     let (check_only, path) = match args {
         [flag] if flag == "--version" => {
             println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION"));

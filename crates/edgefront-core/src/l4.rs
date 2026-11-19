@@ -43,6 +43,17 @@
 //!   with its reason when it completes, which a draining listener uses to
 //!   close what is still open when its drain timeout runs out.
 //!
+//! - **Out of file descriptors.** [`Acceptor`] accepts for a listener and
+//!   handles running out of descriptors as pacerd's workers did: a pending
+//!   connection the process has no descriptor for stays in the queue, so
+//!   the listener stays readable and the accept loop would spin. The
+//!   acceptor keeps one spare descriptor, gives it up, accepts the pending
+//!   connection and closes it at once (the client sees a clean close, not
+//!   a hang), and takes the spare back. If the spare cannot be had again it
+//!   stops accepting for [`ACCEPT_PAUSE`] instead. (macOS and the BSDs
+//!   drop the connection that hit the limit themselves; the acceptor then
+//!   closes the next one queued, if there is one.)
+//!
 //! The listener with its admission limits and drain, and proxy week 12's
 //! UDP, TLS passthrough and PROXY protocol build on this module; it has no
 //! policy of its own.
@@ -56,7 +67,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::time::{Instant, sleep_until};
 
 /// Index of the client-to-upstream direction.
@@ -465,6 +476,108 @@ where
     })
     .await;
     pipe.outcome(reason)
+}
+
+/// How long an [`Acceptor`] stops accepting when it is out of file
+/// descriptors and has no spare: pacerd's 100 ms.
+pub const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
+/// What [`Acceptor::accept`] produced.
+#[derive(Debug)]
+pub enum Accepted {
+    /// A connection, with Nagle's algorithm off.
+    Conn(TcpStream, SocketAddr),
+    /// The process was out of file descriptors: one pending connection
+    /// was accepted on the spare descriptor and closed at once (pacerd's
+    /// `fd_exhausted`).
+    Shed,
+    /// The process was out of file descriptors and had no spare, so the
+    /// acceptor stopped accepting for [`ACCEPT_PAUSE`] (pacerd's
+    /// `fd_exhausted_paused`).
+    Paused,
+}
+
+/// Accepts connections for one listener, shedding the ones the process
+/// has no descriptor for. See the [module docs](self).
+#[derive(Debug)]
+pub struct Acceptor {
+    listener: TcpListener,
+    /// A descriptor to give up when the process runs out
+    /// (worker.c's `reserve_fd`).
+    spare: Option<std::fs::File>,
+}
+
+/// Whether an I/O error means the process or the system is out of file
+/// descriptors: EMFILE or ENFILE, 24 and 23 on Linux and the BSDs.
+pub fn out_of_descriptors(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(23 | 24))
+}
+
+fn spare() -> Option<std::fs::File> {
+    std::fs::File::open("/dev/null").ok()
+}
+
+impl Acceptor {
+    /// An acceptor for `listener`, taking its spare descriptor now.
+    pub fn new(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            spare: spare(),
+        }
+    }
+
+    /// The listener's address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Whether the acceptor holds its spare descriptor.
+    pub fn has_spare(&self) -> bool {
+        self.spare.is_some()
+    }
+
+    /// The next connection, or what happened instead when the process is
+    /// out of descriptors. A connection that went away before it was
+    /// accepted is skipped. Other accept errors are returned; the caller
+    /// should pause before trying again.
+    pub async fn accept(&mut self) -> io::Result<Accepted> {
+        if self.spare.is_none() {
+            self.spare = spare();
+        }
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true);
+                    return Ok(Accepted::Conn(stream, peer));
+                }
+                Err(e) if out_of_descriptors(&e) => return Ok(self.shed().await),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Out of descriptors: give up the spare, accept the pending
+    /// connection and drop it, take the spare back. On Linux the
+    /// connection that hit the limit is still queued and this closes it;
+    /// the BSDs and macOS have already dropped it, and this closes the
+    /// next one queued, if any. Either way one connection was refused for
+    /// want of a descriptor, which is what [`Accepted::Shed`] reports.
+    async fn shed(&mut self) -> Accepted {
+        if self.spare.take().is_some() {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            // An accepted stream is dropped at once: closed with nothing
+            // read.
+            drop(self.listener.poll_accept(&mut cx));
+            self.spare = spare();
+            if self.spare.is_some() {
+                return Accepted::Shed;
+            }
+        }
+        tokio::time::sleep(ACCEPT_PAUSE).await;
+        self.spare = spare();
+        Accepted::Paused
+    }
 }
 
 /// `from + d`, or a time so far ahead that it never comes when that

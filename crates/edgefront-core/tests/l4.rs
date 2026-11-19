@@ -535,3 +535,118 @@ async fn the_upstream_closes_first_while_the_client_is_open() {
     assert_eq!(out.reason, CloseReason::Done);
     assert_eq!(out.bytes_down, 5);
 }
+
+/// Runs the test `name` of this test binary again in a child process whose
+/// descriptor limit is `nofile`, and returns true there. The parent waits
+/// for the child, requires it to pass and returns false. Raising or
+/// lowering a limit needs no unsafe code this way.
+fn in_child_with_nofile(name: &str, nofile: u32) -> bool {
+    const CHILD: &str = "EDGEFRONT_L4_NOFILE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "ulimit -n {nofile} && exec \"$0\" --exact {name} --nocapture --test-threads 1"
+        ))
+        .arg(exe)
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "child failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    false
+}
+
+// it_limits.c: limits_fd_exhaustion_sheds_without_spinning, at the
+// acceptor: with every descriptor in use, a pending connection is closed
+// at once on the spare instead of left in the queue, and with no spare
+// the acceptor pauses.
+#[test]
+fn out_of_descriptors_the_acceptor_sheds_then_pauses_then_recovers() {
+    if !in_child_with_nofile(
+        "out_of_descriptors_the_acceptor_sheds_then_pauses_then_recovers",
+        64,
+    ) {
+        return;
+    }
+    use l4::{ACCEPT_PAUSE, Accepted, Acceptor};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut hog = Vec::new();
+        let err = loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => hog.push(f),
+                Err(e) => break e,
+            }
+        };
+        assert!(l4::out_of_descriptors(&err), "{err}");
+        // Room for one client socket, then none for the acceptor's spare.
+        hog.pop();
+        let mut c1 = TcpStream::connect(addr).await.unwrap();
+        let mut acc = Acceptor::new(listener);
+        assert!(!acc.has_spare());
+        let t = Instant::now();
+        assert!(matches!(acc.accept().await.unwrap(), Accepted::Paused));
+        assert!(t.elapsed() >= ACCEPT_PAUSE);
+        // Room for one more client and for the spare: the accept still hits
+        // the limit, so the acceptor gives up its spare to accept a pending
+        // connection and closes it, then takes the spare back.
+        hog.pop();
+        hog.pop();
+        let c1b = TcpStream::connect(addr).await.unwrap();
+        assert!(matches!(acc.accept().await.unwrap(), Accepted::Shed));
+        assert!(acc.has_spare());
+        // c1 was closed without a byte, by the acceptor on Linux and by
+        // the kernel's failed accept on macOS.
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(3), c1.read(&mut b))
+            .await
+            .unwrap();
+        assert!(matches!(n, Ok(0) | Err(_)), "{n:?}");
+        // With room again, connections are accepted.
+        drop(c1b);
+        hog.truncate(hog.len().saturating_sub(4));
+        let mut c2 = TcpStream::connect(addr).await.unwrap();
+        let mine = c2.local_addr().unwrap();
+        let mut s = loop {
+            match acc.accept().await.unwrap() {
+                // c1b, if the kernel kept it queued.
+                Accepted::Conn(_, peer) if peer != mine => {}
+                Accepted::Conn(s, _) => break s,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(acc.local_addr().unwrap(), addr);
+        s.write_all(b"ok").await.unwrap();
+        let mut got = [0u8; 2];
+        c2.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ok");
+    });
+}
+
+#[test]
+fn descriptor_shortage_is_emfile_or_enfile() {
+    assert!(l4::out_of_descriptors(&std::io::Error::from_raw_os_error(
+        24
+    )));
+    assert!(l4::out_of_descriptors(&std::io::Error::from_raw_os_error(
+        23
+    )));
+    assert!(!l4::out_of_descriptors(&std::io::Error::from_raw_os_error(
+        61
+    )));
+    assert!(!l4::out_of_descriptors(&std::io::Error::other("x")));
+}

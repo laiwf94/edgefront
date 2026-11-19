@@ -5,10 +5,14 @@
 //!
 //! `edgefront proxy` runs the HTTP/1.1 proxy ported from steer instead; see
 //! the `proxy` module, and `edgefront check` lints a limiter config; see
-//! the `check` module.
+//! the `check` module. `edgefront limits` runs pacerd's TCP proxy with its
+//! limits (the `limits` module), and `edgefront ctl limits` talks to its
+//! admin socket (the `ctl` module).
 
 mod check;
 mod cli;
+mod ctl;
+mod limits;
 mod proxy;
 
 use std::process::ExitCode;

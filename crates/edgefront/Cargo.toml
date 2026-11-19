@@ -14,6 +14,11 @@ edgefront-core.workspace = true
 edgefront-proxy.workspace = true
 edgefront-limiter.workspace = true
 
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 tokio.workspace = true
 toml = { workspace = true, features = ["display"] }
 tracing.workspace = true
