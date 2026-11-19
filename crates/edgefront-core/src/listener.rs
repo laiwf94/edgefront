@@ -42,6 +42,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::http1::{BoxError, HoldBody, server_builder};
+use crate::tls::{Acceptor, Slot, TlsInfo};
 
 /// Limits for every connection a listener accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,19 +106,71 @@ pub async fn serve<H: Handler>(
     limits: ServerLimits,
     shutdown: impl Future<Output = ()>,
 ) -> ServeReport {
+    run(listener, None, handler, limits, shutdown).await
+}
+
+/// Like [`serve`], with every connection's TLS handshake run by
+/// `acceptor` first, off the accept loop.
+///
+/// The loop takes a handshake slot before it accepts, so at most the
+/// current snapshot's `max_concurrent_handshakes` run at once and later
+/// connections wait in the kernel's backlog. A connection whose handshake
+/// fails or times out is closed and never reaches `handler`. The header
+/// read timeout starts once the handshake is done. Each request carries
+/// the connection's [`TlsInfo`](crate::tls::TlsInfo) as an
+/// `Arc<TlsInfo>` extension. On shutdown, handshakes still running are
+/// abandoned and not reported.
+pub async fn serve_tls<H: Handler>(
+    listener: TcpListener,
+    acceptor: Arc<Acceptor>,
+    handler: Arc<H>,
+    limits: ServerLimits,
+    shutdown: impl Future<Output = ()>,
+) -> ServeReport {
+    run(listener, Some(acceptor), handler, limits, shutdown).await
+}
+
+async fn run<H: Handler>(
+    listener: TcpListener,
+    acceptor: Option<Arc<Acceptor>>,
+    handler: Arc<H>,
+    limits: ServerLimits,
+    shutdown: impl Future<Output = ()>,
+) -> ServeReport {
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut conns = JoinSet::new();
     let mut report = ServeReport::default();
     let mut shutdown = pin!(shutdown);
-    loop {
+    'serving: loop {
+        // With TLS, a handshake slot first; reaping finished connections
+        // and watching for shutdown while waiting for one.
+        let slot = match &acceptor {
+            None => None,
+            Some(a) => loop {
+                tokio::select! {
+                    slot = a.slot() => break Some(slot),
+                    Some(_) = conns.join_next(), if !conns.is_empty() => {}
+                    () = &mut shutdown => break 'serving,
+                }
+            },
+        };
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
                     report.accepted += 1;
                     let _ = stream.set_nodelay(true);
-                    conns.spawn(connection(stream, peer, handler.clone(), limits, stop_rx.clone()));
+                    let (handler, stop) = (handler.clone(), stop_rx.clone());
+                    match (&acceptor, slot) {
+                        (Some(a), Some(slot)) => {
+                            conns.spawn(handshake_then_serve(a.clone(), slot, stream, peer, handler, limits, stop));
+                        }
+                        _ => {
+                            conns.spawn(connection(stream, peer, None, handler, limits, stop));
+                        }
+                    }
                 }
                 Err(e) => {
+                    drop(slot);
                     // Usually out of file descriptors; back off instead of spinning.
                     tracing::warn!(error = %e, "accept failed");
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -142,6 +195,26 @@ pub async fn serve<H: Handler>(
         conns.shutdown().await;
     }
     report
+}
+
+/// Runs a connection's handshake, unless shutdown comes first, then
+/// serves it.
+async fn handshake_then_serve<H: Handler>(
+    acceptor: Arc<Acceptor>,
+    slot: Slot,
+    stream: TcpStream,
+    peer: SocketAddr,
+    handler: Arc<H>,
+    limits: ServerLimits,
+    mut stop: watch::Receiver<bool>,
+) {
+    let established = tokio::select! {
+        done = acceptor.handshake(slot, stream) => done,
+        _ = stop.wait_for(|s| *s) => return,
+    };
+    if let Some((tls, info)) = established {
+        connection(tls, peer, Some(info), handler, limits, stop).await;
+    }
 }
 
 /// The state a connection's watchdog reads. Times are nanoseconds since
@@ -223,13 +296,13 @@ impl Drop for Busy {
     }
 }
 
-/// A TCP stream that reports reads to its watchdog.
-struct Watched {
-    stream: TcpStream,
+/// A stream that reports reads to its watchdog.
+struct Watched<S> {
+    stream: S,
     watch: Arc<Watch>,
 }
 
-impl AsyncRead for Watched {
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -245,7 +318,7 @@ impl AsyncRead for Watched {
     }
 }
 
-impl AsyncWrite for Watched {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -277,18 +350,24 @@ impl AsyncWrite for Watched {
 
 /// Serves one connection until it ends, a timeout closes it, or shutdown
 /// lets it finish.
-async fn connection<H: Handler>(
-    stream: TcpStream,
+async fn connection<S, H: Handler>(
+    stream: S,
     peer: SocketAddr,
+    tls: Option<Arc<TlsInfo>>,
     handler: Arc<H>,
     limits: ServerLimits,
     mut stop: watch::Receiver<bool>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let watch = Arc::new(Watch::new());
     let service = {
         let watch = watch.clone();
-        service_fn(move |req| {
+        service_fn(move |mut req: Request<Incoming>| {
             let busy = Busy::new(watch.clone());
+            if let Some(info) = &tls {
+                req.extensions_mut().insert(Arc::clone(info));
+            }
             let handler = handler.clone();
             async move {
                 let resp = handler.call(req, peer).await;

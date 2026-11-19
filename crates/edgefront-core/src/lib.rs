@@ -23,7 +23,8 @@
 //!   proxy route;
 //! - [`l4`]: the base TCP relay, pacerd's data path: bidirectional copy
 //!   through one fixed buffer per direction, half-close, and connect and
-//!   idle timeouts.
+//!   idle timeouts;
+//! - [`tls`]: TLS termination on rustls, with certificates chosen by SNI.
 
 pub mod admin;
 pub mod body;
@@ -37,3 +38,4 @@ pub mod listener;
 pub mod metrics;
 pub mod reqid;
 pub mod telemetry;
+pub mod tls;
