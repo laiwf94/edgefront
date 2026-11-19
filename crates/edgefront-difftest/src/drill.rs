@@ -88,6 +88,27 @@ impl Upstream {
     /// use port 0; [`Upstream::addr`] and [`Upstream::control`] say which
     /// port was given.
     pub async fn start(name: &str, addr: &str, control: &str) -> io::Result<Upstream> {
+        Upstream::start_with(name, addr, control, None).await
+    }
+
+    /// Like [`Upstream::start`], with the traffic listener terminating TLS
+    /// through `tls` (for the drill over HTTPS); the control listener stays
+    /// plain.
+    pub async fn start_tls(
+        name: &str,
+        addr: &str,
+        control: &str,
+        tls: Arc<edgefront_core::tls::Acceptor>,
+    ) -> io::Result<Upstream> {
+        Upstream::start_with(name, addr, control, Some(tls)).await
+    }
+
+    async fn start_with(
+        name: &str,
+        addr: &str,
+        control: &str,
+        tls: Option<Arc<edgefront_core::tls::Acceptor>>,
+    ) -> io::Result<Upstream> {
         let ln = TcpListener::bind(addr).await?;
         let cln = TcpListener::bind(control).await?;
         let server = Arc::new(Server::new(name));
@@ -96,7 +117,12 @@ impl Upstream {
         let traffic = tokio::spawn({
             let server = server.clone();
             async move {
-                listener::serve(ln, server, upstream_limits(), never()).await;
+                match tls {
+                    None => listener::serve(ln, server, upstream_limits(), never()).await,
+                    Some(tls) => {
+                        listener::serve_tls(ln, tls, server, upstream_limits(), never()).await
+                    }
+                };
             }
         });
         let ctl = tokio::spawn({

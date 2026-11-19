@@ -70,6 +70,18 @@ impl fmt::Debug for Checker {
     }
 }
 
+/// A probe's client: a new connection for every probe, within the probe
+/// timeout.
+fn probe_limits(timeout: Duration) -> ClientLimits {
+    ClientLimits {
+        connect_timeout: timeout,
+        response_header_timeout: Some(timeout),
+        pool_idle_timeout: Duration::from_secs(1),
+        max_idle_per_host: 0,
+        max_response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
+    }
+}
+
 impl Checker {
     /// A checker for `eps` with jitter drawn at random. Must be called
     /// inside a tokio runtime, which the probe client needs.
@@ -80,13 +92,7 @@ impl Checker {
         on_change: Option<ChangeFn>,
     ) -> Checker {
         let rng = SplitMix64::from_entropy();
-        let client = Client::new(&ClientLimits {
-            connect_timeout: cfg.timeout,
-            response_header_timeout: Some(cfg.timeout),
-            pool_idle_timeout: Duration::from_secs(1),
-            max_idle_per_host: 0,
-            max_response_header_bytes: MAX_RESPONSE_HEADER_BYTES,
-        });
+        let client = Client::new(&probe_limits(cfg.timeout));
         Checker {
             cfg,
             eps,
@@ -95,6 +101,12 @@ impl Checker {
             random: Box::new(move || unit(rng.next_u64())),
             on_change,
         }
+    }
+
+    /// Probes over TLS, as `tls` says, as the cluster's requests go.
+    pub fn with_tls(mut self, tls: edgefront_core::http1::TlsTo) -> Checker {
+        self.client = Client::with_tls(&probe_limits(self.cfg.timeout), tls);
+        self
     }
 
     /// Replaces the jitter source with `random`, which must return values

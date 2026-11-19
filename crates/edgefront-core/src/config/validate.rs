@@ -10,7 +10,7 @@ use super::raw::{self, RawCluster, RawConfig, RawTls};
 use super::{
     Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config, ConfigError, Endpoint,
     FieldError, HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy, Retry, Route, Tls,
-    TlsVersion, defaults, go, limits,
+    TlsVersion, UpstreamTls, defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -562,6 +562,10 @@ impl Validator {
                 .allowed_clients
                 .as_ref()
                 .map(|list| self.allowed_clients(&format!("{path}.allowed_clients"), list)),
+            tls: rc
+                .tls
+                .as_ref()
+                .map(|t| self.upstream_tls(&format!("{path}.tls"), t)),
         }
     }
 
@@ -588,6 +592,28 @@ impl Validator {
             }
         }
         list.to_vec()
+    }
+
+    fn upstream_tls(&mut self, path: &str, t: &raw::RawUpstreamTls) -> UpstreamTls {
+        if t.ca_file.is_empty() {
+            self.add(format!("{path}.ca_file"), "is required");
+        }
+        if t.cert_file.is_empty() != t.key_file.is_empty() {
+            self.add(
+                format!("{path}.cert_file"),
+                "cert_file and key_file go together",
+            );
+        }
+        if !t.server_name.is_empty() && check_hostname(&t.server_name).is_err() {
+            self.add(format!("{path}.server_name"), "must be a host name");
+        }
+        let opt = |s: &String| (!s.is_empty()).then(|| s.clone());
+        UpstreamTls {
+            ca_file: t.ca_file.clone(),
+            server_name: opt(&t.server_name),
+            cert_file: opt(&t.cert_file),
+            key_file: opt(&t.key_file),
+        }
     }
 
     fn health_check(&mut self, hp: &str, h: &raw::RawHealth) -> HealthCheck {

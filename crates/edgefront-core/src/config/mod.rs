@@ -306,6 +306,26 @@ pub struct Cluster {
     /// `tls.client_auth`. `None` admits every client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_clients: Option<Vec<String>>,
+    /// TLS, or mutual TLS, to the endpoints. `None` is plain HTTP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<UpstreamTls>,
+}
+
+/// TLS from the proxy to a cluster's endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpstreamTls {
+    /// The CA bundle the endpoints' certificates must chain to; only these
+    /// CAs are trusted, not the system's.
+    pub ca_file: String,
+    /// The name the certificates must carry and the SNI sent; by default
+    /// each endpoint's host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// A client certificate and key for mutual TLS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
 }
 
 /// One upstream address, `host:port`.
@@ -569,6 +589,21 @@ impl Config {
                 && !auth.ca_file.starts_with('/')
             {
                 auth.ca_file = go::join(&dir, &auth.ca_file);
+            }
+        }
+        let dir = path
+            .to_str()
+            .map(go::dir)
+            .unwrap_or_else(|| path.parent().unwrap_or(Path::new("")).display().to_string());
+        for cluster in &mut cfg.clusters {
+            let Some(t) = &mut cluster.tls else { continue };
+            let files = std::iter::once(&mut t.ca_file)
+                .chain(t.cert_file.as_mut())
+                .chain(t.key_file.as_mut());
+            for file in files {
+                if !file.starts_with('/') {
+                    *file = go::join(&dir, file);
+                }
             }
         }
         Ok(cfg)

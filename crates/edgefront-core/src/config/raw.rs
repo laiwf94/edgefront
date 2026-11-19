@@ -258,6 +258,13 @@ raw_struct!(RawClientAuth, "an object" {
     required: Option<bool>,
 });
 
+raw_struct!(RawUpstreamTls, "an object" {
+    ca_file: String,
+    server_name: String,
+    cert_file: String,
+    key_file: String,
+});
+
 raw_struct!(RawCertificate, "an object" {
     cert_file: String,
     key_file: String,
@@ -283,6 +290,7 @@ raw_struct!(RawCluster, "an object" {
     outlier_detection: Option<RawOutlier>,
     retry: Option<RawRetry>,
     allowed_clients: Option<Vec<String>>,
+    tls: Option<RawUpstreamTls>,
 });
 
 raw_struct!(RawEndpoint, "an object" {

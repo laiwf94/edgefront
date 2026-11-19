@@ -8,7 +8,9 @@
 // every file, with new keys. `go run gen.go -extra` keeps ca.crt and
 // ca.key and rewrites only the certificates added for stapling and client
 // authentication (week 5): ocsp (a chain with an OCSP URL),
-// ocsp-responder (a delegated OCSP signer), and the client certificates.
+// ocsp-responder (a delegated OCSP signer), and the client certificates
+// (client, client-rotated, client-expired, and client-other from the
+// second CA).
 package main
 
 import (
@@ -149,6 +151,8 @@ func extra(c *ca) {
 		{base: "ocsp-responder", usage: []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning}},
 		{base: "client", usage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 			names: []string{"client.example.com"}, uris: []string{"spiffe://edge.test/ns/web/sa/frontend"}},
+		{base: "client-rotated", usage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			uris: []string{"spiffe://edge.test/ns/web/sa/rotated"}},
 		{base: "client-expired", usage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 			uris:      []string{"spiffe://edge.test/ns/web/sa/old"},
 			notBefore: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), notAfter: time.Date(2020, 1, 3, 0, 0, 0, 0, time.UTC)},

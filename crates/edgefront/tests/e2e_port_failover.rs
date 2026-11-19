@@ -17,6 +17,13 @@
 //! still succeeds 100.00% and every fault shows, which proves the drill
 //! breaks what it says it breaks.
 //!
+//! The resilient drill runs a second time over HTTPS with mutual TLS: the
+//! upstreams terminate TLS with a certificate for `api.example.com` and
+//! require a client certificate from the fixture CA, and the cluster's
+//! `tls` block pins that CA, names the server and presents the client
+//! certificate, for requests and health checks alike. It must hold the
+//! same table.
+//!
 //! `EDGEFRONT_E2E_PHASE_SECONDS` shortens or lengthens the phases.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -49,7 +56,7 @@ fn phase_seconds() -> u64 {
 
 /// `examples/failover/<name>.json` with the proxy and admin listeners on
 /// free ports and the endpoints on `upstreams`, written to a scratch file.
-fn config(name: &str, upstreams: &[String; 3]) -> std::path::PathBuf {
+fn config(name: &str, upstreams: &[String; 3], tls: bool) -> std::path::PathBuf {
     let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/failover");
     let text = std::fs::read_to_string(examples.join(format!("{name}.json"))).unwrap();
     let mut c: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -60,11 +67,59 @@ fn config(name: &str, upstreams: &[String; 3]) -> std::path::PathBuf {
     for (e, addr) in endpoints.iter_mut().zip(upstreams) {
         e["address"] = addr.as_str().into();
     }
-    let dir = std::env::temp_dir().join(format!("e2e-failover-{}-{name}", std::process::id()));
+    if tls {
+        c["clusters"][0]["tls"] = serde_json::json!({
+            "ca_file": fixture("ca.crt"),
+            "server_name": "api.example.com",
+            "cert_file": fixture("client.crt"),
+            "key_file": fixture("client.key"),
+        });
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "e2e-failover-{}-{name}{}",
+        std::process::id(),
+        if tls { "-tls" } else { "" }
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("proxy.json");
     std::fs::write(&path, serde_json::to_string_pretty(&c).unwrap()).unwrap();
     path
+}
+
+fn fixture(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../edgefront-core/tests/fixtures/tls")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The upstreams' TLS: the `exact` certificate (`api.example.com`), and a
+/// client certificate from the fixture CA required.
+fn upstream_tls() -> std::sync::Arc<edgefront_core::tls::Acceptor> {
+    use edgefront_core::config::{Certificate, ClientAuth, Tls, TlsVersion};
+    use edgefront_core::tls::{Acceptor, Snapshot, Store};
+    let tls = Tls {
+        certificates: vec![Certificate {
+            cert_file: fixture("exact.crt"),
+            key_file: fixture("exact.key"),
+            server_names: None,
+        }],
+        min_version: TlsVersion::Tls12,
+        cipher_suites: None,
+        handshake_timeout: Duration::from_secs(5),
+        max_concurrent_handshakes: 1024,
+        strict_sni: false,
+        ocsp: Default::default(),
+        client_auth: Some(ClientAuth {
+            ca_file: fixture("ca.crt"),
+            required: true,
+        }),
+    };
+    Acceptor::new(
+        Store::new(std::sync::Arc::new(Snapshot::load(&tls).unwrap())),
+        None,
+    )
 }
 
 /// A running `edgefront proxy`, stopped with SIGTERM when dropped so it
@@ -178,7 +233,7 @@ fn cluster(p: &Proc) -> serde_json::Value {
 
 /// Runs the four phases against `config_name` and returns their reports
 /// and the end state.
-fn drill(config_name: &str) -> (Vec<Report>, serde_json::Value) {
+fn drill(config_name: &str, tls: bool) -> (Vec<Report>, serde_json::Value) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -186,16 +241,17 @@ fn drill(config_name: &str) -> (Vec<Report>, serde_json::Value) {
     let mut ups: Vec<Upstream> = rt.block_on(async {
         let mut ups = Vec::new();
         for name in ["primary-a", "primary-b", "backup"] {
-            ups.push(
-                Upstream::start(name, "127.0.0.1:0", "127.0.0.1:0")
-                    .await
-                    .unwrap(),
-            );
+            let up = if tls {
+                Upstream::start_tls(name, "127.0.0.1:0", "127.0.0.1:0", upstream_tls()).await
+            } else {
+                Upstream::start(name, "127.0.0.1:0", "127.0.0.1:0").await
+            };
+            ups.push(up.unwrap());
         }
         ups
     });
     let addrs = [0, 1, 2].map(|i| ups[i].addr().to_string());
-    let p = start(&config(config_name, &addrs));
+    let p = start(&config(config_name, &addrs, tls));
     let deadline = Instant::now() + TIMEOUT;
     while request(&p.admin, "GET", "/readyz", "").0 != 200 {
         assert!(Instant::now() < deadline, "the proxy never became ready");
@@ -221,7 +277,11 @@ fn drill(config_name: &str) -> (Vec<Report>, serde_json::Value) {
             _ => {}
         }
         let report = rt.block_on(running).unwrap();
-        eprint!("{config_name}: {}", report.row());
+        eprint!(
+            "{config_name}{}: {}",
+            if tls { " over https" } else { "" },
+            report.row()
+        );
         reports.push(report);
     }
     let end = cluster(&p);
@@ -246,7 +306,16 @@ fn endpoint_flags(end: &serde_json::Value) -> Vec<(bool, bool)> {
 
 #[test]
 fn with_resilience_on_every_phase_succeeds_as_in_steers_table() {
-    let (reports, end) = drill("resilient");
+    resilient(false);
+}
+
+#[test]
+fn over_https_with_mutual_tls_every_phase_succeeds_too() {
+    resilient(true);
+}
+
+fn resilient(tls: bool) {
+    let (reports, end) = drill("resilient", tls);
     let requests = (RATE * phase_seconds() as f64) as u64;
     for r in &reports {
         assert_eq!(
@@ -292,7 +361,7 @@ fn with_resilience_on_every_phase_succeeds_as_in_steers_table() {
 
 #[test]
 fn with_resilience_off_every_fault_reaches_the_client() {
-    let (reports, end) = drill("plain");
+    let (reports, end) = drill("plain", false);
     let requests = (RATE * phase_seconds() as f64) as u64;
     assert_eq!(reports[0].ok, requests, "{:?}", reports[0].failures);
     for r in &reports[1..] {

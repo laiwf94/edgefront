@@ -133,6 +133,26 @@ Routing reads it through a cluster's `allowed_clients`: `spiffe://` IDs, exact o
 
 `crates/edgefront-proxy/tests/lifecycle.rs` runs the proxy with three restricted clusters and an open one. It checks the 403, the forwarded ID, that a spoofed header never reaches the upstream, the refused handshakes, and the anonymous client under optional verification.
 
+### TLS to upstreams
+
+A cluster's `tls` block makes the proxy speak TLS, or mutual TLS, to its endpoints:
+- `ca_file` is the CA bundle the endpoints' certificates must chain to. It is the only set of trust anchors, and the system's are never consulted, so a cluster trusts exactly the CA it names.
+- `server_name` is the name the certificates must carry and the SNI sent. By default it is each endpoint's host, which suits name-addressed endpoints. IP-addressed endpoints behind a named certificate need the override.
+- `cert_file` and `key_file` are presented as the client certificate.
+
+`edgefront_core::http1::TlsTo` reads the block into a rustls `ClientConfig` (ring, the safe default versions, `http/1.1` as ALPN). `Client::with_tls` sends over it. hyper-util's pooled client cannot take a TLS connector without another dependency, so the TLS client keeps its own pool. It holds idle hyper connections per authority under the same idle timeout and per-origin cap. A connection is offered again once its last response body is read, and a TCP or TLS step past `connect_timeout` is a connect timeout. The client lives in `edgefront-core` with the rest of the TLS stack, so the cache and the limiter can reach TLS origins with the same code, and the proxy's health checks use it too (`Checker::with_tls`), so a probe goes the same way as a request.
+
+A refused handshake is a connect error, which steer's retry rules always retry. A cluster never falls back to cleartext. The block is read on every runtime build, so a reload picks up a rotated CA bundle or client certificate at once. A file that cannot be read fails `reload::load` at startup or reload, naming the cluster. If one disappears between that check and the build, the cluster refuses every attempt (`Client::refusing`) rather than send in cleartext.
+
+`crates/edgefront-proxy/tests/upstream_tls.rs` covers:
+- the pinned CA, the name override, and five requests over one pooled connection;
+- refusals for no override against an IP, another CA and a wrong name;
+- mutual TLS with no certificate, then the client certificate, then a reload that rotates it to another, then an expired one;
+- unreadable files that refuse instead of falling back;
+- the configuration rules.
+
+`crates/edgefront/tests/e2e_port_failover.rs` runs the resilient failover drill a second time over HTTPS with mutual TLS. The three upstreams terminate TLS for `api.example.com` and require client certificates from the fixture CA, and the cluster's `tls` block pins the CA, names the server and presents the client certificate, for requests and health checks alike. Every phase must keep 100.00%, as over cleartext.
+
 ### The failover drill
 
 steer's README publishes one table as the measure of its resilience: its failover drill, in which two priority-0 upstreams and a priority-1 backup take 200 requests per second while one fault lands per 10-second phase (a primary killed with SIGKILL, the other failing half its requests, then that one blackholed), and every phase keeps 100.00% of requests with health checks, outlier detection and retries on. The port is held to the same table. `examples/failover.sh` is steer's script with the proxy swapped, and the configurations in `examples/failover/` are steer's, byte for byte, so the comparison is between the two binaries and nothing else.

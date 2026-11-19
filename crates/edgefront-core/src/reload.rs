@@ -123,7 +123,8 @@ pub struct Loaded {
 
 /// Loads and checks `path` as steer's `loadConfig` and `loadTLS` did: a
 /// valid file, a token unless the admin API is on loopback, and every
-/// certificate and key readable and matched. Problems with certificates
+/// certificate and key readable and matched, the clusters' upstream TLS
+/// files included. Problems with certificates
 /// that still serve (expired, not yet valid, a name not covered) are
 /// logged as `tls certificate` warnings.
 pub fn load(path: &str, settings: &Settings, prefix: &str) -> Result<Loaded, String> {
@@ -150,6 +151,11 @@ pub fn load_with(
             "admin_listen {} is not a loopback address; set {prefix}_ADMIN_TOKEN to expose the admin API",
             config.admin_listen
         ));
+    }
+    for (i, c) in config.clusters.iter().enumerate() {
+        if let Some(t) = &c.tls {
+            crate::http1::TlsTo::load(t).map_err(|e| format!("{path}: clusters[{i}].tls: {e}"))?;
+        }
     }
     let tls = match &config.tls {
         None => None,

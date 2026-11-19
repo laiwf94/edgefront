@@ -101,7 +101,7 @@ use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
 use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
-use edgefront_core::http1::{Client, ClientLimits};
+use edgefront_core::http1::{Client, ClientLimits, TlsTo};
 use edgefront_core::listener::Handler;
 use edgefront_core::reload;
 use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics, TlsMetrics};
@@ -347,6 +347,20 @@ impl Cluster {
                 Some(on_eject),
             ))
         });
+        // TLS to the endpoints, read afresh on every build, so a reload
+        // picks up rotated CA bundles and client certificates. A block
+        // that cannot be read here was readable when the file was loaded;
+        // its cluster then refuses every attempt rather than speak
+        // cleartext.
+        let tls = cfg.tls.as_ref().map(|t| {
+            TlsTo::load(t).map_err(|e| {
+                tracing::error!(
+                    cluster = name,
+                    error = e.as_str(),
+                    "cannot load upstream tls"
+                );
+            })
+        });
         let checker = cfg.health_check.as_ref().map(|hc| {
             let cluster = name.clone();
             let metrics = Arc::clone(src.metrics);
@@ -363,21 +377,32 @@ impl Cluster {
                     );
                 }
             });
-            Arc::new(Checker::new(
+            let checker = Checker::new(
                 hc.clone(),
                 balancer.endpoints().to_vec(),
                 Arc::clone(clock),
                 Some(on_change),
-            ))
+            );
+            Arc::new(match &tls {
+                Some(Ok(t)) => checker.with_tls(t.clone()),
+                _ => checker,
+            })
         });
-        let client = match prev {
-            Some(p) if p.config.connect_timeout == cfg.connect_timeout => p.client.clone(),
-            _ => Client::new(&ClientLimits {
-                connect_timeout: cfg.connect_timeout,
-                // The cluster timeout bounds the whole exchange instead.
-                response_header_timeout: None,
-                ..ClientLimits::default()
-            }),
+        let limits = ClientLimits {
+            connect_timeout: cfg.connect_timeout,
+            // The cluster timeout bounds the whole exchange instead.
+            response_header_timeout: None,
+            ..ClientLimits::default()
+        };
+        let client = match (&tls, prev) {
+            (Some(Ok(t)), _) => Client::with_tls(&limits, t.clone()),
+            (Some(Err(())), _) => Client::refusing(&limits),
+            (None, Some(p))
+                if p.config.connect_timeout == cfg.connect_timeout && p.config.tls.is_none() =>
+            {
+                p.client.clone()
+            }
+            (None, _) => Client::new(&limits),
         };
         let addresses: Vec<&str> = cfg.endpoints.iter().map(|e| e.address.as_str()).collect();
         Cluster {

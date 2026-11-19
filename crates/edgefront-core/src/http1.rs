@@ -6,18 +6,23 @@
 //! that give up after one second, and idle origin connections kept for 90
 //! seconds, at most 256 per origin.
 
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::{Request, Response};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::client::conn::http1 as conn_http1;
 use hyper::server::conn::http1;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use rustls::pki_types::ServerName;
+use tokio::net::TcpStream;
 
 /// The smallest read buffer hyper accepts. A configured header limit below
 /// it is still enforced exactly on the server, through hyper's separate
@@ -177,11 +182,14 @@ impl fmt::Display for ClientError {
 
 impl StdError for ClientError {}
 
-/// A pooled HTTP/1.1 client over plain TCP. Cloning is cheap and clones
-/// share one pool.
+/// A pooled HTTP/1.1 client, over plain TCP or, with
+/// [`Client::with_tls`], over TLS to every origin. Cloning is cheap and
+/// clones share one pool.
 pub struct Client<B> {
     inner: HyperClient<HttpConnector, B>,
     response_header_timeout: Option<Duration>,
+    tls: Option<Arc<TlsPool<B>>>,
+    refuse: bool,
 }
 
 impl<B> Clone for Client<B> {
@@ -189,8 +197,91 @@ impl<B> Clone for Client<B> {
         Client {
             inner: self.inner.clone(),
             response_header_timeout: self.response_header_timeout,
+            tls: self.tls.clone(),
+            refuse: self.refuse,
         }
     }
+}
+
+/// How a client speaks TLS to its origins: the trust anchors and, for
+/// mutual TLS, the client certificate (a `ClientConfig`), and the name
+/// the origins' certificates must carry when it is not the host in the
+/// request's URI.
+#[derive(Clone)]
+pub struct TlsTo {
+    config: Arc<rustls::ClientConfig>,
+    server_name: Option<ServerName<'static>>,
+}
+
+impl fmt::Debug for TlsTo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsTo")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TlsTo {
+    /// Reads a cluster's `tls` block: the CA bundle it pins (the only
+    /// trust anchors; the system's are never used), the server name
+    /// override, and the client certificate and key for mutual TLS.
+    pub fn load(cfg: &crate::config::UpstreamTls) -> Result<TlsTo, String> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let file = &cfg.ca_file;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(file).map_err(|e| format!("{file}: {e}"))? {
+            roots
+                .add(cert.map_err(|e| format!("{file}: {e}"))?)
+                .map_err(|e| format!("{file}: {e}"))?;
+        }
+        if roots.is_empty() {
+            return Err(format!("{file}: no CA certificates"));
+        }
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots);
+        let mut config = match (&cfg.cert_file, &cfg.key_file) {
+            (Some(c), Some(k)) => {
+                let chain = CertificateDer::pem_file_iter(c)
+                    .map_err(|e| format!("{c}: {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("{c}: {e}"))?;
+                let key = PrivateKeyDer::from_pem_file(k).map_err(|e| format!("{k}: {e}"))?;
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .map_err(|e| format!("{c} and {k}: {e}"))?
+            }
+            _ => builder.with_no_client_auth(),
+        };
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_name = match &cfg.server_name {
+            Some(n) => Some(
+                ServerName::try_from(n.clone()).map_err(|e| format!("server_name {n:?}: {e}"))?,
+            ),
+            None => None,
+        };
+        Ok(TlsTo {
+            config: Arc::new(config),
+            server_name,
+        })
+    }
+}
+
+/// An idle pooled connection and when it went idle.
+type Idle<B> = (conn_http1::SendRequest<B>, Instant);
+
+/// Idle TLS connections by authority.
+struct TlsPool<B> {
+    tls: TlsTo,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    max_idle: usize,
+    max_buf: usize,
+    idle: Mutex<HashMap<String, Vec<Idle<B>>>>,
 }
 
 impl<B> fmt::Debug for Client<B> {
@@ -224,7 +315,35 @@ where
         Client {
             inner,
             response_header_timeout: limits.response_header_timeout,
+            tls: None,
+            refuse: false,
         }
+    }
+
+    /// A client every request through which fails with
+    /// [`ClientError::Connect`], for a cluster whose TLS settings could not
+    /// be read: it must not fall back to cleartext.
+    pub fn refusing(limits: &ClientLimits) -> Self {
+        let mut client = Client::new(limits);
+        client.refuse = true;
+        client
+    }
+
+    /// A client that speaks TLS to every origin, as `tls` says, with the
+    /// same limits and its own pool of TLS connections. Requests still
+    /// carry `http://host:port/path` URIs, whose authority names the
+    /// origin to connect to.
+    pub fn with_tls(limits: &ClientLimits, tls: TlsTo) -> Self {
+        let mut client = Client::new(limits);
+        client.tls = Some(Arc::new(TlsPool {
+            tls,
+            connect_timeout: limits.connect_timeout,
+            idle_timeout: limits.pool_idle_timeout,
+            max_idle: limits.max_idle_per_host,
+            max_buf: limits.max_response_header_bytes.max(MIN_BUFFER),
+            idle: Mutex::new(HashMap::new()),
+        }));
+        client
     }
 
     /// Sends `req`, whose URI must be absolute (`http://host:port/path`),
@@ -232,6 +351,18 @@ where
     /// afterwards; the connection goes back to the pool when it is read to
     /// the end.
     pub async fn send(&self, req: Request<B>) -> Result<Response<Incoming>, ClientError> {
+        if self.refuse {
+            return Err(ClientError::Connect);
+        }
+        if let Some(pool) = &self.tls {
+            let sent = pool.send(req);
+            return match self.response_header_timeout {
+                Some(limit) => tokio::time::timeout(limit, sent)
+                    .await
+                    .unwrap_or(Err(ClientError::Timeout)),
+                None => sent.await,
+            };
+        }
         let sent = self.inner.request(req);
         let result = match self.response_header_timeout {
             Some(limit) => match tokio::time::timeout(limit, sent).await {
@@ -241,6 +372,112 @@ where
             None => sent.await,
         };
         result.map_err(|e| ClientError::classify(&e))
+    }
+}
+
+impl<B> TlsPool<B>
+where
+    B: Body + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<BoxError>,
+{
+    /// An idle connection to `authority` that can take a request now.
+    fn take_idle(&self, authority: &str) -> Option<conn_http1::SendRequest<B>> {
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        let list = idle.get_mut(authority)?;
+        let mut busy = Vec::new();
+        let mut found = None;
+        while let Some((sender, since)) = list.pop() {
+            if sender.is_closed() || since.elapsed() >= self.idle_timeout {
+                continue;
+            }
+            if sender.is_ready() {
+                found = Some(sender);
+                break;
+            }
+            // Still reading the last response's body; it comes back later.
+            busy.push((sender, since));
+        }
+        list.extend(busy);
+        found
+    }
+
+    fn put_idle(&self, authority: &str, sender: conn_http1::SendRequest<B>) {
+        if self.max_idle == 0 {
+            return;
+        }
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        let list = idle.entry(authority.to_owned()).or_default();
+        list.retain(|(s, since)| !s.is_closed() && since.elapsed() < self.idle_timeout);
+        if list.len() < self.max_idle {
+            list.push((sender, Instant::now()));
+        }
+    }
+
+    async fn connect(
+        &self,
+        authority: &str,
+        host: &str,
+    ) -> Result<conn_http1::SendRequest<B>, ClientError> {
+        let tcp = tokio::time::timeout(self.connect_timeout, TcpStream::connect(authority))
+            .await
+            .map_err(|_| ClientError::ConnectTimeout)?
+            .map_err(|_| ClientError::Connect)?;
+        let _ = tcp.set_nodelay(true);
+        let name = match &self.tls.server_name {
+            Some(n) => n.clone(),
+            None => ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+                .map_err(|_| ClientError::Connect)?,
+        };
+        let connector = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls.config));
+        let stream = tokio::time::timeout(self.connect_timeout, connector.connect(name, tcp))
+            .await
+            .map_err(|_| ClientError::ConnectTimeout)?
+            .map_err(|e| {
+                tracing::debug!(origin = authority, error = %e, "tls to the origin failed");
+                ClientError::Connect
+            })?;
+        let (sender, conn) = conn_http1::Builder::new()
+            .max_buf_size(self.max_buf)
+            .handshake(TokioIo::new(stream))
+            .await
+            .map_err(|_| ClientError::Connect)?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(sender)
+    }
+
+    async fn send(&self, mut req: Request<B>) -> Result<Response<Incoming>, ClientError> {
+        let authority = req
+            .uri()
+            .authority()
+            .map(|a| a.as_str().to_owned())
+            .ok_or(ClientError::Protocol)?;
+        let host = req.uri().host().unwrap_or_default().to_owned();
+        let authority = match req.uri().port_u16() {
+            Some(_) => authority,
+            None => format!("{authority}:443"),
+        };
+        // The connection is to the origin, so the request line is the
+        // origin form.
+        let origin_form = req.uri().path_and_query().map_or_else(
+            || http::Uri::from_static("/"),
+            |p| http::Uri::from(p.clone()),
+        );
+        *req.uri_mut() = origin_form;
+        let mut sender = match self.take_idle(&authority) {
+            Some(s) => s,
+            None => self.connect(&authority, &host).await?,
+        };
+        match sender.send_request(req).await {
+            Ok(resp) => {
+                self.put_idle(&authority, sender);
+                Ok(resp)
+            }
+            Err(e) if e.is_parse_too_large() => Err(ClientError::HeadersTooLarge),
+            Err(_) => Err(ClientError::Protocol),
+        }
     }
 }
 
