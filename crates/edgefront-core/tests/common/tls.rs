@@ -1,4 +1,5 @@
-//! TLS test helpers: the certificates in `tests/fixtures/tls` (steer's
+//! TLS test helpers, shared by the crates' tests through `#[path]`: the
+//! certificates in `crates/edgefront-core/tests/fixtures/tls` (steer's
 //! tlsedge test set, written by `gen.go` there), `tls` blocks built from
 //! them, and a rustls client to handshake and send requests with.
 
@@ -20,10 +21,11 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
-/// The path of a fixture file.
+/// The path of a fixture file. The path goes through `crates/`, so the
+/// helpers work from any crate's tests that include this file.
 pub fn fixture(name: &str) -> String {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/tls");
+    p.push("../edgefront-core/tests/fixtures/tls");
     p.push(name);
     p.to_string_lossy().into_owned()
 }

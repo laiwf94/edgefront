@@ -799,26 +799,19 @@ fn command_line() {
     cfg["tls"] = serde_json::json!({"certificates": [{"cert_file": "c.pem", "key_file": "c.pem"}]});
     std::fs::write(&tls, cfg.to_string()).unwrap();
     let tls = tls.to_str().unwrap();
+    // A tls block whose certificate cannot be read is refused by both,
+    // naming the entry and the file.
+    let refused = format!(
+        "edgefront: {tls}: tls.certificates[0]: {}: failed to find any PEM data in certificate input\n",
+        cert.to_str().unwrap()
+    );
     assert_eq!(
         edgefront(&["proxy", "--check-config", tls]),
-        (
-            2,
-            String::new(),
-            format!(
-                "edgefront: {tls}: tls is not supported by the proxy yet; remove the tls block\n"
-            )
-        )
+        (2, String::new(), refused.clone())
     );
-
     assert_eq!(
         edgefront(&["proxy", "--config", tls]),
-        (
-            2,
-            String::new(),
-            format!(
-                "edgefront: {tls}: tls is not supported by the proxy yet; remove the tls block\n"
-            )
-        )
+        (2, String::new(), refused)
     );
 
     // A listen or admin address in use: the proxy cannot start.

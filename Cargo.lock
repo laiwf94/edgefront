@@ -384,10 +384,13 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proptest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

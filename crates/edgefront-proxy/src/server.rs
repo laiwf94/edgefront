@@ -87,7 +87,7 @@
 //! the admin API's `/clusters` reports, and [`Proxy::drain`] closes each
 //! connection after its response while the process drains.
 
-use std::future::Future as _;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -103,7 +103,9 @@ use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
 use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
 use edgefront_core::http1::{Client, ClientLimits};
 use edgefront_core::listener::Handler;
-use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics};
+use edgefront_core::reload;
+use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics, TlsMetrics};
+use edgefront_core::tls::TlsInfo;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
@@ -828,6 +830,7 @@ impl Proxy {
             host: host.clone(),
             id: id.clone(),
             absolute: parts.uri.authority().is_some(),
+            tls: parts.extensions.get::<Arc<TlsInfo>>().is_some(),
         };
         // The request phase runs before the cluster's `max_requests`, so
         // an answer from a filter, such as a cache hit, takes no place.
@@ -962,6 +965,8 @@ struct Forwarding {
     id: HeaderValue,
     /// The client sent an absolute-form target.
     absolute: bool,
+    /// The request came over TLS, so `X-Forwarded-Proto` is `https`.
+    tls: bool,
 }
 
 impl Forwarding {
@@ -972,7 +977,7 @@ impl Forwarding {
         forwarded::set_forwarded(
             headers,
             self.peer,
-            false,
+            self.tls,
             self.host.as_bytes(),
             &self.trusted,
         );
@@ -1313,6 +1318,40 @@ impl Refresh {
 /// Resolves once `stopped` turns true or its sender is gone.
 async fn until_stopped(mut stopped: tokio::sync::watch::Receiver<bool>) {
     let _ = stopped.wait_for(|s| *s).await;
+}
+
+impl reload::Service for Proxy {
+    fn reload(&self, config: &Config) -> Result<u64, String> {
+        Proxy::reload(self, config)
+    }
+
+    fn record_failed_reload(&self) {
+        Proxy::record_failed_reload(self);
+    }
+
+    fn drain(&self) {
+        Proxy::drain(self);
+    }
+
+    fn draining(&self) -> bool {
+        Proxy::draining(self)
+    }
+
+    fn state(&self) -> ProxyState {
+        Proxy::state(self)
+    }
+
+    fn write_metrics(&self, out: &mut String) {
+        self.metrics().registry().write(out);
+    }
+
+    fn tls_metrics(&self, in_progress: Box<dyn Fn() -> u64 + Send + Sync>) -> TlsMetrics {
+        self.metrics().tls(in_progress)
+    }
+
+    async fn background(self: Arc<Self>, stop: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        self.run_checks(stop).await;
+    }
 }
 
 impl Handler for Proxy {
