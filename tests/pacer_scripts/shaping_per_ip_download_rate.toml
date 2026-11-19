@@ -1,0 +1,15 @@
+name = "shaping_per_ip_download_rate"
+from = "it_shaping.c"
+# 1 MiB/s with a 64 KiB burst: 2 MiB + 64 KiB takes about 2 s.
+upstream = [{ name = "u", mode = "source", bytes = 2162688 }]
+config = """
+workers 2
+listener shape {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_bandwidth 1m/s burst 64k
+}
+"""
+step = [
+  { op = "download", bytes = 2162688, min_ms = 1800, max_ms = 2400, expect = "bytes=2162688 hash=ok time=ok" },
+]

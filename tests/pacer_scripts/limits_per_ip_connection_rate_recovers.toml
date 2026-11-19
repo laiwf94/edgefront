@@ -1,0 +1,23 @@
+name = "limits_per_ip_connection_rate_recovers"
+from = "it_limits.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+admin_socket {sock}
+workers 1
+listener lim {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_conn_rate 5/s burst 5
+}
+"""
+step = [
+  { op = "works_n", count = 5, expect = "5 of 5" },
+  { op = "connect", conn = "x", expect = "ok" },
+  { op = "refused", conn = "x", expect = "yes" },
+  { op = "log", text = "reason=per_ip_rate", expect = "found" },
+  # One token returns every 200 ms.
+  { op = "sleep", ms = 250 },
+  { op = "connect", conn = "y", expect = "ok" },
+  { op = "works", conn = "y", expect = "yes" },
+  { op = "stats", counters = ["accepted", "rejected_per_ip_rate"], expect = "accepted=6 rejected_per_ip_rate=1" },
+]

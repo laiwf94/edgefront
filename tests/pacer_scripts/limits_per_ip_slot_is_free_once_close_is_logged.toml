@@ -1,0 +1,16 @@
+name = "limits_per_ip_slot_is_free_once_close_is_logged"
+from = "it_limits.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+workers 2
+listener lim {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_max_conns 1
+}
+"""
+step = [
+  # A client that reconnects as soon as it reads its close in the log is
+  # admitted, on any worker, 200 times in a row.
+  { op = "cycle", count = 200, expect = "200 rounds" },
+]

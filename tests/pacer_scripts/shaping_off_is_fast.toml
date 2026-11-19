@@ -1,0 +1,13 @@
+name = "shaping_off_is_fast"
+from = "it_shaping.c"
+upstream = [{ name = "u", mode = "source", bytes = 33554432 }]
+config = """
+workers 2
+listener shape {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+}
+"""
+step = [
+  { op = "download", bytes = 33554432, max_ms = 1500, expect = "bytes=33554432 hash=ok time=ok" },
+]

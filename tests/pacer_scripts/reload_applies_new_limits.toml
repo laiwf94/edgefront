@@ -1,0 +1,36 @@
+name = "reload_applies_new_limits"
+from = "it_lifecycle.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_max_conns 1
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+  { op = "connect", conn = "b", expect = "ok" },
+  { op = "works", conn = "b", expect = "no" },
+  { op = "close", conn = "b" },
+  { op = "config", text = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_max_conns 3
+}
+""" },
+  { op = "signal", text = "HUP", expect = "yes" },
+  { op = "log", text = "msg=reloaded source=SIGHUP", expect = "found" },
+  { op = "connect", conn = "c", expect = "ok" },
+  { op = "works", conn = "c", expect = "yes" },
+  { op = "connect", conn = "d", expect = "ok" },
+  { op = "works", conn = "d", expect = "yes" },
+  { op = "connect", conn = "e", expect = "ok" },
+  { op = "works", conn = "e", expect = "no" },
+]

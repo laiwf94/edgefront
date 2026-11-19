@@ -1,0 +1,26 @@
+name = "failure_kill_and_restart_on_the_same_port"
+from = "it_failures.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+workers 4
+drain_timeout 5s
+admin_socket {sock}
+listener f {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+}
+"""
+step = [
+  { op = "hold_many", count = 8, expect = "held 8 of 8" },
+  # SIGKILL: no drain, no cleanup. Clients see their connections die.
+  { op = "signal", text = "KILL", expect = "yes" },
+  { op = "exit", expect = "exit signal 9" },
+  { op = "held_closed", expect = "all closed" },
+  { op = "close_held" },
+  # The restart binds the same port despite TIME_WAIT and takes over the
+  # admin socket file the dead process left behind.
+  { op = "start", expect = "ready" },
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+  { op = "ctl", text = "ping", expect = "exit 0: ok pong" },
+]

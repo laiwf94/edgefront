@@ -1,0 +1,26 @@
+name = "limits_listener_connection_cap"
+from = "it_limits.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+admin_socket {sock}
+workers 2
+listener lim {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  max_conns 4
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+  { op = "connect", conn = "b", expect = "ok" },
+  { op = "works", conn = "b", expect = "yes" },
+  { op = "connect", conn = "c", expect = "ok" },
+  { op = "works", conn = "c", expect = "yes" },
+  { op = "connect", conn = "d", expect = "ok" },
+  { op = "works", conn = "d", expect = "yes" },
+  { op = "connect", conn = "e", expect = "ok" },
+  { op = "refused", conn = "e", expect = "yes" },
+  { op = "log", text = "reason=listener_full", expect = "found" },
+  { op = "stats", counters = ["open", "rejected_listener_full"], timeout_ms = 0, expect = "open=4 rejected_listener_full=1" },
+]

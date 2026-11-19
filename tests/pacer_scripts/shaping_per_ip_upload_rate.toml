@@ -1,0 +1,16 @@
+name = "shaping_per_ip_upload_rate"
+from = "it_shaping.c"
+upstream = [{ name = "u", mode = "hash" }]
+config = """
+workers 2
+listener shape {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_bandwidth 1m/s burst 64k
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "upload", conn = "a", bytes = 2162688 },
+  { op = "recv_reply", conn = "a", text = "a", min_ms = 1800, max_ms = 2400, expect = "count=2162688 time=ok" },
+]

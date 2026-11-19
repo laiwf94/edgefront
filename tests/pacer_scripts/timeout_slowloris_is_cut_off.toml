@@ -1,0 +1,21 @@
+name = "timeout_slowloris_is_cut_off"
+from = "it_timeouts.c"
+# One byte every 200 ms is 5 bytes/s: under the idle timeout, but far
+# below 100 bytes per 2 s. The check starts after the first window.
+upstream = [{ name = "u", mode = "hash" }]
+config = """
+listener slow {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  idle_timeout 1m
+  min_rate 100 per 2s
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "mark", text = "t" },
+  { op = "trickle", conn = "a", bytes = 1, ms = 200, count = 50 },
+  { op = "log", text = "reason=slow_client", timeout_ms = 8000, expect = "found" },
+  { op = "elapsed", text = "t", min_ms = 1800, max_ms = 3500, expect = "time=ok" },
+  { op = "join", conn = "a", expect = "cut before the end" },
+]

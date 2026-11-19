@@ -1,0 +1,20 @@
+name = "timeout_shaped_client_is_not_called_slow"
+from = "it_timeouts.c"
+# Our own shaping holds this client to 512 bytes/s, below its 1 KiB/s
+# minimum. It must not be cut for slowness we caused.
+upstream = [{ name = "u", mode = "hash" }]
+config = """
+listener slow {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_bandwidth 512/s burst 512
+  min_rate 1k per 1s
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "send", conn = "a", bytes = 2048, expect = "yes" },
+  { op = "shutdown", conn = "a", expect = "yes" },
+  { op = "recv_reply", conn = "a", timeout_ms = 10000, expect = "count=2048" },
+  { op = "log_count", text = "slow_client", expect = "0" },
+]

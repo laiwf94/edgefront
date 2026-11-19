@@ -1,0 +1,23 @@
+name = "failure_stalled_upstream_with_a_full_buffer"
+from = "it_failures.c"
+# The client keeps sending into a stalled upstream: the proxy's buffer and
+# the socket buffers fill, the client blocks, and the slow-client check
+# closes the connection; the proxy never buffers more.
+upstream = [{ name = "u", mode = "stall" }]
+config = """
+workers 4
+drain_timeout 5s
+admin_socket {sock}
+listener f {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  buffer 16k
+  min_rate 1k per 1s
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  # Kernel buffers on both sides plus one 16 KiB proxy buffer: under 32 MiB.
+  { op = "flood", conn = "a", ms = 4000, bytes = 33554432, expect = "held back" },
+  { op = "log", text = "reason=slow_client", expect = "found" },
+]

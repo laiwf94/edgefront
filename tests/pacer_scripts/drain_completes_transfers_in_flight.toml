@@ -1,0 +1,27 @@
+name = "drain_completes_transfers_in_flight"
+from = "it_lifecycle.c"
+# A shaped 4 MiB download takes about 2 s. SIGTERM arrives in the middle:
+# new connections are refused at once, but the download finishes byte for
+# byte before the process exits.
+upstream = [{ name = "u", mode = "source", bytes = 4194304 }]
+config = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_bandwidth 2m/s burst 256k
+}
+"""
+step = [
+  { op = "download_bg", conn = "d", bytes = 4194304 },
+  { op = "sleep", ms = 500 },
+  { op = "signal", text = "TERM", expect = "yes" },
+  { op = "log", text = "msg=draining reason=SIGTERM", expect = "found" },
+  { op = "refused_now", expect = "refused" },
+  { op = "join", conn = "d", expect = "bytes=4194304 hash=ok" },
+  { op = "exit", timeout_ms = 10000, expect = "exit 0" },
+  { op = "log", text = "reason=done bytes_up=0 bytes_down=4194304", expect = "found" },
+  { op = "log", text = "msg=drained", expect = "found" },
+  { op = "no_log", text = "drain timeout", expect = "absent" },
+]

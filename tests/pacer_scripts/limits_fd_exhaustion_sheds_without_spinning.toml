@@ -1,0 +1,27 @@
+name = "limits_fd_exhaustion_sheds_without_spinning"
+from = "it_limits.c"
+# After its own descriptors a single worker has room for a handful of
+# connections, two descriptors each. tokio's runtime holds a few more
+# descriptors than pacerd's event loop, so edgefront gets a few more.
+nofile = { pacerd = 20, edgefront = 32 }
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+workers 1
+listener lim {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+}
+"""
+step = [
+  { op = "hold_many", count = 16, expect = "held some, not all" },
+  { op = "log", text = "reason=fd_exhausted", expect = "found" },
+  # A client that arrives now is closed at once, not left in the queue,
+  # and the process stays idle meanwhile.
+  { op = "connect", conn = "pending", expect = "ok" },
+  { op = "idle_cpu", ms = 1000, expect = "idle" },
+  { op = "refused", conn = "pending", expect = "yes" },
+  { op = "close_held" },
+  { op = "sleep", ms = 200 },
+  { op = "connect", conn = "after", expect = "ok" },
+  { op = "works", conn = "after", expect = "yes" },
+]

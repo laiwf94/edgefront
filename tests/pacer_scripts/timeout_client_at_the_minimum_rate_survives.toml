@@ -1,0 +1,19 @@
+name = "timeout_client_at_the_minimum_rate_survives"
+from = "it_timeouts.c"
+# 64 bytes every 250 ms is 512 bytes per 2 s, above the 100 minimum.
+upstream = [{ name = "u", mode = "hash" }]
+config = """
+listener slow {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  min_rate 100 per 2s
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "trickle", conn = "a", bytes = 64, ms = 250, count = 20 },
+  { op = "join", conn = "a", expect = "sent all" },
+  { op = "shutdown", conn = "a", expect = "yes" },
+  { op = "recv_reply", conn = "a", timeout_ms = 3000, expect = "count=1280" },
+  { op = "log_count", text = "slow_client", expect = "0" },
+]

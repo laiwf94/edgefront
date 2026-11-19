@@ -28,6 +28,10 @@
 //!   replayed against both binaries on one logical clock, and status,
 //!   headers, body digest and origin fetches are diffed per request.
 //!
+//! - [`l4`]: pacerd's data path as a client sees it: the scenarios of
+//!   pacer's `tests/it_*.c` as traffic scripts under `tests/pacer_scripts`,
+//!   run against legacy pacerd and against `edgefront limits`, with their
+//!   accept, refuse and close outcomes and counters diffed step by step.
 //! - [`drill`]: not a diff but the tools of steer's failover drill, its
 //!   fake upstream and its open-loop load generator, so the drill runs
 //!   against the Rust binary without Go.
@@ -39,6 +43,7 @@ pub mod balancer;
 pub mod cache;
 pub mod drill;
 pub mod driver;
+pub mod l4;
 pub mod pacer;
 pub mod pacer_config;
 pub mod resilience;

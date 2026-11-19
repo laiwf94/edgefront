@@ -1,0 +1,21 @@
+name = "failure_stalled_upstream_hits_the_idle_timeout"
+from = "it_failures.c"
+# The upstream accepts and then goes silent, as behind a partition: the
+# connection is closed by the idle timeout, not held for ever.
+upstream = [{ name = "u", mode = "stall" }]
+config = """
+workers 4
+drain_timeout 5s
+admin_socket {sock}
+listener f {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  idle_timeout 1s
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "send", conn = "a", text = "hello", expect = "yes" },
+  { op = "recv_eof", conn = "a", min_ms = 800, max_ms = 2500, expect = "bytes=0 time=ok" },
+  { op = "log", text = "reason=idle_timeout bytes_up=5 bytes_down=0", expect = "found" },
+]

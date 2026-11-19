@@ -1,0 +1,47 @@
+name = "reload_rejects_what_needs_a_restart"
+from = "it_lifecycle.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+}
+"""
+step = [
+  { op = "config", text = """
+listener life {
+  listen 127.0.0.1:1
+  upstream {upstream}
+}
+""" },
+  { op = "signal", text = "HUP", expect = "yes" },
+  { op = "log", text = "error=\"workers cannot change without a restart\"", expect = "found" },
+  { op = "config", text = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  table_size 1024
+}
+""" },
+  { op = "signal", text = "HUP", expect = "yes" },
+  { op = "log", text = "listener life: table_size cannot change", expect = "found" },
+  { op = "config", text = """
+workers 2
+listener life {
+  listen 127.0.0.1:1
+  upstream {upstream}
+}
+""" },
+  { op = "signal", text = "HUP", expect = "yes" },
+  { op = "log", text = "listener life: listen cannot change", expect = "found" },
+  { op = "config", text = "workers 2\nlistener life {\n" },
+  { op = "signal", text = "HUP", expect = "yes" },
+  { op = "log", text = "error=\"line 2: listener life: missing }\"", expect = "found" },
+  # The running config is untouched.
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+]

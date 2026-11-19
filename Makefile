@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-resilience difftest-pacer difftest-pacer-config difftest-cache e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-resilience difftest-pacer difftest-pacer-config difftest-l4 difftest-cache e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -132,6 +132,17 @@ difftest-pacer:
 # through `diffdrive config` and the Rust parser.
 difftest-pacer-config:
 	cargo run --release --locked -p edgefront-difftest -- pacer-config $(DIFFTEST_ARGS)
+
+# Run pacer's integration scenarios (legacy/pacer/tests/it_*.c), written as
+# the traffic scripts in tests/pacer_scripts, against legacy pacerd and
+# against edgefront limits, and diff their outcomes and counters step by
+# step. pacerd needs Linux; `make test` runs the scripts against edgefront
+# alone.
+PACER_RELEASE := $(CURDIR)/legacy/pacer/build/release
+difftest-l4:
+	$(MAKE) -C legacy/pacer VARIANT=release build/release/pacerd build/release/pacerctl
+	PACERD_BIN=$(PACER_RELEASE)/pacerd PACERCTL_BIN=$(PACER_RELEASE)/pacerctl \
+		cargo test --locked -p edgefront --test pacer_scripts -- --nocapture
 
 # Diff the cache node against cachet 0.1: replay 50,000 generated requests
 # (or DIFFTEST_ARGS="--log FILE", a recorded log) against cachet as it was

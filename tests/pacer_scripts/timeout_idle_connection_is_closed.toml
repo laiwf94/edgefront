@@ -1,0 +1,17 @@
+name = "timeout_idle_connection_is_closed"
+from = "it_timeouts.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+listener slow {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  idle_timeout 1s
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+  { op = "mark", text = "t" },
+  { op = "closed_within", conn = "a", text = "t", min_ms = 800, max_ms = 2000, expect = "closed time=ok" },
+  { op = "log", text = "reason=idle_timeout", expect = "found" },
+]

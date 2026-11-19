@@ -1,0 +1,27 @@
+name = "reload_can_move_the_upstream"
+from = "it_lifecycle.c"
+upstream = [{ name = "u", mode = "source", bytes = 5 }, { name = "other", mode = "source", bytes = 7 }]
+config = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "recv_eof", conn = "a", expect = "bytes=5" },
+  { op = "config", text = """
+workers 2
+drain_timeout 10s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream:other}
+}
+""" },
+  { op = "signal", text = "HUP", expect = "yes" },
+  { op = "log", text = "msg=reloaded", expect = "found" },
+  { op = "connect", conn = "b", expect = "ok" },
+  { op = "recv_eof", conn = "b", expect = "bytes=7" },
+]

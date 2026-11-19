@@ -1,0 +1,19 @@
+name = "drain_timeout_closes_stragglers"
+from = "it_lifecycle.c"
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+drain_timeout 1s
+listener life {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+  { op = "mark", text = "t" },
+  { op = "signal", text = "TERM", expect = "yes" },
+  { op = "exit", text = "t", min_ms = 900, max_ms = 3000, expect = "exit 0 time=ok" },
+  { op = "log", text = "msg=\"drain timeout\" worker=0 closing=1", expect = "found" },
+  { op = "log", text = "reason=drain_timeout", expect = "found" },
+]

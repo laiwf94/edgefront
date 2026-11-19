@@ -1,0 +1,36 @@
+name = "limits_per_ip_concurrent_connections"
+from = "it_limits.c"
+needs_loopback_range = true
+upstream = [{ name = "u", mode = "echo" }]
+config = """
+admin_socket {sock}
+workers 2
+listener lim {
+  listen 127.0.0.1:{port}
+  upstream {upstream}
+  per_ip_max_conns 3
+}
+"""
+step = [
+  { op = "connect", conn = "a", expect = "ok" },
+  { op = "works", conn = "a", expect = "yes" },
+  { op = "connect", conn = "b", expect = "ok" },
+  { op = "works", conn = "b", expect = "yes" },
+  { op = "connect", conn = "c", expect = "ok" },
+  { op = "works", conn = "c", expect = "yes" },
+  # A fourth from the same address is refused before any byte is read.
+  { op = "connect", conn = "x", expect = "ok" },
+  { op = "refused", conn = "x", expect = "yes" },
+  { op = "close", conn = "x" },
+  { op = "log", text = "reason=per_ip_conns", expect = "found" },
+  # Another address is not affected.
+  { op = "connect", conn = "other", from = "127.0.0.2", expect = "ok" },
+  { op = "works", conn = "other", expect = "yes" },
+  { op = "close", conn = "other" },
+  # Closing one frees a slot once the proxy has logged the close.
+  { op = "close", conn = "a" },
+  { op = "log", text = "peer={peer:a} reason=done", expect = "found" },
+  { op = "connect", conn = "again", expect = "ok" },
+  { op = "works", conn = "again", expect = "yes" },
+  { op = "stats", counters = ["accepted", "rejected_per_ip_conns"], expect = "accepted=5 rejected_per_ip_conns=1" },
+]
