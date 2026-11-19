@@ -120,6 +120,26 @@ uint64_t pacer_gcra_take_range(pacer_gcra *g, uint64_t now_ns, uint64_t min, uin
     return 0;
 }
 
+uint64_t pacer_gcra_book(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decision *d)
+{
+    pacer_decision local;
+    if (!d) {
+        d = &local;
+    }
+    uint64_t iv = atomic_load_explicit(&g->interval, memory_order_relaxed);
+    uint64_t tol = atomic_load_explicit(&g->tolerance, memory_order_relaxed);
+    uint64_t now = pacer_ticks(now_ns);
+    uint64_t tat = atomic_load_explicit(&g->tat, memory_order_relaxed);
+    uint64_t next = 0, booked = 0;
+    while ((booked = pacer_step_book(tat, now, cost, iv, tol, &next, d)) != 0) {
+        if (atomic_compare_exchange_weak_explicit(&g->tat, &tat, next, memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            return booked;
+        }
+    }
+    return 0;
+}
+
 void pacer_gcra_refund(pacer_gcra *g, uint64_t now_ns, uint64_t tokens)
 {
     uint64_t iv = atomic_load_explicit(&g->interval, memory_order_relaxed);

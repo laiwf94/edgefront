@@ -170,37 +170,77 @@ static uint64_t quantum(uint64_t want)
     return want < READ_QUANTUM ? want : READ_QUANTUM;
 }
 
+/* Give the listener's limiter back the tokens booked for `dir`. */
+static void drop_booking(struct pd_conn *c, int dir, uint64_t now)
+{
+    if (c->booked[dir] == 0) {
+        return;
+    }
+    if (lconf(c)->bandwidth.on) {
+        pacer_gcra_refund(&c->w->d->listeners[c->li].bytes, now, c->booked[dir]);
+    }
+    c->booked[dir] = 0;
+}
+
 /*
- * Reserve up to `want` bytes from the client's and the listener's byte
- * limiters. Returns the grant; when it is 0, *retry is how long to wait.
- * Unused tokens go back through give_back.
+ * Reserve up to `want` bytes for `dir` from the client's and the
+ * listener's byte limiters. Returns the grant; when it is 0, *retry is how
+ * long to wait. Unused tokens go back through give_back.
+ *
+ * The listener's limiter is shared by every connection of the listener.
+ * One that finds it short books its next quantum there and reads it when
+ * the booking is due, so connections waiting for the link are served in
+ * the order they asked. Without the booking each waiter only learns when
+ * the next quantum would be free, every waiter is told the same moment,
+ * and whichever of them runs first at that moment takes it, again and
+ * again (#238).
  */
-static uint64_t reserve(struct pd_conn *c, uint64_t want, uint64_t now, uint64_t *retry)
+static uint64_t reserve(struct pd_conn *c, int dir, uint64_t want, uint64_t now, uint64_t *retry)
 {
     struct pd_listener *l = &c->w->d->listeners[c->li];
     const struct pd_listener_conf *lc = lconf(c);
     uint64_t grant = want;
     *retry = 0;
+    if (!lc->bandwidth.on) {
+        c->booked[dir] = 0; /* turned off by a reload */
+    }
     if (lc->per_ip_bandwidth.on) {
         pacer_decision d;
         if (pacer_table_take_range(l->ip_bytes, c->key, c->keylen, now, quantum(grant), grant,
                                    &d) != PACER_OK) {
+            drop_booking(c, dir, now);
             *retry = UNTRACKED_RETRY_NS;
             return 0;
         }
         grant = d.granted;
         *retry = d.retry_after_ns;
-    }
-    if (grant > 0 && lc->bandwidth.on) {
-        pacer_decision d;
-        uint64_t g = pacer_gcra_take_range(&l->bytes, now, quantum(grant), grant, &d);
-        if (g < grant && lc->per_ip_bandwidth.on) {
-            pacer_table_refund(l->ip_bytes, c->key, c->keylen, now, grant - g);
+        if (grant == 0) {
+            /* The client's own limit holds the read back; a booking would
+             * keep the listener's tokens from everyone else meanwhile. */
+            drop_booking(c, dir, now);
+            return 0;
         }
-        grant = g;
-        *retry = d.retry_after_ns;
     }
-    return grant;
+    if (!lc->bandwidth.on) {
+        return grant;
+    }
+    uint64_t g = 0;
+    if (c->booked[dir] > 0) {
+        g = grant < c->booked[dir] ? grant : c->booked[dir];
+        c->booked[dir] -= g;
+    } else {
+        pacer_decision d;
+        g = pacer_gcra_take_range(&l->bytes, now, quantum(grant), grant, &d);
+        *retry = d.retry_after_ns;
+        if (g == 0) {
+            c->booked[dir] = pacer_gcra_book(&l->bytes, now, quantum(grant), &d);
+            *retry = d.retry_after_ns;
+        }
+    }
+    if (g < grant && lc->per_ip_bandwidth.on) {
+        pacer_table_refund(l->ip_bytes, c->key, c->keylen, now, grant - g);
+    }
+    return g;
 }
 
 static void give_back(struct pd_conn *c, uint64_t tokens, uint64_t now)
@@ -234,7 +274,7 @@ static const char *pump(struct pd_conn *c, int dir, uint64_t now)
         return NULL;
     }
     uint64_t retry = 0;
-    uint64_t grant = reserve(c, space, now, &retry);
+    uint64_t grant = reserve(c, dir, space, now, &retry);
     if (grant == 0) {
         c->throttled_to[dir] = now + (retry ? retry : 1);
         c->last_throttle = c->throttled_to[dir];
@@ -417,6 +457,9 @@ void pd_conn_close(struct pd_conn *c, const char *reason)
     struct pd_worker *w = c->w;
     pd_count(w, c->li, reason);
     pd_heap_remove(&w->timers, &c->timer);
+    uint64_t now = pacer_now_ns();
+    drop_booking(c, PD_UP, now);
+    drop_booking(c, PD_DOWN, now);
     struct pd_listener *pl = &w->d->listeners[c->li];
     if (c->held && pacer_table_release(pl->ip_conns, c->key, c->keylen) != PACER_OK) {
         /* Holds are never evicted, so this would be a bookkeeping bug. */

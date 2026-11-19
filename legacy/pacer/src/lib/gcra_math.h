@@ -90,6 +90,43 @@ static inline uint64_t pacer_step_range(uint64_t tat, uint64_t now, uint64_t min
 }
 
 /*
+ * Book `cost` tokens whether or not they are available yet: the bucket
+ * goes into debt, and d->retry_after_ns says when the booked tokens are
+ * due. Returns the number booked; *next is set only when it is non-zero.
+ * A cost above the burst is lowered to the burst. Nothing is booked for a
+ * cost of 0, or when the debt would pass PACER_MAX_TOL_TICKS; then
+ * d->retry_after_ns says when `cost` would fit without debt.
+ */
+static inline uint64_t pacer_step_book(uint64_t tat, uint64_t now, uint64_t cost, uint64_t iv,
+                                       uint64_t tol, uint64_t *next, pacer_decision *d)
+{
+    uint64_t base = tat > now ? tat : now;
+    uint64_t depth = tol / iv;
+    if (cost > depth) {
+        cost = depth;
+    }
+    d->granted = 0;
+    d->remaining = pacer_avail(base - now, tol, iv);
+    d->retry_after_ns = 0;
+    if (cost == 0) {
+        return 0;
+    }
+    /* cost * iv <= tol <= PACER_MAX_TOL_TICKS, and the debt never passes
+     * PACER_MAX_TOL_TICKS, so neither the sum nor base + cost * iv can
+     * overflow. */
+    uint64_t debt = base - now + cost * iv;
+    if (debt > PACER_MAX_TOL_TICKS) {
+        d->retry_after_ns = pacer_ticks_to_ns_ceil(debt - tol);
+        return 0;
+    }
+    *next = base + cost * iv;
+    d->granted = cost;
+    d->remaining = pacer_avail(debt, tol, iv);
+    d->retry_after_ns = debt > tol ? pacer_ticks_to_ns_ceil(debt - tol) : 0;
+    return cost;
+}
+
+/*
  * Arrival time after giving back `tokens`. Never moves before now, so a
  * refund cannot create more than a full bucket. The debt can exceed the
  * tolerance after a reconfigure shrinks the burst, so a refund is measured

@@ -1,7 +1,7 @@
 /*
  * Model check for the GCRA limiter. Random operation sequences drive
- * pacer_gcra_take, take_upto, take_range, refund, remaining and reconfigure
- * and the same operations on a slow reference: a plain token bucket whose
+ * pacer_gcra_take, take_upto, take_range, book, refund, remaining and
+ * reconfigure and the same operations on a slow reference: a plain token bucket whose
  * level is an exact fraction, refilled continuously and capped at the burst.
  * The two must agree on every return value and every decision field.
  *
@@ -246,6 +246,33 @@ static uint64_t ref_take_range(ref_bucket *m, uint64_t now, uint64_t min, uint64
     return grant;
 }
 
+/* Booking takes the tokens whether or not the level covers them; the
+ * level may go negative, down to the documented debt limit of 2^62 ticks
+ * (1/64 ns each) behind a full bucket. */
+static uint64_t ref_book(ref_bucket *m, uint64_t now, uint64_t cost, pacer_decision *d)
+{
+    ref_advance(m, now);
+    if (cost > m->burst) {
+        cost = m->burst;
+    }
+    *d = (pacer_decision){0, ref_whole(m), 0};
+    if (cost == 0) {
+        return 0;
+    }
+    rat level = rat_sub(m->level, rat_int(cost));
+    rat debt_ticks = rat_mul(rat_div(rat_sub(rat_int(m->burst), level), m->rate), rat_int(64));
+    if (rat_cmp(debt_ticks, rat_int(PACER_MAX_TOL_TICKS)) > 0) {
+        d->retry_after_ns = ref_wait(m, cost);
+        return 0;
+    }
+    m->level = level;
+    *d = (pacer_decision){cost, ref_whole(m), 0};
+    if (rat_cmp(level, rat_int(0)) < 0) {
+        d->retry_after_ns = ref_wait(m, 0);
+    }
+    return cost;
+}
+
 static void ref_refund(ref_bucket *m, uint64_t now, uint64_t tokens)
 {
     ref_advance(m, now);
@@ -452,7 +479,12 @@ static int run_seed(uint64_t seed)
                      max);
             want_rc = (int)ref_take_range(&m, now, min, max, &want);
             got_rc = (int)pacer_gcra_take_range(&g, now, min, max, &got);
-        } else if (kind < 80) {
+        } else if (kind < 72) {
+            uint64_t cost = rng_below(&s, b + 3);
+            snprintf(op, sizeof op, "t=%" PRIu64 " book %" PRIu64, now, cost);
+            want_rc = (int)ref_book(&m, now, cost, &want);
+            got_rc = (int)pacer_gcra_book(&g, now, cost, &got);
+        } else if (kind < 85) {
             uint64_t tokens = rng_below(&s, 20) == 0 ? UINT64_MAX : rng_below(&s, b + 2);
             snprintf(op, sizeof op, "t=%" PRIu64 " refund %" PRIu64, now, tokens);
             ref_refund(&m, now, tokens);
@@ -546,6 +578,15 @@ TEST(model_gcra_reference_by_hand)
     CHECK_EQ_U64(ref_remaining(&m, 150000000ull), 0);
     pacer_rate bad = {0, 1, 1};
     CHECK_EQ_INT(ref_reconfigure(&m, &bad), PACER_EINVAL);
+    /* Booking goes into debt: at 10/s with burst 5 and 2 tokens left, a
+     * booking of 4 leaves -2, due 200 ms later. */
+    ref_bucket bk = {5, rat_make(1, 100000000), rat_int(2), 0};
+    CHECK_EQ_U64(ref_book(&bk, 0, 4, &d), 4);
+    CHECK_EQ_U64(d.remaining, 0);
+    CHECK_EQ_U64(d.retry_after_ns, 200000000ull);
+    CHECK_EQ_U64(ref_book(&bk, 0, 9, &d), 5); /* lowered to the burst */
+    CHECK_EQ_U64(d.retry_after_ns, 700000000ull);
+    CHECK_EQ_U64(ref_book(&bk, 0, 0, &d), 0);
     /* 3 per 7 ns rounds 7/3 ns up to 150/64 ns, slower but within 1/150. */
     pacer_rate odd = {3, 7, 1};
     CHECK(ref_rate(&odd, &rate));

@@ -121,6 +121,19 @@ uint64_t pacer_gcra_take_range(pacer_gcra *g, uint64_t now_ns, uint64_t min, uin
                                pacer_decision *d);
 
 /*
+ * Book `cost` tokens that may not be available yet: the limiter goes into
+ * debt and d->retry_after_ns says when they are due (0 when they already
+ * are). Returns the number booked. Consumers that share one limiter and
+ * find it empty book their next share instead of polling for it, so they
+ * are served in the order they asked rather than by who wakes first. A
+ * cost above the burst is lowered to the burst. Books nothing for a cost
+ * of 0, or when the debt would pass 2^62 ticks (about 2.3 years); then
+ * d->retry_after_ns says when `cost` would fit. Unused booked tokens go
+ * back through pacer_gcra_refund. `d` may be NULL.
+ */
+uint64_t pacer_gcra_book(pacer_gcra *g, uint64_t now_ns, uint64_t cost, pacer_decision *d);
+
+/*
  * Give back `tokens` previously granted and not used. The state never moves
  * before `now_ns`, so a refund cannot create more than a full bucket.
  */
