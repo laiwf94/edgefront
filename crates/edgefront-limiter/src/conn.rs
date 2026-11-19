@@ -108,6 +108,29 @@ impl ClientKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }
+
+    /// The key whose bytes are `b`: 4 for IPv4, 16 for IPv6.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != 4 && b.len() != CLIENT_KEY_MAX {
+            return None;
+        }
+        let mut bytes = [0u8; CLIENT_KEY_MAX];
+        bytes[..b.len()].copy_from_slice(b);
+        Some(Self {
+            bytes,
+            len: b.len() as u8,
+        })
+    }
+
+    /// The address the key stands for: the IPv4 address, or the first
+    /// address of the IPv6 prefix.
+    pub fn ip(&self) -> IpAddr {
+        if self.len == 4 {
+            IpAddr::from([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]])
+        } else {
+            IpAddr::from(self.bytes)
+        }
+    }
 }
 
 impl fmt::Debug for ClientKey {
@@ -608,6 +631,39 @@ impl Admission {
     /// or `None` for a client the table does not track.
     pub fn client(&self, key: &ClientKey) -> Option<crate::table::EntryState> {
         self.clients.get(key.as_bytes())
+    }
+
+    /// Every client the table tracks, with its holds and arrival time.
+    pub fn clients(&self) -> Vec<(ClientKey, crate::table::EntryState)> {
+        self.clients
+            .entries()
+            .into_iter()
+            .filter_map(|(k, st)| ClientKey::from_bytes(&k).map(|k| (k, st)))
+            .collect()
+    }
+
+    /// The client key `ip` has under the listener's IPv6 prefix now.
+    pub fn key_of(&self, ip: IpAddr) -> ClientKey {
+        ClientKey::new(ip, self.ipv6_prefix())
+    }
+
+    /// The IPv6 prefix clients are grouped by.
+    pub fn ipv6_prefix(&self) -> u32 {
+        self.client.load(Ordering::Relaxed) & 0xff
+    }
+
+    /// New-connection tokens the client has left at `now_ns`, when
+    /// `per_ip_conn_rate` is on: the burst for a client the table does not
+    /// track.
+    pub fn conn_tokens(&self, key: &ClientKey, now_ns: u64) -> Option<u64> {
+        if self.client.load(Ordering::Relaxed) & RATE_ON == 0 {
+            return None;
+        }
+        Some(
+            self.clients
+                .remaining(key.as_bytes(), now_ns)
+                .unwrap_or_else(|| self.clients.burst()),
+        )
     }
 }
 

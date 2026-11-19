@@ -123,7 +123,11 @@ if !d.allowed {
 edgefront limits -c pacerd.conf -t      # check the config
 edgefront limits -c pacerd.conf         # run
 edgefront ctl limits -s /run/pacerd/admin.sock stats
+edgefront ctl limits -s /run/pacerd/admin.sock top 20          # busiest clients
+edgefront ctl limits -s /run/pacerd/admin.sock client 192.0.2.7
 ```
+
+`stats` prints pacerctl's counters, line for line. `top` and `client` are new: each client's open connections and what is left of its connection rate, byte rate and quota (`client=192.0.2.7 tracked=yes open=3 conn_tokens=8 byte_tokens=65512 quota_used=-`).
 
 `examples/l4_limits.sh` is pacer's live demo on edgefront: the same config and clients, checking the connection-rate limit and its recovery, a slowloris client cut off beside a steady one, and a drain that finishes a download in flight byte for byte. CI runs it, and `crates/edgefront/tests/e2e_l4_limits.rs` runs it under `make test`. How it maps onto pacerd, and the two places it differs, are in [docs/DESIGN.md](docs/DESIGN.md#running-the-data-path-edgefront-limits).
 

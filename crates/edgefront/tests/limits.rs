@@ -863,3 +863,93 @@ fn a_ninth_admin_client_is_told_busy_and_a_path_that_is_not_a_socket_is_refused(
     );
     assert_eq!(std::fs::read_to_string(&sock).unwrap(), "not a socket");
 }
+
+// pacerctl had no way to see who holds a listener's connections; the
+// admin API lists the busiest clients and looks one address up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctl_lists_the_busiest_clients_and_looks_one_up() {
+    let up = upstream("127.0.0.1:0", echo).await;
+    let (sock, _rm) = short_socket();
+    let top = format!("admin_socket {}\n", sock.display());
+    let p = Proc::start(
+        "127.0.0.1",
+        up,
+        &top,
+        "  per_ip_max_conns 5\n  per_ip_conn_rate 10/s burst 10\n  per_ip_bandwidth 1m/s burst 64k\n",
+        None,
+    );
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let mut s = TcpStream::connect(p.addr()).await.unwrap();
+        assert!(works(&mut s).await);
+        held.push(s);
+    }
+    let (code, out, _) = ctl(&sock, "top");
+    assert_eq!(code, 0);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "listener=lim clients_tracked=1 shown=1", "{out}");
+    assert!(
+        lines[1].starts_with("client=127.0.0.1 tracked=yes open=3 conn_tokens="),
+        "{out}"
+    );
+    // Tokens refill as time passes, so only their presence is fixed.
+    assert!(lines[1].contains(" byte_tokens="), "{out}");
+    assert!(lines[1].ends_with(" quota_used=-"), "{out}");
+    let out = Command::new(BIN)
+        .args([
+            "ctl",
+            "limits",
+            "-s",
+            sock.to_str().unwrap(),
+            "-l",
+            "lim",
+            "client",
+            "127.0.0.1",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with("listener=lim client=127.0.0.1 tracked=yes open=3 "),
+        "{text}"
+    );
+    let (code, text, _) = ctl(&sock, "stats");
+    assert_eq!(code, 0);
+    assert!(text.contains("listener=lim open=3 accepted=3 "), "{text}");
+    // An address nobody used, a listener that does not exist, bad input.
+    let out = Command::new(BIN)
+        .args([
+            "ctl",
+            "limits",
+            "-s",
+            sock.to_str().unwrap(),
+            "client",
+            "192.0.2.9",
+        ])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with(
+        "listener=lim client=192.0.2.9 tracked=no open=0 conn_tokens=10 byte_tokens=65536 quota_used=-"
+    ));
+    for (args, want) in [
+        (vec!["-l", "nope", "top"], "error no listener nope\n"),
+        (
+            vec!["client", "not-an-ip"],
+            "error not an IP address: not-an-ip\n",
+        ),
+    ] {
+        let mut a = vec!["ctl", "limits", "-s", sock.to_str().unwrap()];
+        a.extend(args);
+        let out = Command::new(BIN).args(&a).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&out.stderr), want);
+    }
+    let out = Command::new(BIN)
+        .args(["ctl", "limits", "-s", sock.to_str().unwrap(), "top", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    drop(held);
+    let (code, log) = p.stop();
+    assert_eq!(code, 0, "{log}");
+}

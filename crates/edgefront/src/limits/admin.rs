@@ -9,6 +9,8 @@
 //! |---|---|
 //! | `GET /ping` | `ok pong` |
 //! | `GET /stats` | the counters, in pacerd's `stats` text ([`super::stats`]) |
+//! | `GET /clients?top=N&listener=NAME` | the N clients with the most connections open (10 by default), per listener |
+//! | `GET /client?addr=IP&listener=NAME` | one address's limits as tracked now, per listener |
 //! | `POST /reload` | `ok reloaded`, or `error <why>` with 409 |
 //! | `POST /drain` | `ok draining` |
 //!
@@ -95,13 +97,32 @@ fn text(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
 }
 
 /// Answers one admin request.
-pub fn answer(d: &Daemon, method: &Method, path: &str) -> Response<Full<Bytes>> {
+pub fn answer(
+    d: &Daemon,
+    method: &Method,
+    path: &str,
+    query: Option<&str>,
+) -> Response<Full<Bytes>> {
     let want = |m: Method| -> Option<Response<Full<Bytes>>> {
         (*method != m).then(|| text(StatusCode::METHOD_NOT_ALLOWED, "error method not allowed\n"))
     };
     match path {
         "/ping" => want(Method::GET).unwrap_or_else(|| text(StatusCode::OK, "ok pong\n")),
         "/stats" => want(Method::GET).unwrap_or_else(|| text(StatusCode::OK, stats::render(d))),
+        "/clients" => want(Method::GET).unwrap_or_else(|| {
+            let top = match param(query, "top").map(|t| t.parse::<usize>()) {
+                None => 10,
+                Some(Ok(n)) => n,
+                Some(Err(_)) => {
+                    return text(StatusCode::BAD_REQUEST, "error top must be a number\n");
+                }
+            };
+            reply(stats::top(d, param(query, "listener").as_deref(), top))
+        }),
+        "/client" => want(Method::GET).unwrap_or_else(|| match param(query, "addr") {
+            None => text(StatusCode::BAD_REQUEST, "error addr is required\n"),
+            Some(addr) => reply(stats::client(d, param(query, "listener").as_deref(), &addr)),
+        }),
         "/reload" => want(Method::POST).unwrap_or_else(|| match d.reload("admin") {
             Ok(()) => text(StatusCode::OK, "ok reloaded\n"),
             Err(e) => text(StatusCode::CONFLICT, format!("error {e}\n")),
@@ -112,6 +133,44 @@ pub fn answer(d: &Daemon, method: &Method, path: &str) -> Response<Full<Bytes>> 
         }),
         _ => text(StatusCode::NOT_FOUND, "error unknown command\n"),
     }
+}
+
+/// A report, or a 404 with its error.
+fn reply(r: Result<String, String>) -> Response<Full<Bytes>> {
+    match r {
+        Ok(body) => text(StatusCode::OK, body),
+        Err(e) => text(StatusCode::NOT_FOUND, format!("error {e}\n")),
+    }
+}
+
+/// One query parameter's value, percent-decoded.
+fn param(query: Option<&str>, name: &str) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| decode(v))
+}
+
+/// Percent-decoding, leaving a malformed escape as it is.
+fn decode(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(x) = v
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(x);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Serves the admin API until the task is aborted.
@@ -135,7 +194,7 @@ pub async fn serve(admin: Admin, d: Arc<Daemon>) {
         let d = Arc::clone(&d);
         tokio::spawn(async move {
             let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
-                let r = answer(&d, req.method(), req.uri().path());
+                let r = answer(&d, req.method(), req.uri().path(), req.uri().query());
                 async move { Ok::<_, Infallible>(r) }
             });
             let conn = hyper::server::conn::http1::Builder::new()
@@ -146,5 +205,24 @@ pub async fn serve(admin: Admin, d: Arc<Daemon>) {
             let _ = tokio::time::timeout(DEADLINE * 5, conn).await;
             drop(slot);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_values_are_found_and_decoded() {
+        let q = Some("listener=web&addr=2001%3Adb8%3A%3A1&top=3");
+        assert_eq!(param(q, "listener").as_deref(), Some("web"));
+        assert_eq!(param(q, "addr").as_deref(), Some("2001:db8::1"));
+        assert_eq!(param(q, "top").as_deref(), Some("3"));
+        assert_eq!(param(q, "nope"), None);
+        assert_eq!(param(None, "top"), None);
+        assert_eq!(decode("100%"), "100%");
+        assert_eq!(decode("%zz"), "%zz");
+        assert_eq!(decode("a%2"), "a%2");
+        assert_eq!(decode("%41b"), "Ab");
     }
 }

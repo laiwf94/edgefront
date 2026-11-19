@@ -15,6 +15,7 @@ pub mod rate;
 pub mod shape;
 pub mod siphash;
 pub mod slowloris;
+pub mod stats;
 pub mod table;
 pub mod window;
 

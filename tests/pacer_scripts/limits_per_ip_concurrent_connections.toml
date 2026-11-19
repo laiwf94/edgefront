@@ -33,4 +33,9 @@ step = [
   { op = "connect", conn = "again", expect = "ok" },
   { op = "works", conn = "again", expect = "yes" },
   { op = "stats", counters = ["accepted", "rejected_per_ip_conns"], expect = "accepted=5 rejected_per_ip_conns=1" },
+  # Every counter pacerctl printed, from both admin sockets.
+  { op = "close", conn = "b" },
+  { op = "close", conn = "c" },
+  { op = "close", conn = "again" },
+  { op = "stats", counters = ["open", "accepted", "rejected_listener_full", "rejected_per_ip_conns", "rejected_per_ip_rate", "rejected_table_full", "rejected_fd_exhausted", "closed_done", "closed_idle", "closed_slow", "closed_upstream_failed", "closed_reset", "closed_drain", "closed_other", "bytes_up", "bytes_down", "throttled", "clients_tracked", "client_table_capacity", "client_table_evictions"], expect = "open=0 accepted=5 rejected_listener_full=0 rejected_per_ip_conns=1 rejected_per_ip_rate=0 rejected_table_full=0 rejected_fd_exhausted=0 closed_done=5 closed_idle=0 closed_slow=0 closed_upstream_failed=0 closed_reset=0 closed_drain=0 closed_other=0 bytes_up=20 bytes_down=20 throttled=0 clients_tracked=2 client_table_capacity=16384 client_table_evictions=0" },
 ]

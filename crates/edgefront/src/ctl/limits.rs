@@ -2,8 +2,14 @@
 //! over its admin socket as HTTP requests.
 //!
 //! ```text
-//! edgefront ctl limits [-s SOCKET] stats|ping|reload|drain
+//! edgefront ctl limits [-s SOCKET] [-l LISTENER] stats|ping|reload|drain
+//! edgefront ctl limits [-s SOCKET] [-l LISTENER] top [N]
+//! edgefront ctl limits [-s SOCKET] [-l LISTENER] client ADDRESS
 //! ```
+//!
+//! `top` lists each listener's N busiest clients (10 by default) with
+//! their open connections and what is left of their limits, and `client`
+//! one address's; `-l` keeps either to one listener.
 //!
 //! The answer is printed as it comes; one that starts with `error ` goes
 //! to stderr and exits 1, as pacerctl did. Exit code 2 is bad usage, 1 a
@@ -25,15 +31,40 @@ pub const DEFAULT_SOCKET: &str = "/run/pacerd/admin.sock";
 /// How long to wait for the answer: pacerctl's 5 seconds.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-const USAGE: &str = "usage: edgefront ctl limits [-s SOCKET] stats|ping|reload|drain\n  -s SOCKET  admin socket (default /run/pacerd/admin.sock)\n";
+const USAGE: &str = "usage: edgefront ctl limits [-s SOCKET] [-l LISTENER] COMMAND\n  commands: stats, ping, reload, drain, top [N], client ADDRESS\n  -s SOCKET    admin socket (default /run/pacerd/admin.sock)\n  -l LISTENER  only this listener, for top and client\n";
 
-/// The request for a pacerctl command.
-pub fn request_for(cmd: &str) -> Option<(Method, &'static str)> {
-    Some(match cmd {
-        "stats" => (Method::GET, "/stats"),
-        "ping" => (Method::GET, "/ping"),
-        "reload" => (Method::POST, "/reload"),
-        "drain" => (Method::POST, "/drain"),
+/// A query value, percent-encoded.
+fn enc(v: &str) -> String {
+    v.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The request for a command and its argument, with the listener `-l`
+/// named, or `None` for a command that does not exist or misses its
+/// argument.
+pub fn request_for(
+    cmd: &str,
+    arg: Option<&str>,
+    listener: Option<&str>,
+) -> Option<(Method, String)> {
+    let only = listener.map_or(String::new(), |l| format!("&listener={}", enc(l)));
+    Some(match (cmd, arg) {
+        ("stats", None) => (Method::GET, "/stats".into()),
+        ("ping", None) => (Method::GET, "/ping".into()),
+        ("reload", None) => (Method::POST, "/reload".into()),
+        ("drain", None) => (Method::POST, "/drain".into()),
+        ("top", None) => (Method::GET, format!("/clients?top=10{only}")),
+        ("top", Some(n)) if n.parse::<usize>().is_ok() => {
+            (Method::GET, format!("/clients?top={n}{only}"))
+        }
+        ("client", Some(a)) => (Method::GET, format!("/client?addr={}{only}", enc(a))),
         _ => return None,
     })
 }
@@ -71,15 +102,28 @@ pub async fn call(socket: &Path, method: Method, path: &str) -> Result<String, S
 
 /// Runs `edgefront ctl limits` with the arguments after `limits`.
 pub fn run(args: &[String]) -> ExitCode {
-    let (socket, cmd) = match args {
-        [s, path, cmd] if s == "-s" => (path.as_str(), cmd.as_str()),
-        [cmd] => (DEFAULT_SOCKET, cmd.as_str()),
-        _ => {
-            eprint!("{USAGE}");
-            return ExitCode::from(2);
+    let mut rest = args;
+    let mut socket = DEFAULT_SOCKET;
+    let mut listener = None;
+    loop {
+        match rest {
+            [flag, v, tail @ ..] if flag == "-s" => {
+                socket = v.as_str();
+                rest = tail;
+            }
+            [flag, v, tail @ ..] if flag == "-l" => {
+                listener = Some(v.as_str());
+                rest = tail;
+            }
+            _ => break,
         }
+    }
+    let req = match rest {
+        [cmd] => request_for(cmd, None, listener),
+        [cmd, arg] => request_for(cmd, Some(arg), listener),
+        _ => None,
     };
-    let Some((method, path)) = request_for(cmd) else {
+    let Some((method, path)) = req else {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
@@ -95,7 +139,7 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     let socket = Path::new(socket);
     let answer = rt.block_on(async {
-        tokio::time::timeout(TIMEOUT, call(socket, method, path))
+        tokio::time::timeout(TIMEOUT, call(socket, method, &path))
             .await
             .unwrap_or_else(|_| Err(format!("no answer from {}", socket.display())))
     });
@@ -112,5 +156,30 @@ pub fn run(args: &[String]) -> ExitCode {
             eprintln!("edgefront: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_map_to_admin_requests() {
+        let r = |c, a, l| request_for(c, a, l).map(|(m, p)| format!("{m} {p}"));
+        assert_eq!(r("stats", None, None).as_deref(), Some("GET /stats"));
+        assert_eq!(r("drain", None, None).as_deref(), Some("POST /drain"));
+        assert_eq!(r("top", None, None).as_deref(), Some("GET /clients?top=10"));
+        assert_eq!(
+            r("top", Some("3"), Some("web 1")).as_deref(),
+            Some("GET /clients?top=3&listener=web%201")
+        );
+        assert_eq!(
+            r("client", Some("2001:db8::1"), None).as_deref(),
+            Some("GET /client?addr=2001%3Adb8%3A%3A1")
+        );
+        assert_eq!(r("top", Some("x"), None), None);
+        assert_eq!(r("client", None, None), None);
+        assert_eq!(r("stats", Some("x"), None), None);
+        assert_eq!(r("bogus", None, None), None);
     }
 }

@@ -730,6 +730,47 @@ impl Table {
         })
     }
 
+    /// Whole tokens `key` has at `now_ns`, without adding it or changing
+    /// its recency, or `None` for a key the table does not track (which
+    /// has a full bucket, [`Table::burst`]).
+    pub fn remaining(&self, key: &[u8], now_ns: u64) -> Option<u64> {
+        let st = self.get(key)?;
+        let (iv, tol) = self.rate();
+        let debt = st.tat.saturating_sub(clock::ticks_wide(now_ns));
+        Some(crate::gcra::wide::avail(
+            debt,
+            u128::from(tol),
+            u128::from(iv),
+        ))
+    }
+
+    /// The burst: the tokens a key the table does not track has.
+    pub fn burst(&self) -> u64 {
+        let (iv, tol) = self.rate();
+        tol / iv
+    }
+
+    /// Every key's state, one shard at a time: each shard is locked only
+    /// while its own entries are read, so this never holds up decisions on
+    /// the others. For stats and lookups, not the data path; a key added or
+    /// removed meanwhile may or may not be in the result.
+    pub fn entries(&self) -> Vec<(Vec<u8>, EntryState)> {
+        let mut out = Vec::new();
+        for p in self.shards.iter() {
+            let s = lock(p);
+            for e in s.slots.iter().filter(|e| e.keylen != 0) {
+                out.push((
+                    e.key().to_vec(),
+                    EntryState {
+                        tat: s.absolute(e.tat),
+                        holds: e.holds,
+                    },
+                ));
+            }
+        }
+        out
+    }
+
     /// Change the per-key rate for every key, keeping debt as time. An
     /// invalid rate leaves the table unchanged.
     pub fn reconfigure(&self, rate: &Rate) -> Result<(), Error> {

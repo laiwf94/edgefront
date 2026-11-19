@@ -213,6 +213,19 @@ impl Bandwidth {
         self.listener.remaining(now_ns)
     }
 
+    /// Byte tokens the client has left at `now_ns`, when
+    /// `per_ip_bandwidth` is on: the burst for a client not tracked.
+    pub fn client_tokens(&self, key: &ClientKey, now_ns: u64) -> Option<u64> {
+        if self.on.load(Ordering::Relaxed) & PER_IP_ON == 0 {
+            return None;
+        }
+        Some(
+            self.clients
+                .remaining(key.as_bytes(), now_ns)
+                .unwrap_or_else(|| self.clients.burst()),
+        )
+    }
+
     /// The per-client byte table's counters.
     pub fn client_stats(&self) -> TableStats {
         self.clients.stats()
