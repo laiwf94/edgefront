@@ -1,0 +1,16 @@
+[
+  {
+    "implementation": "libpacer (C)",
+    "keys": 1035213,
+    "rss_start_kib": 896,
+    "rss_made_kib": 3488,
+    "rss_filled_kib": 132512
+  },
+  {
+    "implementation": "edgefront-limiter (Rust)",
+    "keys": 1035213,
+    "rss_start_kib": 2456,
+    "rss_made_kib": 138044,
+    "rss_filled_kib": 138328
+  }
+]

@@ -33,6 +33,8 @@
 //! - [`l4proxy`]: the L4 proxy's bulk throughput, round-trip latency and
 //!   concurrent round trips, direct, through pacerd and through
 //!   `edgefront limits` (`scenarios/l4_proxy.toml`).
+//! - [`memory`]: memory per tracked client of libpacer's and
+//!   edgefront-limiter's keyed tables.
 //! - [`cli`]: the `edgefront-bench` command line.
 
 pub mod cli;
@@ -43,6 +45,7 @@ pub mod l4proxy;
 pub mod limiter;
 pub mod load;
 pub mod measure;
+pub mod memory;
 pub mod origin;
 pub mod report;
 pub mod scenario;

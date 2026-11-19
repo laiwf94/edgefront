@@ -37,6 +37,10 @@
 //! edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
 //!     The L4 proxy's bulk, latency and concurrent round trips, direct and
 //!     through each proxy given; prints a Markdown table.
+//! edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
+//!     Memory per tracked client of libpacer's table (through diffdrive)
+//!     and edgefront-limiter's (through edgefront-difftest); prints a
+//!     Markdown table.
 //! ```
 //!
 //! Exit codes: 0 on success, 2 for bad usage, 1 when the work fails.
@@ -61,6 +65,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
        edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
        edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
+       edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
 ";
 
 /// Why a command failed.
@@ -171,6 +176,7 @@ pub fn run(args: &[String]) -> Result<(), Failure> {
         "load" => load(rest),
         "limiter" => limiter(rest),
         "l4" => l4(rest),
+        "memory" => memory(rest),
         "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -599,6 +605,32 @@ fn l4(args: &[String]) -> Result<(), Failure> {
     let points = points?;
     print!("{}", crate::l4proxy::markdown(&points));
     write_json(flags.one("json")?, &points)
+}
+
+fn memory(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(args, &["keys", "diffdrive", "difftest", "json"], &[])?;
+    flags.no_positional()?;
+    let keys: u64 = flags
+        .required("keys")?
+        .parse()
+        .map_err(|_| usage("--keys must be a number"))?;
+    let mut ms = Vec::new();
+    if let Some(d) = flags.one("diffdrive")? {
+        ms.push(
+            crate::memory::measure("libpacer (C)", std::process::Command::new(d), keys)
+                .map_err(failed)?,
+        );
+    }
+    if let Some(d) = flags.one("difftest")? {
+        let mut cmd = std::process::Command::new(d);
+        cmd.arg("pacer-rust-driver");
+        ms.push(crate::memory::measure("edgefront-limiter (Rust)", cmd, keys).map_err(failed)?);
+    }
+    if ms.is_empty() {
+        return Err(usage("give --diffdrive, --difftest or both"));
+    }
+    print!("{}", crate::memory::markdown(&ms));
+    write_json(flags.one("json")?, &ms)
 }
 
 /// How long a whole run of `scenarios` against `targets` takes at least.
