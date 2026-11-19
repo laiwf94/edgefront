@@ -1,0 +1,126 @@
+{
+  "command": "edgefront-bench run --scenario bench/scenarios/cache-hit.toml --scenario bench/scenarios/miss-heavy.toml --scenario bench/scenarios/web-mix.toml --scenario bench/scenarios/large-objects.toml --targets edgefront,varnish,nginx,ats --out docs/benchmarks/data/2026-11/cache --run 2026-11-baseline --rebuild",
+  "extra": {},
+  "machine": {
+    "arch": "aarch64",
+    "cpus": 16,
+    "description": "16-core arm64, Docker 28",
+    "kernel": "6.10.14-linuxkit",
+    "loadgen_cpus": "10-15",
+    "memory_bytes": 8217190400,
+    "origin_cpus": "4-9",
+    "runtime": "docker 28.0.4",
+    "target_cpus": "0-3"
+  },
+  "measured": {
+    "body_bytes": 43452272640,
+    "completed": 600000,
+    "errors": {
+      "connect": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 0.7834133333333333,
+    "latency": {
+      "max_ms": 81.039473,
+      "mean_ms": 0.20182103835833337,
+      "p50_ms": 0.079935,
+      "p90_ms": 0.158463,
+      "p999_ms": 18.612223,
+      "p99_ms": 2.631679
+    },
+    "origin_requests": 129952,
+    "scheduled": 600000,
+    "service_latency": {
+      "max_ms": 71.194458,
+      "mean_ms": 0.18379465865166664,
+      "p50_ms": 0.078399,
+      "p90_ms": 0.156415,
+      "p999_ms": 15.065087,
+      "p99_ms": 2.252799
+    },
+    "status_classes": [
+      0,
+      600000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 5000.0
+  },
+  "phases": [
+    {
+      "completed": 300000,
+      "duration_secs": 60.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 65.24225,
+        "mean_ms": 0.12259994082,
+        "p50_ms": 0.064223,
+        "p90_ms": 0.123455,
+        "p999_ms": 11.919359,
+        "p99_ms": 0.766975
+      },
+      "name": "warmup",
+      "rate": 5000.0,
+      "scheduled": 300000,
+      "throughput_rps": 5000.0,
+      "warmup": true
+    },
+    {
+      "completed": 600000,
+      "duration_secs": 120.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 81.039473,
+        "mean_ms": 0.20182103835833337,
+        "p50_ms": 0.079935,
+        "p90_ms": 0.158463,
+        "p999_ms": 18.612223,
+        "p99_ms": 2.631679
+      },
+      "name": "load",
+      "rate": 5000.0,
+      "scheduled": 600000,
+      "throughput_rps": 5000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 0.296091483289347,
+    "cpu_seconds": 35.531119,
+    "cpuset": "0-3",
+    "peak_memory_bytes": 2108608512,
+    "peak_rss_bytes": 1068396544
+  },
+  "run": "2026-11-baseline",
+  "scenario": {
+    "connections": 128,
+    "description": "10,000 objects from 1 KiB to 2 MiB under a Zipf 0.9 law, 90% hits at 5,000 requests per second.",
+    "hit_ratio_target": 0.9,
+    "measured_secs": 120.0,
+    "name": "web-mix",
+    "protocol": "http1",
+    "rate": 5000.0,
+    "seed": 2,
+    "warmup_secs": 60.0,
+    "working_set_bytes": 820992000
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-19T23:24:06Z",
+  "target": {
+    "image_size_bytes": 221133094,
+    "images": [
+      {
+        "id": "sha256:473e7a691fddb20b121f64f7b0cc57147a2a95e005b9d6d2950bede822b9f2fa",
+        "reference": "trafficserver/trafficserver:10.1.2@sha256:473e7a691fddb20b121f64f7b0cc57147a2a95e005b9d6d2950bede822b9f2fa",
+        "size_bytes": 221133094
+      }
+    ],
+    "kind": "cache",
+    "name": "ats",
+    "product": "Apache Traffic Server",
+    "version": "10.1.2"
+  },
+  "track": "cache"
+}

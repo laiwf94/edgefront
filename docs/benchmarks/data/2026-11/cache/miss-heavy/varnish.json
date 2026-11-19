@@ -1,0 +1,126 @@
+{
+  "command": "edgefront-bench run --scenario bench/scenarios/cache-hit.toml --scenario bench/scenarios/miss-heavy.toml --scenario bench/scenarios/web-mix.toml --scenario bench/scenarios/large-objects.toml --targets edgefront,varnish,nginx,ats --out docs/benchmarks/data/2026-11/cache --run 2026-11-baseline --rebuild",
+  "extra": {},
+  "machine": {
+    "arch": "aarch64",
+    "cpus": 16,
+    "description": "16-core arm64, Docker 28",
+    "kernel": "6.10.14-linuxkit",
+    "loadgen_cpus": "10-15",
+    "memory_bytes": 8217190400,
+    "origin_cpus": "4-9",
+    "runtime": "docker 28.0.4",
+    "target_cpus": "0-3"
+  },
+  "measured": {
+    "body_bytes": 3227910144,
+    "completed": 180000,
+    "errors": {
+      "connect": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 0.4605055555555555,
+    "latency": {
+      "max_ms": 162.807553,
+      "mean_ms": 1.0591408917611111,
+      "p50_ms": 0.225407,
+      "p90_ms": 1.165311,
+      "p999_ms": 55.738367,
+      "p99_ms": 22.265855
+    },
+    "origin_requests": 97109,
+    "scheduled": 180000,
+    "service_latency": {
+      "max_ms": 162.807333,
+      "mean_ms": 0.9475228437277778,
+      "p50_ms": 0.220287,
+      "p90_ms": 1.014783,
+      "p999_ms": 51.642367,
+      "p99_ms": 20.086783
+    },
+    "status_classes": [
+      0,
+      180000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 3000.0
+  },
+  "phases": [
+    {
+      "completed": 60000,
+      "duration_secs": 20.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 56.7455,
+        "mean_ms": 0.40078973063333334,
+        "p50_ms": 0.134911,
+        "p90_ms": 0.513791,
+        "p999_ms": 36.012031,
+        "p99_ms": 4.227071
+      },
+      "name": "warmup",
+      "rate": 3000.0,
+      "scheduled": 60000,
+      "throughput_rps": 3000.0,
+      "warmup": true
+    },
+    {
+      "completed": 180000,
+      "duration_secs": 60.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 162.807553,
+        "mean_ms": 1.0591408917611111,
+        "p50_ms": 0.225407,
+        "p90_ms": 1.165311,
+        "p999_ms": 55.738367,
+        "p99_ms": 22.265855
+      },
+      "name": "load",
+      "rate": 3000.0,
+      "scheduled": 180000,
+      "throughput_rps": 3000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 0.42521210457884495,
+    "cpu_seconds": 25.512975,
+    "cpuset": "0-3",
+    "peak_memory_bytes": 2255433728,
+    "peak_rss_bytes": 2231824384
+  },
+  "run": "2026-11-baseline",
+  "scenario": {
+    "connections": 128,
+    "description": "50,000 objects of 4 to 64 KiB under a Zipf 0.8 law, 50% hits at 3,000 requests per second.",
+    "hit_ratio_target": 0.5,
+    "measured_secs": 60.0,
+    "name": "miss-heavy",
+    "protocol": "http1",
+    "rate": 3000.0,
+    "seed": 4,
+    "warmup_secs": 20.0,
+    "working_set_bytes": 921460736
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-19T23:10:56Z",
+  "target": {
+    "image_size_bytes": 125643630,
+    "images": [
+      {
+        "id": "sha256:801d9ed8fa84ca018b3949de4b3c669040a1700dd3d8f2da627341327cc38f1e",
+        "reference": "varnish:9.0.4@sha256:801d9ed8fa84ca018b3949de4b3c669040a1700dd3d8f2da627341327cc38f1e",
+        "size_bytes": 125643630
+      }
+    ],
+    "kind": "cache",
+    "name": "varnish",
+    "product": "Varnish Cache",
+    "version": "9.0.4"
+  },
+  "track": "cache"
+}
