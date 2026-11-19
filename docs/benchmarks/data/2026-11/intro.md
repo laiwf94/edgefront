@@ -1,0 +1,12 @@
+The first published comparison from the shared harness (#84), for the cache track's week 4 (#87): edgefront against Varnish, NGINX and Apache Traffic Server. It covers the cache-hit, cache-miss (`miss-heavy`, 50% hits), mixed 90% (`web-mix`) and large-object scenarios. Each run gives every target the same origin, cache size, CPUs and worker count; [bench/targets/README.md](../../bench/targets/README.md) lists every configuration difference from the products' defaults. The raw results are under [data/2026-11/](data/2026-11/), and `examples/bench-report.sh` regenerates this page from them.
+
+Recorded on 20 Nov 2026 (07:04 to 07:34 UTC+8) on the benchmark machine, a 16-core arm64 Mac running Docker 28. The runs were sequential and the runtime lock held throughout, but other work on the Mac kept its one-minute load average between 4.4 and 37 (median 8.4). Read the sub-millisecond p99s and the p99.9s as upper bounds: the same `cache-hit` run on a quieter machine gave edgefront 124 µs and Varnish 180 µs at p99 ([the harness demo](2026-11-20-harness-demo.md)). The medians, hit ratios, memory and CPU numbers moved much less between runs.
+
+What the numbers say:
+
+- **Hits.** At 5,000 requests per second, every target serves the cache-hit scenario at a p50 of 49 to 73 µs. edgefront had the lowest p99 (151 µs) and p99.9 (727 µs) in this run.
+- **Memory is edgefront's weak point.** With the same cache size as the others (the working set plus a quarter, 1.07 GiB for `miss-heavy`), edgefront's resident set peaked at 2.8 GiB in `miss-heavy` and 3.0 GiB in `web-mix`. NGINX keeps its cache in page cache and peaked at about 40 MiB of RSS. The memory store's byte budget does not bound its real footprint; that is the cache track's next memory item.
+- **Hit ratios.** Every target is below the 50% target in `miss-heavy` (40.6 to 47.5%), because once-only objects compete for the same space. In `large-objects`, edgefront reached 86.7% against NGINX's 93.8%.
+- **Varnish** failed 53 requests in `web-mix` (out of 600,000) and peaked at 4.4 GiB.
+
+The proxy (Go against Rust) and limiter (C against Rust) week 4 tables join this page as those tracks publish their raw results under `data/2026-11/`. Each result's `track` field files it into its own section.

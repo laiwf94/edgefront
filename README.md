@@ -324,6 +324,10 @@ cargo run --release -p edgefront-bench -- report --results target/bench/web-mix 
 
 The runner needs Docker and builds the edgefront and harness images from `bench/Dockerfile` the first time. On a 16-core arm64 Mac, `examples/bench.sh` takes under two and a half minutes with the images built. [docs/DESIGN.md](docs/DESIGN.md#the-benchmark-harness) explains how it measures, and `bench/targets/README.md` how each product is configured.
 
+The first published comparison is [docs/benchmarks/2026-11-baseline.md](docs/benchmarks/2026-11-baseline.md): edgefront, Varnish, NGINX and Apache Traffic Server on the cache-hit, cache-miss, mixed and large-object scenarios. `examples/bench-report.sh` regenerates it from the raw results.
+
+Pull requests that touch the crates run the regression gate (`bench/gates.toml`, `.github/workflows/bench.yml`). It runs edgefront five times beside five runs of the baseline commit on the same runner and fails when p99 or requests per CPU second is worse by more than 5% at p < 0.01 (one-sided Mann-Whitney U). It also fails when the binary or the image grows past its fixed ceiling. [docs/DESIGN.md](docs/DESIGN.md#the-regression-gate) explains why it compares on the same runner.
+
 ## Where it stops
 
 HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are buffered in memory up to the per-object limit (8 MiB by default); larger responses stream through uncached. Only single byte ranges are served. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#what-it-does-not-do-well) for the full list.
