@@ -21,6 +21,15 @@ on:
       - "examples/bench.sh"
       - ".github/workflows/bench.yml"
   workflow_dispatch:
+    inputs:
+      record:
+        description: "Also write a gate baseline from this run (uploaded as an artifact)"
+        type: boolean
+        default: false
+      measure:
+        description: "Run the baseline commit beside the candidate whatever the CPU model"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,6 +41,7 @@ env:
 
 jobs:
   harness:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -67,3 +77,89 @@ jobs:
               || { echo "$f:"; jq .measured "$f"; exit 1; }
           done
           cat target/bench/smoke/report.md >> "$GITHUB_STEP_SUMMARY"
+
+  # The regression gate (bench/gates.toml): the gate scenario five times
+  # against edgefront on one CPU, judged with a Mann-Whitney U test and the
+  # measured tolerances. On a CPU model whose committed samples are steady
+  # enough (committed_models), against those; on any other, against the
+  # baseline's commit built and run here, interleaved with the candidate.
+  # Pull requests and manual runs only: about four minutes, seven when the
+  # baseline is measured too.
+  gate:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build edgefront and the harness
+        run: cargo build --release --locked --bin edgefront --bin edgefront-bench
+      - name: Build the benchmark images
+        run: |
+          mkdir -p target/bench-images
+          cp target/release/edgefront target/release/edgefront-bench target/bench-images/
+          docker build -f bench/Dockerfile.prebuilt --target harness -t edgefront-bench/harness:local target/bench-images
+          docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:local target/bench-images
+      - name: Choose how to judge this runner
+        run: |
+          cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)
+          echo "CPU_MODEL=$cpu" >> "$GITHUB_ENV"
+          read -r plan commit <<<"$(target/bench-images/edgefront-bench gate --config bench/gates.toml --machine "$cpu" --plan)"
+          [[ "${{ inputs.measure }}" == true ]] && plan=measure
+          [[ "${{ inputs.record }}" == true ]] && plan=committed
+          echo "PLAN=$plan" >> "$GITHUB_ENV"
+          echo "BASE_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "$cpu: $plan $commit"
+      # The baseline's commit, built in the same target directory (the
+      # dependencies are reused; the candidate's binaries are copied out)
+      # and imaged as a second target, edgefront-base.
+      - name: Build the baseline commit
+        if: env.PLAN == 'measure'
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_COMMIT"
+          git worktree add target/baseline-src FETCH_HEAD
+          (cd target/baseline-src && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked --bin edgefront)
+          mkdir -p target/baseline-images
+          cp target/release/edgefront target/baseline-images/
+          docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront-base:local target/baseline-images
+      - name: Five gate runs
+        run: |
+          mkdir -p target/bench-targets
+          cp -r bench/targets/edgefront target/bench-targets/
+          targets=edgefront
+          if [[ $PLAN == measure ]]; then
+            cp -r bench/targets/edgefront target/bench-targets/edgefront-base
+            sed -i 's|edgefront-bench/edgefront:local|edgefront-bench/edgefront-base:local|' target/bench-targets/edgefront-base/target.toml
+            targets=edgefront,edgefront-base
+          fi
+          # With two targets, --repeat alternates them run by run.
+          target/bench-images/edgefront-bench run --scenario bench/ci/gate.toml --targets "$targets" \
+            --targets-dir target/bench-targets --target-cpus 1 --repeat 5 --out target/bench/gate --run gate
+      - name: Record a baseline
+        if: inputs.record
+        run: |
+          cp bench/baseline/gate.json target/bench/gate-baseline.json
+          target/bench-images/edgefront-bench baseline --config bench/gates.toml --results target/bench/gate \
+            --machine "$CPU_MODEL" --commit "$(git rev-parse HEAD)" --out target/bench/gate-baseline.json
+          echo "$CPU_MODEL, binary $(stat -c %s target/bench-images/edgefront) bytes"
+      - name: Judge
+        if: ${{ !inputs.record }}
+        run: |
+          baseline=bench/baseline/gate.json
+          if [[ $PLAN == measure ]]; then
+            baseline=target/bench/gate-baseline.json
+            target/bench-images/edgefront-bench baseline --config bench/gates.toml --results target/bench/gate \
+              --target edgefront-base --machine "$CPU_MODEL" --commit "$BASE_COMMIT" --out "$baseline"
+          fi
+          target/bench-images/edgefront-bench gate --config bench/gates.toml --results target/bench/gate \
+            --baseline "$baseline" --machine "$CPU_MODEL" --binary target/bench-images/edgefront \
+            --verdict target/bench/gate-verdict.json --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-gate
+          path: |
+            target/bench/gate
+            target/bench/gate-baseline.json
+            target/bench/gate-verdict.json
