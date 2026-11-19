@@ -15,7 +15,7 @@ use common::*;
 use edgefront_core::config::TlsVersion;
 use edgefront_core::listener::{Handler, ServerLimits, serve_tls};
 use edgefront_core::tls::{
-    Acceptor, HandshakeResult, OnHandshake, Snapshot, TlsInfo, UnknownServerName,
+    Acceptor, HandshakeResult, OnHandshake, Snapshot, Store, TlsInfo, UnknownServerName,
 };
 use http::{Request, Response};
 use http_body_util::Full;
@@ -255,7 +255,7 @@ async fn wait_for(cond: impl Fn() -> bool) {
 
 #[tokio::test]
 async fn handshake_matrix() {
-    let server = Server::start(Acceptor::new(load(&standard()), None)).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&standard())), None)).await;
     let h2_first = ClientOpts {
         alpn: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         ..ClientOpts::default()
@@ -328,7 +328,7 @@ async fn version_and_cipher_policy() {
     let mut only13 = standard();
     only13.min_version = TlsVersion::Tls13;
     only13.cipher_suites = None;
-    let server = Server::start(Acceptor::new(load(&only13), None)).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&only13)), None)).await;
     let tls12 = ClientOpts {
         max_tls12: true,
         ..ClientOpts::default()
@@ -351,16 +351,15 @@ async fn version_and_cipher_policy() {
     };
     let mut gcm = standard();
     gcm.cipher_suites = Some(vec![suite(0xc02b)]);
-    let server = Server::start(Acceptor::new(load(&gcm), None)).await;
+    server.acceptor.store().swap(load(&gcm));
     assert!(
         handshake(server.addr, "api.example.com", &chacha_only)
             .await
             .is_err()
     );
-    server.shutdown().await;
     let mut both = standard();
     both.cipher_suites = Some(vec![suite(0xc02b), suite(0xcca9)]);
-    let server = Server::start(Acceptor::new(load(&both), None)).await;
+    server.acceptor.store().swap(load(&both));
     let s = handshake(server.addr, "api.example.com", &chacha_only)
         .await
         .unwrap();
@@ -382,7 +381,7 @@ async fn version_and_cipher_policy() {
             "cipher suite TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA is not offered: AES-CBC suites are not supported",
         ]
     );
-    let server = Server::start(Acceptor::new(s, None)).await;
+    server.acceptor.store().swap(s);
     handshake(server.addr, "api.example.com", &tls12)
         .await
         .unwrap();
@@ -394,7 +393,7 @@ async fn strict_sni_handshake() {
     let mut c = standard();
     c.strict_sni = true;
     let (on, seen) = counting();
-    let server = Server::start(Acceptor::new(load(&c), Some(on))).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&c)), Some(on))).await;
     let any = ClientOpts {
         roots: None,
         ..ClientOpts::default()
@@ -423,7 +422,7 @@ async fn handshake_timeout() {
             t.fetch_add(1, Ordering::Relaxed);
         }
     });
-    let server = Server::start(Acceptor::new(load(&c), Some(on))).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&c)), Some(on))).await;
     let mut stalled = Vec::new();
     for _ in 0..8 {
         stalled.push(TcpStream::connect(server.addr).await.unwrap());
@@ -463,7 +462,7 @@ async fn max_concurrent_handshakes() {
     let mut c = standard();
     c.handshake_timeout = Duration::from_millis(400);
     c.max_concurrent_handshakes = 2;
-    let server = Server::start(Acceptor::new(load(&c), None)).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&c)), None)).await;
     let _a = TcpStream::connect(server.addr).await.unwrap();
     let _b = TcpStream::connect(server.addr).await.unwrap();
     wait_for(|| server.acceptor.in_progress() == 2).await;
@@ -484,7 +483,7 @@ async fn max_concurrent_handshakes() {
 #[tokio::test]
 async fn shutdown_abandons_handshakes() {
     let (on, seen) = counting();
-    let server = Server::start(Acceptor::new(load(&standard()), Some(on))).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&standard())), Some(on))).await;
     let mut raw = TcpStream::connect(server.addr).await.unwrap();
     wait_for(|| server.acceptor.in_progress() == 1).await;
     let acceptor = Arc::clone(&server.acceptor);
@@ -503,7 +502,7 @@ async fn shutdown_abandons_handshakes() {
 #[tokio::test]
 async fn plain_http_is_refused() {
     let (on, seen) = counting();
-    let server = Server::start(Acceptor::new(load(&standard()), Some(on))).await;
+    let server = Server::start(Acceptor::new(Store::new(load(&standard())), Some(on))).await;
     let mut raw = TcpStream::connect(server.addr).await.unwrap();
     use tokio::io::AsyncWriteExt;
     raw.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -516,5 +515,181 @@ async fn plain_http_is_refused() {
         "{buf:?}"
     );
     wait_for(|| seen.lock().unwrap().as_slice() == [HandshakeResult::Error]).await;
+    server.shutdown().await;
+}
+
+/// Swapping the certificate under a keep-alive connection: the connection
+/// keeps working with the old certificate and new connections get the new
+/// one.
+#[tokio::test]
+async fn reload_keeps_live_connections() {
+    let server = Server::start(Acceptor::new(
+        Store::new(load(&tls_config(vec![cert("exact", &[])]))),
+        None,
+    ))
+    .await;
+    let opts = ClientOpts::default();
+    let mut live = Client::connect(server.addr, "api.example.com", &opts).await;
+    assert_eq!(live.cert, "exact");
+    assert_eq!(live.get("/").await.unwrap().0, 200);
+
+    server
+        .acceptor
+        .store()
+        .swap(load(&tls_config(vec![cert("rotated", &[])])));
+    for _ in 0..3 {
+        assert_eq!(
+            live.get("/").await.unwrap(),
+            (200, "api.example.com".to_owned())
+        );
+        assert!(live.is_open());
+    }
+    let fresh = Client::connect(server.addr, "api.example.com", &opts).await;
+    assert_eq!(fresh.cert, "rotated");
+    server.shutdown().await;
+}
+
+/// A handshake already running when the store is swapped finishes on the
+/// snapshot it started with.
+#[tokio::test]
+async fn handshake_in_progress_keeps_its_snapshot() {
+    let server = Server::start(Acceptor::new(
+        Store::new(load(&tls_config(vec![cert("exact", &[])]))),
+        None,
+    ))
+    .await;
+    // Open the TCP connection and let the server start its handshake
+    // before the swap, then send the ClientHello after it.
+    let tcp = TcpStream::connect(server.addr).await.unwrap();
+    wait_for(|| server.acceptor.in_progress() == 1).await;
+    server
+        .acceptor
+        .store()
+        .swap(load(&tls_config(vec![cert("rotated", &[])])));
+    let name = rustls::pki_types::ServerName::try_from("api.example.com").unwrap();
+    let s = tokio_rustls::TlsConnector::from(client_config(&ClientOpts::default()))
+        .connect(name, tcp)
+        .await
+        .unwrap();
+    assert_eq!(presented(&s), "exact");
+    let s = handshake(server.addr, "api.example.com", &ClientOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(presented(&s), "rotated");
+    server.shutdown().await;
+}
+
+/// The store is reloaded 100 times, each time from the files, while eight
+/// clients open new connections and four keep-alive clients send requests
+/// on theirs. No handshake and no request may fail, every new connection
+/// gets one of the two certificates, and once the swaps stop a new
+/// connection gets the last one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reload_100_times_under_load() {
+    let a = tls_config(vec![cert("exact", &[]), cert("wild", &[])]);
+    let b = tls_config(vec![cert("rotated", &[]), cert("wild", &[])]);
+    let (on, seen) = counting();
+    let server = Server::start(Acceptor::new(Store::new(load(&a)), Some(on))).await;
+    let addr = server.addr;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let certs = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+    let mut clients = Vec::new();
+    for _ in 0..8 {
+        let (stop, failures, requests, certs) = (
+            Arc::clone(&stop),
+            Arc::clone(&failures),
+            Arc::clone(&requests),
+            Arc::clone(&certs),
+        );
+        clients.push(tokio::spawn(async move {
+            let opts = ClientOpts::default();
+            while !stop.load(Ordering::Relaxed) {
+                match handshake(addr, "api.example.com", &opts).await {
+                    Ok(s) => {
+                        certs.lock().unwrap().insert(presented(&s));
+                        let (mut send, conn) =
+                            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(s))
+                                .await
+                                .unwrap();
+                        tokio::spawn(conn);
+                        let req = http::Request::get("/")
+                            .body(http_body_util::Empty::<Bytes>::new())
+                            .unwrap();
+                        match send.send_request(req).await {
+                            Ok(r) if r.status() == 200 => {
+                                requests.fetch_add(1, Ordering::Relaxed);
+                            }
+                            other => {
+                                eprintln!("request failed: {other:?}");
+                                failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("handshake failed: {e}");
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+    for _ in 0..4 {
+        let (stop, failures, requests) = (
+            Arc::clone(&stop),
+            Arc::clone(&failures),
+            Arc::clone(&requests),
+        );
+        clients.push(tokio::spawn(async move {
+            let mut c = Client::connect(addr, "www.example.com", &ClientOpts::default()).await;
+            while !stop.load(Ordering::Relaxed) {
+                match c.get("/").await {
+                    Ok((200, _)) => {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    other => {
+                        eprintln!("keep-alive request failed: {other:?}");
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+
+    for i in 0..100 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let next = if i % 2 == 0 { &b } else { &a };
+        server.acceptor.store().swap(load(next));
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stop.store(true, Ordering::Relaxed);
+    for c in clients {
+        c.await.unwrap();
+    }
+    assert_eq!(failures.load(Ordering::Relaxed), 0);
+    let done = requests.load(Ordering::Relaxed);
+    assert!(
+        done >= 200,
+        "only {done} requests completed during the reloads"
+    );
+    let certs = certs.lock().unwrap().clone();
+    assert_eq!(
+        certs,
+        ["exact", "rotated"].into_iter().collect(),
+        "new connections saw {certs:?}"
+    );
+    let handshakes = seen.lock().unwrap().clone();
+    assert!(handshakes.iter().all(|r| *r == HandshakeResult::Ok));
+    eprintln!(
+        "100 reloads: {done} requests and {} handshakes, none failed",
+        handshakes.len()
+    );
+    // The 100th swap installed `a`.
+    let s = handshake(addr, "api.example.com", &ClientOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(presented(&s), "exact");
     server.shutdown().await;
 }

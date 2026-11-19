@@ -54,6 +54,7 @@ use tokio::sync::Notify;
 use tokio_rustls::server::TlsStream;
 
 use super::der;
+use super::store::Store;
 use crate::config::{CipherSuite, Tls, TlsVersion};
 pub use crate::telemetry::metrics::HandshakeResult;
 
@@ -509,9 +510,10 @@ impl TlsInfo {
     }
 }
 
-/// Runs TLS handshakes for a listener.
+/// Runs TLS handshakes for a listener, each on the store's snapshot at
+/// the moment it starts.
 pub struct Acceptor {
-    snapshot: Arc<Snapshot>,
+    store: Arc<Store>,
     /// Slots taken: handshakes running, plus the one the accept loop
     /// holds while it waits for a connection.
     taken: Mutex<usize>,
@@ -541,11 +543,11 @@ impl Drop for Slot {
 }
 
 impl Acceptor {
-    /// An acceptor serving `snapshot`. `on_handshake`, if set, is called
-    /// after every handshake that ends before shutdown.
-    pub fn new(snapshot: Arc<Snapshot>, on_handshake: Option<OnHandshake>) -> Arc<Acceptor> {
+    /// An acceptor serving `store`'s snapshots. `on_handshake`, if set,
+    /// is called after every handshake that ends before shutdown.
+    pub fn new(store: Arc<Store>, on_handshake: Option<OnHandshake>) -> Arc<Acceptor> {
         Arc::new(Acceptor {
-            snapshot,
+            store,
             taken: Mutex::new(0),
             freed: Notify::new(),
             active: AtomicUsize::new(0),
@@ -561,9 +563,14 @@ impl Acceptor {
         self.on_handshake.set(on_handshake).is_ok()
     }
 
+    /// The store the acceptor reads.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
     /// The snapshot new handshakes use.
     pub fn current(&self) -> Arc<Snapshot> {
-        Arc::clone(&self.snapshot)
+        self.store.current()
     }
 
     /// Handshakes running now.
