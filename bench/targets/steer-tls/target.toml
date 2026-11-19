@@ -1,5 +1,5 @@
 # steer, the Go proxy edgefront's proxy is ported from, built from
-# legacy/steer, terminating TLS with a test certificate for
+# legacy/steer at the last commit that had it, terminating TLS with a test certificate for
 # api.example.com: one route to the origin, every setting at its default.
 product = "steer"
 version = "0.1.0"

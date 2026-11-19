@@ -4,8 +4,10 @@ name: difftest
 # and routing diff (10,000 configs and 100,000 requests), the balancer diff
 # (1,000 scenarios of 10,000 picks), the resilience diff (5,000 outlier and
 # 5,000 retry traces), and the end-to-end HTTP/1.1 and balancing runs
-# against a live steer. legacy/steer is deleted only after this job has
-# passed on three consecutive runs on main; the deleting commit names them.
+# against a live steer. legacy/steer was deleted after this job passed on
+# three consecutive runs on main, as the deleting commit records; the job
+# now builds steer from the last commit that had it (STEER_REV in the
+# Makefile), so the port stays held to steer.
 # workflow_dispatch lets a run on main be started without a new commit.
 
 on:
@@ -25,9 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # steer's source comes from history.
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
-          go-version-file: legacy/steer/go.mod
+          # steer's go.mod at STEER_REV.
+          go-version: "1.27.4"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Configs and routes - diff 10,000 configs and 100,000 requests against steer

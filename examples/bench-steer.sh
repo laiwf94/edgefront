@@ -12,7 +12,7 @@
 # each number the median of the repetitions. Needs Docker with at least 16
 # CPUs: the targets get 4, the origin 6 and the load generator the rest.
 # BENCH_REBUILD=1 rebuilds the images built from this repository (steer from
-# legacy/steer, edgefront at this commit).
+# legacy/steer's last commit, edgefront at this commit).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

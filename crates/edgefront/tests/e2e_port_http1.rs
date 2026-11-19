@@ -2,7 +2,7 @@
 //! configuration and behaves as steer did.
 //!
 //! Three fake upstreams (`a` and `b` at priority 0, `c` at priority 1, as in
-//! `legacy/steer/examples/steer.json`) answer the way steer's
+//! `examples/steer/steer.json`) answer the way steer's
 //! `internal/fakeupstream` does and record every request they receive.
 //! Each case is sent as raw bytes on its own connection: the README's
 //! traffic (`GET /hello`) and the request-path behaviour the README lists,
@@ -21,8 +21,8 @@
 //!
 //! The binary's transcript must equal `tests/fixtures/e2e_port_http1.txt`,
 //! which was recorded from steer. With `STEER_BIN` pointing at a build of
-//! `legacy/steer/cmd/steer` (`make e2e-steer`, run in CI by the
-//! legacy-steer workflow), steer runs the same cases live and its
+//! steer's `cmd/steer` (`make e2e-steer`, which builds it from history,
+//! run in CI by the difftest workflow), steer runs the same cases live and its
 //! transcript must equal the file too; `E2E_BLESS=1` rewrites the file from
 //! steer.
 
@@ -44,7 +44,7 @@ const FIXTURE: &str = concat!(
 );
 const STEER_EXAMPLE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../legacy/steer/examples/steer.json"
+    "/../../examples/steer/steer.json"
 );
 const TIMEOUT: Duration = Duration::from_secs(10);
 

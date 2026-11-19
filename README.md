@@ -5,7 +5,7 @@ A self-hosted application edge in one Rust binary. It brings three projects toge
 | Part | Started as | Today |
 |---|---|---|
 | Cache | cachet | An HTTP caching reverse proxy in Rust, split into `edgefront-cache` and the root package and served by the `edgefront` binary |
-| Proxy | steer | A Go edge proxy and load balancer, under [legacy/steer](legacy/steer), being ported to `edgefront-proxy`; the Rust port already proxies HTTP/1.1 with steer's configuration (see below) |
+| Proxy | steer | A Go edge proxy and load balancer, ported to `edgefront-proxy` and `edgefront-core` and deleted from `legacy/` once the differential suite passed (see [Migrating from steer](#migrating-from-steer)) |
 | Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer), being ported to `edgefront-limiter`; its algorithms are ported and make the same decisions as the C (see below) |
 
 All three keep their full history. The plan for the next year, three tracks in parallel, is in [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap`.
@@ -19,7 +19,7 @@ All three keep their full history. The plan for the next year, three tracks in p
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request IDs and the HTTP/1.1 request path ported from steer |
 | `crates/edgefront-cache` | cachet's caching policy, storage and purge |
 | `crates/edgefront-limiter` | pacer's rate limiting algorithms |
-| `crates/edgefront-difftest` | Differential tests against `legacy/steer`, `legacy/pacer` and cachet 0.1 |
+| `crates/edgefront-difftest` | Differential tests against steer (built from history), `legacy/pacer` and cachet 0.1 |
 | `.` (`cachet`) | The cache node's runtime still to move into the crates, and the reference `cachet` binary |
 
 Which crate depends on which is in [docs/DESIGN.md](docs/DESIGN.md#crate-map).
@@ -30,8 +30,8 @@ Which crate depends on which is in [docs/DESIGN.md](docs/DESIGN.md#crate-map).
 
 ```sh
 cargo build --release -p edgefront
-target/release/edgefront proxy --check-config legacy/steer/examples/steer.json
-target/release/edgefront proxy --config legacy/steer/examples/steer.json   # listens on 127.0.0.1:18080
+target/release/edgefront proxy --check-config examples/steer/steer.json
+target/release/edgefront proxy --config examples/steer/steer.json   # listens on 127.0.0.1:18080
 ```
 
 The log is JSON on stdout (`EDGEFRONT_LOG` sets the filter, default `info`), one line per request with steer's fields, and SIGTERM drains in-flight requests before exiting. The request path behaves as steer's did: routing on host and longest prefix after path cleaning, `X-Forwarded-*` rewritten and trusted only from `trusted_proxies`, request IDs accepted or generated and returned, hop-by-hop headers removed both ways, each cluster's `max_requests` and `timeout`, and steer's JSON errors (`no_route`, `overloaded`, `no_healthy_upstream`, `bad_gateway`, `upstream_timeout`, `bad_request`, `method_not_allowed`). `crates/edgefront/tests/e2e_port_http1.rs` holds the binary to a transcript recorded from steer, header values byte for byte, and in CI it also runs steer itself on the same 30 requests.
@@ -336,7 +336,7 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 
 `make difftest-cache` holds the cache to cachet 0.1, the binary from before the workspace split. It replays 50,000 generated requests against both binaries on one logical clock, and diffs each response's status, headers except `Date` and body SHA-256, and the origin requests it took. `DIFFTEST_ARGS="--log FILE"` replays a recorded log instead, and `edgefront-difftest cache-record --seed N` writes the log a seed generates. The run and `make test` need libfaketime (`apt install libfaketime`). See [docs/DESIGN.md](docs/DESIGN.md#checking-the-cache-against-cachet-01).
 
-While `legacy/steer` exists, its own gate runs too (gofmt, vet, `go test -race ./...` and short fuzzing), plus four comparisons that need Go: `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, `make difftest-balancer` diffs the pick sequences of 1,000 seeded balancing scenarios of 10,000 requests each (health changes, ejections, priority spill and panic included) between steer's `balancer.LB` and `edgefront_proxy::balancer::Balancer`, `make difftest-resilience` diffs every ejection, multiplier, retry decision, backoff and budget balance on 5,000 generated failure traces and 5,000 request traces (every hundredth of 100,000 requests) between steer's outlier detector and retry code and `edgefront_proxy::outlier` and `edgefront_proxy::retry`, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary, and the end-to-end balancing run against steer's balancer. The `failover-drill` job runs steer's failover drill against steer and `examples/failover.sh` against edgefront, and fails unless both keep 100.00% of requests in all four phases with the resilience features on.
+steer's differential suite still runs, against steer built from the last commit that had `legacy/steer` (`STEER_REV` in the Makefile; `make steer-src` extracts it into `target/steer-src`, which needs the commit's history and Go): `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, `make difftest-balancer` diffs the pick sequences of 1,000 seeded balancing scenarios of 10,000 requests each (health changes, ejections, priority spill and panic included) between steer's `balancer.LB` and `edgefront_proxy::balancer::Balancer`, `make difftest-resilience` diffs every ejection, multiplier, retry decision, backoff and budget balance on 5,000 generated failure traces and 5,000 request traces (every hundredth of 100,000 requests) between steer's outlier detector and retry code and `edgefront_proxy::outlier` and `edgefront_proxy::retry`, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary, and the end-to-end balancing run against steer's balancer. The difftest workflow runs all four on every push. The `failover-drill` job runs `examples/failover.sh` against edgefront and fails unless it keeps 100.00% of requests in all four phases with the resilience features on.
 
 The `difftest-pacer` job of the difftest workflow runs every pacer differential suite on each push to main: `make difftest-pacer`, the million-operation end-to-end test, `make difftest-pacer-config` and `make difftest-l4`. `make difftest-l4` runs pacer's 23 integration scenarios, written as traffic scripts in `tests/pacer_scripts`, against legacy pacerd and against `edgefront limits`, and diffs their accept, refuse and close outcomes and counters step by step (Linux only, as pacerd is; `make test` runs the scripts against edgefront alone).
 

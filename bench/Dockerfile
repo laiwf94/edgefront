@@ -7,9 +7,9 @@
 #   --target harness    edgefront-bench, for the origin and the load
 #                       generator (edgefront-bench/harness)
 #   --target steer      steer, the Go proxy edgefront's proxy is ported
-#                       from, built as legacy/steer's own Dockerfile builds
-#                       it (edgefront-bench/steer), on the same base image
-#                       as edgefront
+#                       from, built from legacy/steer at the last commit
+#                       that had it, as its own Dockerfile built it
+#                       (edgefront-bench/steer), on edgefront's base image
 #
 # The runner tags them local-<hash of the checkout's path>, so checkouts
 # sharing one Docker never run each other's builds; EDGEFRONT_BENCH_TAG
@@ -45,10 +45,13 @@ EXPOSE 8080
 ENTRYPOINT ["/edgefront"]
 CMD ["--config", "/etc/edgefront/edgefront.toml"]
 
-# steer as legacy/steer/Dockerfile builds it: static, trimmed, stripped.
+# steer as its own Dockerfile built it: static, trimmed, stripped. Its
+# source is legacy/steer at the last commit that had it, fetched from the
+# repository, so the image is pinned by that commit.
 FROM golang:1.27.4-alpine AS steer-build
+ARG STEER_REV=8f0c2a5d45975259c0e385ada04dd47cd1eb2057
+ADD https://github.com/laiwf94/edgefront.git#${STEER_REV}:legacy/steer /src
 WORKDIR /src
-COPY legacy/steer ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/steer ./cmd/steer
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS steer

@@ -1,5 +1,5 @@
 //! The config loader against steer: its Go test suite ported case for case,
-//! every example file in legacy/steer/examples (in JSON and in TOML), a
+//! every example file of steer's, in examples/steer (in JSON and in TOML), a
 //! corpus of edge cases with steer's own verdicts, and properties over
 //! generated configs.
 
@@ -54,7 +54,7 @@ fn ms(n: u64) -> Duration {
 }
 
 fn steer_examples() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../legacy/steer/examples")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/steer")
 }
 
 fn fixtures() -> PathBuf {

@@ -181,6 +181,23 @@ jobs:
       - name: L4 limits demo (pacer's live demo on edgefront limits)
         run: examples/l4_limits.sh
 
+  # steer's failover drill against edgefront: 100.00% of requests in all
+  # four phases with the resilience features on, and every fault showing
+  # with them off (scripts/check-failover.sh). It ran against steer too
+  # until legacy/steer was deleted; steer's published table is in the
+  # README.
+  failover-drill:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Drill against edgefront
+        run: CHECK=1 examples/failover.sh
+
   docker:
     runs-on: ubuntu-latest
     steps:
