@@ -275,13 +275,20 @@ dependencies = [
 name = "edgefront"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cachet",
  "edgefront-core",
  "edgefront-difftest",
  "edgefront-limiter",
  "edgefront-proxy",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustls",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
