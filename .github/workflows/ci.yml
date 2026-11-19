@@ -87,6 +87,8 @@ jobs:
     # 600) within `timeout` minutes (default 30), which leave room for the
     # build. Pushes and pull requests run each target for 60 seconds.
     timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (matrix.timeout || 30) || 15 }}
+    env:
+      CARGO_FUZZ_VERSION: 0.13.2
     strategy:
       fail-fast: false
       matrix:
@@ -104,11 +106,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@v2
+      # install-action has no prebuilt cargo-fuzz, so it falls back to
+      # downloading cargo-binstall from GitHub releases, and with ten jobs
+      # starting at once that download can be refused (403) before any
+      # fuzzing runs (#242). Build the pinned version from crates.io instead
+      # and keep the binary in the Actions cache, so a run downloads no
+      # release asset and most runs build nothing.
+      - name: Restore cargo-fuzz ${{ env.CARGO_FUZZ_VERSION }}
+        id: cargo-fuzz
+        uses: actions/cache@v4
         with:
-          tool: cargo-fuzz
-      # The prebuilt cargo-fuzz is a musl binary and defaults to its own
-      # target, where the sanitizers cannot link; name the gnu target.
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build cargo-fuzz ${{ env.CARGO_FUZZ_VERSION }}
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-fuzz --version "$CARGO_FUZZ_VERSION"
+      # Name the gnu target, where the sanitizers link, whatever target
+      # cargo-fuzz was built for.
       # With the target's dictionary when it has one. An input that takes
       # over 10 seconds fails the run, so a parse that loops is caught.
       - name: Fuzz for ${{ matrix.secs || 600 }} seconds
