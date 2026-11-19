@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use super::*;
 
@@ -89,10 +90,11 @@ fn refusal_reasons_and_counters_have_pacerd_names() {
             "per_ip_rate",
             "table_full",
             "fd_exhausted",
-            "fd_exhausted_paused"
+            "fd_exhausted_paused",
+            "per_ip_quota",
         ]
     );
-    // pd_stat_names, in order.
+    // pd_stat_names, in order, then the quota's.
     let names: Vec<_> = Stat::ALL.iter().map(|s| s.name()).collect();
     assert_eq!(
         names,
@@ -113,6 +115,7 @@ fn refusal_reasons_and_counters_have_pacerd_names() {
             "bytes_up",
             "bytes_down",
             "throttled",
+            "rejected_per_ip_quota",
         ]
     );
     for (i, s) in Stat::ALL.iter().enumerate() {
@@ -143,6 +146,7 @@ fn reasons_map_to_counters_as_stat_for_does() {
         ("table_full", Stat::RejectedTableFull),
         ("fd_exhausted", Stat::RejectedFdExhausted),
         ("fd_exhausted_paused", Stat::RejectedFdExhausted),
+        ("per_ip_quota", Stat::RejectedPerIpQuota),
         ("something_else", Stat::ClosedOther),
         ("", Stat::ClosedOther),
     ];
@@ -573,4 +577,313 @@ fn racing_accepts_never_exceed_the_caps() {
     .sum();
     assert_eq!(decided, (THREADS * ROUNDS) as u64);
     assert!(c.get(Stat::Accepted) > 0);
+}
+
+const HOUR: u64 = 3_600 * SEC;
+const DAY: u64 = 24 * HOUR;
+
+fn quota(limit: u64, window_ns: u64) -> Option<ConnQuota> {
+    Some(ConnQuota {
+        limit,
+        window: Duration::from_nanos(window_ns),
+    })
+}
+
+#[test]
+fn a_quota_refuses_past_its_limit_at_the_window_edge() {
+    // No cap and no rate: only the quota table is used.
+    let a = admission(|l| l.per_ip_conn_quota = quota(3, HOUR));
+    let k = ClientKey::new(ip("10.0.0.1"), 64);
+    let open: Vec<_> = (0..3)
+        .map(|_| a.admit(ip("10.0.0.1"), 100 * SEC).unwrap())
+        .collect();
+    assert!(open.iter().all(|p| !p.held()));
+    drop(open);
+    // Closing does not give a quota back: it counts new connections.
+    assert_eq!(
+        a.admit(ip("10.0.0.1"), 100 * SEC).unwrap_err(),
+        Refusal::PerIpQuota
+    );
+    assert_eq!(a.open(), 0, "a quota refusal gives the slot back");
+    assert_eq!(a.client_stats().inserts, 0, "the client table is not used");
+    assert_eq!(a.quota_count(&k, 100 * SEC), Some(3));
+    // The three are in the window until an hour after their bucket
+    // started; just past that, the oldest bucket is weighted down.
+    assert_eq!(
+        a.admit(ip("10.0.0.1"), HOUR).unwrap_err(),
+        Refusal::PerIpQuota
+    );
+    assert!(a.admit(ip("10.0.0.1"), HOUR + 1).is_ok());
+    assert_eq!(
+        a.admit(ip("10.0.0.1"), HOUR + 1).unwrap_err(),
+        Refusal::PerIpQuota
+    );
+    // Another client, and an IPv6 client by its prefix, have their own.
+    assert!(a.admit(ip("10.0.0.2"), 0).is_ok());
+    assert!(a.admit(ip("2001:db8::1"), 0).is_ok());
+    assert_eq!(
+        a.quota_count(&ClientKey::new(ip("2001:db8::2"), 64), 0),
+        Some(1)
+    );
+    let c = a.counters();
+    assert_eq!(
+        (c.get(Stat::Accepted), c.get(Stat::RejectedPerIpQuota)),
+        (6, 3)
+    );
+    assert_eq!(a.quota_stats().unwrap().entries, 3);
+}
+
+#[test]
+fn a_quota_refusal_gives_back_the_hold_and_the_token() {
+    let a = admission(|l| {
+        l.per_ip_max_conns = 5;
+        l.per_ip_conn_rate = Some(Rate::new(2, SEC, 2));
+        l.per_ip_conn_quota = quota(1, HOUR);
+    });
+    let k = ClientKey::new(ip("10.0.0.1"), 64);
+    let p = a.admit(ip("10.0.0.1"), 0).unwrap();
+    assert!(p.held());
+    let before = a.client(&k).unwrap();
+    assert_eq!(before.holds, 1);
+    for _ in 0..5 {
+        assert_eq!(a.admit(ip("10.0.0.1"), 0).unwrap_err(), Refusal::PerIpQuota);
+    }
+    // Nothing was taken: the same holds and the same arrival time, so the
+    // second token of the burst is still there.
+    assert_eq!(a.client(&k).unwrap(), before);
+    assert_eq!(a.open(), 1);
+    assert_eq!(a.client_stats().holds, 1);
+    a.reconfigure(&{
+        let mut l = listener();
+        l.per_ip_max_conns = 5;
+        l.per_ip_conn_rate = Some(Rate::new(2, SEC, 2));
+        l.per_ip_conn_quota = quota(3, HOUR);
+        l
+    })
+    .unwrap();
+    let q = a.admit(ip("10.0.0.1"), 0).unwrap();
+    // Two tokens are gone now, so the rate refuses before the quota.
+    assert_eq!(a.admit(ip("10.0.0.1"), 0).unwrap_err(), Refusal::PerIpRate);
+    drop((p, q));
+    assert_eq!(a.client(&k).unwrap().holds, 0);
+    assert_eq!(a.open(), 0);
+    // The cap and the rate are checked first, so their refusals leave the
+    // quota alone.
+    assert_eq!(a.quota_count(&k, 0), Some(2));
+    let c = a.counters();
+    assert_eq!(
+        (
+            c.get(Stat::Accepted),
+            c.get(Stat::RejectedPerIpQuota),
+            c.get(Stat::RejectedPerIpRate)
+        ),
+        (2, 5, 1)
+    );
+}
+
+#[test]
+fn a_full_quota_table_refuses_new_clients_as_table_full() {
+    let a = admission(|l| {
+        l.table_size = 4;
+        l.per_ip_max_conns = 1;
+        l.per_ip_conn_quota = quota(10, DAY);
+    });
+    for i in 1..=4 {
+        drop(a.admit(ip(&format!("10.0.0.{i}")), 0).unwrap());
+    }
+    // A second on, the client table reclaims the idle client 1 for client
+    // 5, but the quota table still counts all four in their window.
+    assert_eq!(
+        a.admit(ip("10.0.0.5"), SEC).unwrap_err(),
+        Refusal::TableFull
+    );
+    assert_eq!(a.client_stats().reclaims, 1);
+    assert_eq!(a.open(), 0);
+    assert_eq!(a.client_stats().holds, 0);
+    assert_eq!(a.quota_stats().unwrap().rejections, 1);
+    assert_eq!(a.counters().get(Stat::RejectedTableFull), 1);
+    // Existing clients carry on.
+    assert!(a.admit(ip("10.0.0.2"), SEC).is_ok());
+    // Once their windows are empty they can be reclaimed.
+    assert!(a.admit(ip("10.0.0.5"), 2 * DAY).is_ok());
+    assert_eq!(a.quota_stats().unwrap().reclaims, 1);
+
+    // Under evict, the coldest client's count goes to make room.
+    let a = admission(|l| {
+        l.table_size = 4;
+        l.table_full = FullPolicy::Evict;
+        l.per_ip_conn_quota = quota(1, DAY);
+    });
+    for i in 1..=4 {
+        assert!(a.admit(ip(&format!("10.0.0.{i}")), 0).is_ok());
+    }
+    assert!(a.admit(ip("10.0.0.5"), 0).is_ok());
+    assert_eq!(a.quota_stats().unwrap().evictions, 1);
+    assert!(a.admit(ip("10.0.0.1"), 0).is_ok(), "evicted with its count");
+    assert_eq!(a.admit(ip("10.0.0.5"), 0).unwrap_err(), Refusal::PerIpQuota);
+}
+
+#[test]
+fn reconfigure_changes_a_quota_in_place() {
+    let mut l = listener();
+    l.per_ip_conn_quota = quota(2, HOUR);
+    let a = Arc::new(Admission::new(&l).unwrap());
+    let k = ClientKey::new(ip("10.0.0.1"), 64);
+    for _ in 0..2 {
+        assert!(a.admit(ip("10.0.0.1"), 0).is_ok());
+    }
+    assert_eq!(a.admit(ip("10.0.0.1"), 0).unwrap_err(), Refusal::PerIpQuota);
+
+    // A new limit keeps the count.
+    l.per_ip_conn_quota = quota(3, HOUR);
+    a.reconfigure(&l).unwrap();
+    assert!(a.admit(ip("10.0.0.1"), 0).is_ok());
+    assert_eq!(a.admit(ip("10.0.0.1"), 0).unwrap_err(), Refusal::PerIpQuota);
+    assert_eq!(a.quota_count(&k, 0), Some(3));
+
+    // A new window starts everyone afresh, with day-long windows.
+    l.per_ip_conn_quota = quota(1, DAY);
+    a.reconfigure(&l).unwrap();
+    assert_eq!(a.quota_count(&k, 0), None);
+    assert!(a.admit(ip("10.0.0.1"), 0).is_ok());
+    assert_eq!(
+        a.admit(ip("10.0.0.1"), 2 * HOUR).unwrap_err(),
+        Refusal::PerIpQuota
+    );
+
+    // Switched off, nobody is refused and nothing is counted.
+    l.per_ip_conn_quota = None;
+    a.reconfigure(&l).unwrap();
+    for _ in 0..5 {
+        assert!(a.admit(ip("10.0.0.1"), 2 * HOUR).is_ok());
+    }
+    assert_eq!(a.quota_stats().unwrap().entries, 0);
+    // Reloading with it still off changes nothing.
+    a.reconfigure(&l).unwrap();
+    // Back on, with the same window, counts start from zero.
+    l.per_ip_conn_quota = quota(1, DAY);
+    a.reconfigure(&l).unwrap();
+    assert!(a.admit(ip("10.0.0.1"), 2 * HOUR).is_ok());
+    assert_eq!(
+        a.admit(ip("10.0.0.1"), 2 * HOUR).unwrap_err(),
+        Refusal::PerIpQuota
+    );
+    assert_eq!(a.counters().get(Stat::RejectedPerIpQuota), 4);
+}
+
+#[test]
+fn reconfigure_refuses_a_quota_it_cannot_apply() {
+    // Started without a quota, there is no table to count in.
+    let l = listener();
+    let a = Admission::new(&l).unwrap();
+    assert_eq!(a.quota_stats(), None);
+    assert_eq!(a.quota_count(&ClientKey::new(ip("10.0.0.1"), 64), 0), None);
+    let mut m = l.clone();
+    m.per_ip_conn_quota = quota(5, DAY);
+    m.max_conns = 1;
+    assert_eq!(
+        a.reconfigure(&m).unwrap_err(),
+        "listener web: per_ip_conn_quota cannot be switched on without a restart"
+    );
+    assert_eq!(a.caps(), (1024, 0), "nothing changed");
+
+    // An invalid quota or rate leaves the quota as it was.
+    let mut l = listener();
+    l.per_ip_conn_quota = quota(1, HOUR);
+    let a = Arc::new(Admission::new(&l).unwrap());
+    assert!(a.admit(ip("10.0.0.1"), 0).is_ok());
+    let mut m = l.clone();
+    m.per_ip_conn_quota = quota(0, DAY);
+    assert_eq!(
+        a.reconfigure(&m).unwrap_err(),
+        "listener web: per_ip_conn_quota: invalid argument"
+    );
+    m.per_ip_conn_quota = Some(ConnQuota {
+        limit: 1,
+        window: Duration::from_secs(u64::MAX),
+    });
+    assert_eq!(
+        a.reconfigure(&m).unwrap_err(),
+        "listener web: per_ip_conn_quota: invalid window configuration"
+    );
+    m.per_ip_conn_quota = quota(5, DAY);
+    m.per_ip_conn_rate = Some(Rate::new(0, SEC, 1));
+    assert!(a.reconfigure(&m).is_err());
+    assert_eq!(a.admit(ip("10.0.0.1"), 0).unwrap_err(), Refusal::PerIpQuota);
+    assert_eq!(
+        a.quota_count(&ClientKey::new(ip("10.0.0.1"), 64), 0),
+        Some(1)
+    );
+
+    // new() refuses the same quotas.
+    let mut l = listener();
+    l.per_ip_conn_quota = quota(0, HOUR);
+    assert_eq!(Admission::new(&l).unwrap_err(), Error::InvalidRate);
+    l.per_ip_conn_quota = quota(1, 15);
+    assert_eq!(Admission::new(&l).unwrap_err(), Error::InvalidWindow);
+}
+
+#[test]
+fn a_quota_table_is_fixed_memory_and_swept_with_the_clients() {
+    let a = admission(|l| {
+        l.table_size = 16_384;
+        l.per_ip_conn_rate = Some(Rate::new(1, SEC, 1));
+        l.per_ip_conn_quota = quota(5, HOUR);
+    });
+    let without = admission(|l| {
+        l.table_size = 16_384;
+        l.per_ip_conn_rate = Some(Rate::new(1, SEC, 1));
+    });
+    let m = a.memory();
+    assert!(m > without.memory() + 16_384 * 64, "{m}");
+    for i in 0..20_000u32 {
+        let _ = a.admit(IpAddr::V4(Ipv4Addr::from(i)), u64::from(i));
+    }
+    assert_eq!(a.memory(), m);
+    assert_eq!(a.quota_stats().unwrap().capacity, 16_384);
+    let (clients, windows) = (a.client_stats().entries, a.quota_stats().unwrap().entries);
+    assert!(windows > 15_000, "{windows}");
+    // A second on, every client's rate has refilled but every window
+    // still counts.
+    assert_eq!(a.sweep(2 * SEC, u32::MAX) as u64, clients);
+    assert_eq!(a.quota_stats().unwrap().entries, windows);
+    assert_eq!(a.sweep(2 * HOUR, u32::MAX) as u64, windows);
+    assert_eq!(a.quota_stats().unwrap().entries, 0);
+}
+
+/// Threads racing to admit one client never get more than its quota, and
+/// every refusal gives back what it took.
+#[test]
+fn racing_accepts_never_exceed_the_quota() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 1_000;
+    let a = admission(|l| {
+        l.per_ip_max_conns = 4;
+        l.per_ip_conn_quota = quota(500, HOUR);
+    });
+    let admitted = AtomicUsize::new(0);
+    let start = Barrier::new(THREADS);
+    thread::scope(|s| {
+        for _ in 0..THREADS {
+            let (a, admitted, start) = (&a, &admitted, &start);
+            s.spawn(move || {
+                start.wait();
+                for _ in 0..ROUNDS {
+                    if let Ok(p) = a.admit(ip("10.0.0.1"), 0) {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                        drop(p);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(admitted.load(Ordering::Relaxed), 500);
+    assert_eq!(a.open(), 0);
+    assert_eq!(a.client_stats().holds, 0);
+    let c = a.counters();
+    assert_eq!(c.get(Stat::Accepted), 500);
+    assert_eq!(
+        c.get(Stat::RejectedPerIpQuota) + c.get(Stat::RejectedPerIpConns),
+        (THREADS * ROUNDS - 500) as u64
+    );
 }

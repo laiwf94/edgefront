@@ -20,6 +20,14 @@
 //!    rate has no token, and [`Refusal::TableFull`] when the client is new
 //!    and the table has no room for it under [`FullPolicy::Deny`]. With
 //!    neither limit set the table is not touched at all.
+//! 3. **The client's quota.** With `per_ip_conn_quota` set, a
+//!    [`QuotaTable`] of the same size and full policy as the client table
+//!    counts the client's new connections on a sliding window, and one
+//!    more than the quota allows is refused as [`Refusal::PerIpQuota`].
+//!    pacerd has no quota; this check is edgefront's. A refusal here gives
+//!    back the hold and the token step 2 took, so it too takes nothing,
+//!    and a new client the quota table has no room for is
+//!    [`Refusal::TableFull`].
 //!
 //! An admitted connection gets a [`Permit`]. Dropping it gives back the
 //! client's hold and then the listener slot, in that order, so a client
@@ -30,7 +38,11 @@
 //! caps, the IPv6 prefix and the rate change for the next accept and keep
 //! every open connection's hold and every client's debt. The table's size
 //! and full policy are fixed memory and cannot change without a restart,
-//! and a reload that changes them is refused with pacerd's message.
+//! and a reload that changes them is refused with pacerd's message. A
+//! quota's limit changes in place and keeps every client's count; a new
+//! window length starts every client afresh, as does switching the quota
+//! off. The quota table is allocated at start only for a listener with a
+//! quota, so a reload cannot add one where there was none.
 //!
 //! [`Counters`] are pacerd's per-listener stats, with pacerd's names
 //! ([`Stat::name`]): `admit` counts each acceptance and each refusal under
@@ -42,9 +54,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::config::ListenerConfig;
+use crate::config::{ConnQuota, ListenerConfig};
 use crate::gcra::{Error, Rate};
 use crate::table::{FullPolicy, Table, TableConfig, TableStats};
+
+mod quota;
+
+pub use quota::QuotaTable;
 
 /// The longest [`ClientKey`]: a whole IPv6 address.
 pub const CLIENT_KEY_MAX: usize = 16;
@@ -114,7 +130,8 @@ pub enum Refusal {
     PerIpConns,
     /// The client's `per_ip_conn_rate` has no token left.
     PerIpRate,
-    /// The client is new and the client table has no room for it.
+    /// The client is new and the client table, or the quota table, has no
+    /// room for it.
     TableFull,
     /// The process ran out of file descriptors; the connection was
     /// accepted on a spare descriptor and closed at once.
@@ -122,17 +139,21 @@ pub enum Refusal {
     /// The process ran out of file descriptors and had no spare, so it
     /// stopped accepting for a moment.
     FdExhaustedPaused,
+    /// The client already opened `per_ip_conn_quota` connections in the
+    /// quota's window. edgefront's own; pacerd has no quota.
+    PerIpQuota,
 }
 
 impl Refusal {
-    /// Every refusal, in pacerd's order.
-    pub const ALL: [Refusal; 6] = [
+    /// Every refusal, in pacerd's order, then edgefront's own.
+    pub const ALL: [Refusal; 7] = [
         Refusal::ListenerFull,
         Refusal::PerIpConns,
         Refusal::PerIpRate,
         Refusal::TableFull,
         Refusal::FdExhausted,
         Refusal::FdExhaustedPaused,
+        Refusal::PerIpQuota,
     ];
 
     /// pacerd's `reason=` for this refusal.
@@ -144,6 +165,7 @@ impl Refusal {
             Refusal::TableFull => "table_full",
             Refusal::FdExhausted => "fd_exhausted",
             Refusal::FdExhaustedPaused => "fd_exhausted_paused",
+            Refusal::PerIpQuota => "per_ip_quota",
         }
     }
 
@@ -156,6 +178,7 @@ impl Refusal {
             Refusal::PerIpRate => Stat::RejectedPerIpRate,
             Refusal::TableFull => Stat::RejectedTableFull,
             Refusal::FdExhausted | Refusal::FdExhaustedPaused => Stat::RejectedFdExhausted,
+            Refusal::PerIpQuota => Stat::RejectedPerIpQuota,
         }
     }
 }
@@ -167,7 +190,7 @@ impl fmt::Display for Refusal {
 }
 
 /// One of a listener's counters, in the order pacerd's `stats` command
-/// prints them.
+/// prints them, then edgefront's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stat {
     Accepted,
@@ -186,13 +209,15 @@ pub enum Stat {
     BytesUp,
     BytesDown,
     Throttled,
+    /// Refused for `per_ip_conn_quota`, which pacerd does not have.
+    RejectedPerIpQuota,
 }
 
 impl Stat {
     /// How many counters there are.
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 
-    /// Every counter, in pacerd's order.
+    /// Every counter, in pacerd's order, then edgefront's own.
     pub const ALL: [Stat; Stat::COUNT] = [
         Stat::Accepted,
         Stat::RejectedListenerFull,
@@ -210,10 +235,11 @@ impl Stat {
         Stat::BytesUp,
         Stat::BytesDown,
         Stat::Throttled,
+        Stat::RejectedPerIpQuota,
     ];
 
     /// The name pacerd's `stats` command gives this counter
-    /// (`pd_stat_names`).
+    /// (`pd_stat_names`), and `rejected_per_ip_quota` for the quota.
     pub const fn name(self) -> &'static str {
         match self {
             Stat::Accepted => "accepted",
@@ -232,6 +258,7 @@ impl Stat {
             Stat::BytesUp => "bytes_up",
             Stat::BytesDown => "bytes_down",
             Stat::Throttled => "throttled",
+            Stat::RejectedPerIpQuota => "rejected_per_ip_quota",
         }
     }
 
@@ -301,6 +328,8 @@ const UNLIMITED: Rate = Rate::new(1_000_000_000, 1_000_000_000, 1_000_000_000);
 
 /// `rate_on` in [`Admission::client`].
 const RATE_ON: u32 = 1 << 8;
+/// `quota_on` in [`Admission::client`].
+const QUOTA_ON: u32 = 1 << 9;
 
 /// One listener's admission state, shared by every worker accepting for it.
 /// See the [module docs](self).
@@ -309,12 +338,14 @@ pub struct Admission {
     /// `max_conns` in the high half, `per_ip_max_conns` in the low half, so
     /// an accept reads both caps from one reload.
     caps: AtomicU64,
-    /// `ipv6_prefix` in the low byte, then [`RATE_ON`].
+    /// `ipv6_prefix` in the low byte, then [`RATE_ON`] and [`QUOTA_ON`].
     client: AtomicU32,
     /// Connections open across every worker.
     open: AtomicU32,
     /// Per-client holds and new-connection rate.
     clients: Table,
+    /// Per-client quota windows, for a listener started with a quota.
+    quota: Option<QuotaTable>,
     table_size: u32,
     table_full: FullPolicy,
     counters: Counters,
@@ -343,24 +374,52 @@ fn pack_client(l: &ListenerConfig) -> u32 {
     } else {
         0
     };
-    l.ipv6_prefix.min(128) | rate_on
+    let quota_on = if l.per_ip_conn_quota.is_some() {
+        QUOTA_ON
+    } else {
+        0
+    };
+    l.ipv6_prefix.min(128) | rate_on | quota_on
+}
+
+/// A quota's limit and window in nanoseconds, checked as the quota table
+/// checks them.
+fn quota_parts(q: &ConnQuota) -> Result<(u64, u64), Error> {
+    let window_ns = u64::try_from(q.window.as_nanos()).map_err(|_| Error::InvalidWindow)?;
+    QuotaTable::check(q.limit, window_ns)?;
+    Ok((q.limit, window_ns))
 }
 
 impl Admission {
     /// The admission state for listener `l`, with a client table of
-    /// `l.table_size` keys allocated now and never grown. Fails with
-    /// [`Error::InvalidConfig`] for a table size the table refuses, or
-    /// [`Error::InvalidRate`] for a rate it refuses. A config that passed
-    /// [`crate::LimiterConfig::validate`] never fails.
+    /// `l.table_size` keys allocated now and never grown, and for a
+    /// listener with `per_ip_conn_quota` a [`QuotaTable`] of the same size.
+    /// Fails with [`Error::InvalidConfig`] for a table size the table
+    /// refuses, [`Error::InvalidRate`] for a rate it refuses or a quota of
+    /// 0, or [`Error::InvalidWindow`] for a quota window under 16 ns. A
+    /// config that passed [`crate::LimiterConfig::validate`] never fails.
     pub fn new(l: &ListenerConfig) -> Result<Self, Error> {
         let mut tc = TableConfig::new(l.table_size, l.per_ip_conn_rate.unwrap_or(UNLIMITED));
         tc.full_policy = l.table_full;
+        let quota = match &l.per_ip_conn_quota {
+            Some(q) => {
+                let (limit, window_ns) = quota_parts(q)?;
+                Some(QuotaTable::new(
+                    l.table_size,
+                    limit,
+                    window_ns,
+                    l.table_full,
+                )?)
+            }
+            None => None,
+        };
         Ok(Self {
             name: l.name.clone(),
             caps: AtomicU64::new(pack_caps(l)),
             client: AtomicU32::new(pack_client(l)),
             open: AtomicU32::new(0),
             clients: Table::new(&tc)?,
+            quota,
             table_size: l.table_size,
             table_full: l.table_full,
             counters: Counters::default(),
@@ -372,7 +431,12 @@ impl Admission {
     /// connections keep their holds and clients keep their debt. Refused,
     /// with nothing changed, when `table_size` or `table_full` differs,
     /// with pacerd's message (`listener web: table_size cannot change
-    /// without a restart`), or when the rate is invalid.
+    /// without a restart`), or when the rate is invalid. A quota keeps
+    /// every client's count when only its limit changes, and starts every
+    /// client afresh when its window changes or it is switched off or back
+    /// on. Switching a quota on for a listener started without one is
+    /// refused (`per_ip_conn_quota cannot be switched on without a
+    /// restart`): its table is fixed memory allocated at start.
     pub fn reconfigure(&self, l: &ListenerConfig) -> Result<(), String> {
         let fixed = if l.table_size != self.table_size {
             Some("table_size")
@@ -387,9 +451,35 @@ impl Admission {
                 self.name
             ));
         }
+        if l.per_ip_conn_quota.is_some() && self.quota.is_none() {
+            return Err(format!(
+                "listener {}: per_ip_conn_quota cannot be switched on without a restart",
+                self.name
+            ));
+        }
+        let quota = l
+            .per_ip_conn_quota
+            .as_ref()
+            .map(quota_parts)
+            .transpose()
+            .map_err(|e| format!("listener {}: per_ip_conn_quota: {e}", self.name))?;
         self.clients
             .reconfigure(&l.per_ip_conn_rate.unwrap_or(UNLIMITED))
             .map_err(|e| format!("listener {}: per_ip_conn_rate: {e}", self.name))?;
+        if let Some(t) = &self.quota {
+            let was_on = self.client.load(Ordering::Relaxed) & QUOTA_ON != 0;
+            // Both were checked above, so neither call fails.
+            match quota {
+                None if was_on => t.reset(t.window_ns()).expect("checked quota"),
+                None => {}
+                Some((limit, window_ns)) => {
+                    t.set_limit(limit).expect("checked quota");
+                    if !was_on || window_ns != t.window_ns() {
+                        t.reset(window_ns).expect("checked quota");
+                    }
+                }
+            }
+        }
         self.caps.store(pack_caps(l), Ordering::Relaxed);
         self.client.store(pack_client(l), Ordering::Relaxed);
         Ok(())
@@ -431,25 +521,36 @@ impl Admission {
             key,
             held: false,
         };
-        if per_ip_max == 0 && client & RATE_ON == 0 {
-            return Ok(permit);
-        }
-        let cap = if per_ip_max == 0 {
-            u32::MAX
-        } else {
-            per_ip_max
-        };
-        match self.clients.hold(key.as_bytes(), now_ns, cap) {
-            Ok(d) if d.allowed => {
-                permit.held = true;
-                Ok(permit)
+        if per_ip_max != 0 || client & RATE_ON != 0 {
+            let cap = if per_ip_max == 0 {
+                u32::MAX
+            } else {
+                per_ip_max
+            };
+            match self.clients.hold(key.as_bytes(), now_ns, cap) {
+                Ok(d) if d.allowed => permit.held = true,
+                Ok(_) => return Err(Refusal::PerIpRate),
+                Err(Error::HoldLimit) => return Err(Refusal::PerIpConns),
+                // Only TableFull is left: a ClientKey is 4 or 16 bytes,
+                // never an invalid key.
+                Err(_) => return Err(Refusal::TableFull),
             }
-            Ok(_) => Err(Refusal::PerIpRate),
-            Err(Error::HoldLimit) => Err(Refusal::PerIpConns),
-            // Only TableFull is left: a ClientKey is 4 or 16 bytes, never
-            // an invalid key.
-            Err(_) => Err(Refusal::TableFull),
         }
+        let Some(quota) = self.quota.as_ref().filter(|_| client & QUOTA_ON != 0) else {
+            return Ok(permit);
+        };
+        let refusal = match quota.take(&key, now_ns) {
+            Ok(true) => return Ok(permit),
+            Ok(false) => Refusal::PerIpQuota,
+            // The only error take returns.
+            Err(_) => Refusal::TableFull,
+        };
+        if permit.held {
+            // Give back the token the hold took; dropping the permit gives
+            // back the hold and the slot.
+            self.clients.refund(key.as_bytes(), now_ns, 1);
+        }
+        Err(refusal)
     }
 
     /// Count a refusal decided outside [`Admission::admit`], such as
@@ -479,15 +580,28 @@ impl Admission {
         self.clients.stats()
     }
 
-    /// Bytes allocated for the client table.
+    /// Bytes allocated for the client table and the quota table.
     pub fn memory(&self) -> usize {
-        self.clients.memory()
+        self.clients.memory() + self.quota.as_ref().map_or(0, QuotaTable::memory)
     }
 
     /// Run a round of idle-client removal over `nshards` shards of the
-    /// client table; see [`Table::sweep`].
+    /// client table and of the quota table; see [`Table::sweep`] and
+    /// [`QuotaTable::sweep`]. Returns the entries removed from both.
     pub fn sweep(&self, now_ns: u64, nshards: u32) -> usize {
         self.clients.sweep(now_ns, nshards)
+            + self.quota.as_ref().map_or(0, |q| q.sweep(now_ns, nshards))
+    }
+
+    /// The quota table's counters, for a listener started with a quota.
+    pub fn quota_stats(&self) -> Option<TableStats> {
+        self.quota.as_ref().map(QuotaTable::stats)
+    }
+
+    /// The client's connections in its quota window at `now_ns`, or `None`
+    /// for a listener without a quota table or a client it does not track.
+    pub fn quota_count(&self, key: &ClientKey, now_ns: u64) -> Option<u64> {
+        self.quota.as_ref()?.count(key, now_ns)
     }
 
     /// Holds a client has open, and its connection rate's arrival time,

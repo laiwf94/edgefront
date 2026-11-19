@@ -509,7 +509,7 @@ impl std::fmt::Debug for Table {
 /// More shards mean fewer threads meeting on one lock; with too few keys
 /// per shard, hashing imbalance fills some shards while others still have
 /// room.
-fn pick_shards(max_entries: u32) -> u32 {
+pub(crate) fn pick_shards(max_entries: u32) -> u32 {
     let mut n = DEFAULT_SHARDS;
     while n > 1 && max_entries / n < MIN_PER_SHARD {
         n >>= 1;
