@@ -34,6 +34,9 @@
 //! edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
 //!     Limiter decisions per second, Rust and optionally libpacer's
 //!     bench_limiter, at each thread count; prints a Markdown table.
+//! edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
+//!     The L4 proxy's bulk, latency and concurrent round trips, direct and
+//!     through each proxy given; prints a Markdown table.
 //! ```
 //!
 //! Exit codes: 0 on success, 2 for bad usage, 1 when the work fails.
@@ -57,6 +60,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench origin [--listen ADDR]
        edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
        edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
+       edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
 ";
 
 /// Why a command failed.
@@ -166,6 +170,7 @@ pub fn run(args: &[String]) -> Result<(), Failure> {
         "origin" => serve_origin(rest),
         "load" => load(rest),
         "limiter" => limiter(rest),
+        "l4" => l4(rest),
         "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -573,6 +578,27 @@ fn limiter(args: &[String]) -> Result<(), Failure> {
     };
     print!("{}", report.markdown());
     write_json(flags.one("json")?, &report)
+}
+
+fn l4(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(args, &["scenario", "pacerd", "edgefront", "json"], &[])?;
+    flags.no_positional()?;
+    let path = flags.required("scenario")?;
+    let s = crate::l4proxy::Scenario::parse(&read_text(path)?)
+        .map_err(|e| failed(format!("{path}: {e}")))?;
+    let mut targets = vec![crate::l4proxy::Target::Direct];
+    if let Some(p) = flags.one("pacerd")? {
+        targets.push(crate::l4proxy::Target::Pacerd(PathBuf::from(p)));
+    }
+    if let Some(e) = flags.one("edgefront")? {
+        targets.push(crate::l4proxy::Target::Edgefront(PathBuf::from(e)));
+    }
+    let work = std::env::temp_dir().join(format!("edgefront-bench-l4-{}", std::process::id()));
+    let points = crate::l4proxy::run(&s, &targets, &work).map_err(failed);
+    let _ = std::fs::remove_dir_all(&work);
+    let points = points?;
+    print!("{}", crate::l4proxy::markdown(&points));
+    write_json(flags.one("json")?, &points)
 }
 
 /// How long a whole run of `scenarios` against `targets` takes at least.

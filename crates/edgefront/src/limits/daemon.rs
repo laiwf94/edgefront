@@ -123,9 +123,11 @@ pub struct Daemon {
     drain_now: Notify,
     tasks: Arc<Tasks>,
     /// True once the drain timeout has run out: open connections close.
-    stop_tx: watch::Sender<bool>,
+    stop: Arc<super::stop::Stop>,
     /// True once draining: the accept loops stop and drop their sockets.
     accepting_tx: watch::Sender<bool>,
+    /// True once drained: the worker threads stop.
+    done_tx: watch::Sender<bool>,
 }
 
 /// Reads the config at `path`: a `.toml` file as the TOML limiter section,
@@ -192,8 +194,9 @@ impl Daemon {
             drain_reason: Mutex::new(None),
             drain_now: Notify::new(),
             tasks: Arc::default(),
-            stop_tx: watch::channel(false).0,
+            stop: Arc::default(),
             accepting_tx: watch::channel(true).0,
+            done_tx: watch::channel(false).0,
         })
     }
 
@@ -279,7 +282,7 @@ impl Daemon {
         Context {
             clock: self.clock,
             log: Arc::clone(&self.log),
-            stop: self.stop_tx.subscribe(),
+            stop: Arc::clone(&self.stop),
         }
     }
 
@@ -332,6 +335,14 @@ impl Daemon {
         });
     }
 
+    /// Lets the worker threads stop: the drain is over, or the daemon
+    /// failed to start.
+    pub fn finish(&self) {
+        self.accepting_tx.send_replace(false);
+        self.stop.raise();
+        self.done_tx.send_replace(true);
+    }
+
     /// Waits for the drain, then lets open connections finish until the
     /// drain timeout and closes what is left.
     pub async fn wait_and_drain(&self) {
@@ -369,23 +380,51 @@ impl Daemon {
                     .u64("worker", 0)
                     .u64("closing", self.open() as u64),
             );
-            self.stop_tx.send_replace(true);
+            self.stop.raise();
             self.tasks.wait_idle().await;
         }
     }
 }
 
-/// Binds every listener's socket, or names the first that failed.
-pub async fn bind(cfg: &LimiterConfig) -> Result<Vec<TcpListener>, (SocketAddr, io::Error)> {
-    let mut out = Vec::with_capacity(cfg.listeners.len());
+/// Binds `workers` sockets for every listener, `[worker][listener]`, or
+/// names the first address that failed, as pacerd's `open_listener` did:
+/// the address is first claimed once without `SO_REUSEPORT`, so a port
+/// someone else holds fails here, and then each worker gets a socket of
+/// its own with `SO_REUSEPORT`, among which the kernel spreads new
+/// connections (Linux balances them; macOS gives them to one socket).
+pub fn bind(
+    cfg: &LimiterConfig,
+    workers: u32,
+) -> Result<Vec<Vec<TcpListener>>, (SocketAddr, io::Error)> {
+    use tokio::net::TcpSocket;
+    let socket = |addr: SocketAddr| {
+        if addr.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        }
+    };
     for l in &cfg.listeners {
-        out.push(
-            TcpListener::bind(l.listen)
-                .await
-                .map_err(|e| (l.listen, e))?,
-        );
+        let probe = socket(l.listen).map_err(|e| (l.listen, e))?;
+        // A restart binds at once while old connections sit in TIME_WAIT.
+        probe.set_reuseaddr(true).map_err(|e| (l.listen, e))?;
+        probe.bind(l.listen).map_err(|e| (l.listen, e))?;
     }
-    Ok(out)
+    (0..workers.max(1))
+        .map(|_| {
+            cfg.listeners
+                .iter()
+                .map(|l| {
+                    let err = |e| (l.listen, e);
+                    let s = socket(l.listen).map_err(err)?;
+                    s.set_reuseaddr(true).map_err(err)?;
+                    s.set_reuseport(true).map_err(err)?;
+                    s.bind(l.listen).map_err(err)?;
+                    s.listen(1024).map_err(err)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Runs the daemon from `path` until it has drained. Exit codes as
@@ -403,8 +442,9 @@ pub fn run(path: PathBuf) -> ExitCode {
         }
     };
     log.set_level(config.log_level);
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(config.workers.max(1) as usize)
+    // The main thread runs signals, the admin socket and the drain; the
+    // connections run on `workers` threads of their own (see `serve`).
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
@@ -421,7 +461,7 @@ pub fn run(path: PathBuf) -> ExitCode {
 }
 
 async fn serve(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> ExitCode {
-    let sockets = match bind(&config).await {
+    let sockets = match bind(&config, config.workers) {
         Ok(s) => s,
         Err((addr, e)) => {
             drop(
@@ -464,9 +504,17 @@ async fn serve(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> ExitCode 
             return ExitCode::FAILURE;
         }
     };
-    for (l, s) in daemon.listeners.iter().zip(sockets) {
-        tokio::spawn(Arc::clone(&daemon).accept_loop(Arc::clone(l), s));
-    }
+    let workers = match start_workers(&daemon, sockets) {
+        Ok(w) => w,
+        Err(e) => {
+            drop(
+                log.line(LogLevel::Error, "cannot start worker")
+                    .str("error", &e.to_string()),
+            );
+            daemon.finish();
+            return ExitCode::FAILURE;
+        }
+    };
     let admin_task = admin.map(|a| tokio::spawn(super::admin::serve(a, Arc::clone(&daemon))));
     let cfg = daemon.config();
     drop(
@@ -477,6 +525,10 @@ async fn serve(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> ExitCode 
     );
     let sig = tokio::spawn(signals.run(Arc::clone(&daemon)));
     daemon.wait_and_drain().await;
+    daemon.finish();
+    for w in workers {
+        let _ = w.join();
+    }
     sig.abort();
     if let Some(t) = admin_task {
         t.abort();
@@ -487,6 +539,58 @@ async fn serve(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> ExitCode 
     }
     log.msg(LogLevel::Info, "drained");
     ExitCode::SUCCESS
+}
+
+/// Starts one thread per worker, as pacerd did, each with a
+/// single-threaded runtime that accepts on its own sockets and runs the
+/// connections it accepts to their end: a connection never moves between
+/// threads, and no wake crosses one. Each thread stops once the daemon
+/// has drained ([`Daemon::finish`]).
+fn start_workers(
+    daemon: &Arc<Daemon>,
+    sockets: Vec<Vec<TcpListener>>,
+) -> io::Result<Vec<std::thread::JoinHandle<()>>> {
+    let mut threads = Vec::with_capacity(sockets.len());
+    for (i, mine) in sockets.into_iter().enumerate() {
+        let copies = mine
+            .into_iter()
+            .map(TcpListener::into_std)
+            .collect::<io::Result<Vec<_>>>()?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let d = Arc::clone(daemon);
+        let mut done = d.done_tx.subscribe();
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("worker-{i}"))
+                .spawn(move || {
+                    rt.block_on(async move {
+                        for (l, s) in d.listeners.iter().zip(copies) {
+                            // into_std leaves the socket non-blocking.
+                            match TcpListener::from_std(s) {
+                                Ok(s) => {
+                                    tokio::spawn(Arc::clone(&d).accept_loop(Arc::clone(l), s));
+                                }
+                                Err(e) => {
+                                    drop(
+                                        d.log
+                                            .line(LogLevel::Error, "cannot listen")
+                                            .str("what", l.name())
+                                            .str("error", &e.to_string()),
+                                    );
+                                    d.drain("worker failure");
+                                }
+                            }
+                        }
+                        let _ = done.wait_for(|v| *v).await;
+                    });
+                })?,
+        );
+    }
+    // When the drain stops the accept loops, each drops its socket, and
+    // once all are closed new connections are refused.
+    Ok(threads)
 }
 
 /// SIGTERM and SIGINT drain; SIGHUP reloads.

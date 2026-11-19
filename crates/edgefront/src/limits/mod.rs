@@ -19,6 +19,7 @@ mod conn;
 mod daemon;
 mod log;
 mod stats;
+mod stop;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

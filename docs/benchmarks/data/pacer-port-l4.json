@@ -1,0 +1,84 @@
+{
+  "scenario": "l4-proxy",
+  "runs_per_session": 5,
+  "sessions": [
+    [
+      {
+        "target": "direct",
+        "bulk_mib_s": 18345.05587330288,
+        "p50_us": 42.75,
+        "p99_us": 82.709,
+        "trips_per_s": 291974.44354265096,
+        "cpu_us_per_trip": null
+      },
+      {
+        "target": "pacerd",
+        "bulk_mib_s": 6411.91965845883,
+        "p50_us": 93.542,
+        "p99_us": 143.375,
+        "trips_per_s": 117551.56615450371,
+        "cpu_us_per_trip": 22.5
+      },
+      {
+        "target": "edgefront",
+        "bulk_mib_s": 6244.714756469991,
+        "p50_us": 95.958,
+        "p99_us": 143.625,
+        "trips_per_s": 137734.99460262182,
+        "cpu_us_per_trip": 21.937499999999996
+      }
+    ],
+    [
+      {
+        "target": "direct",
+        "bulk_mib_s": 18969.037182383305,
+        "p50_us": 45.584,
+        "p99_us": 108.5,
+        "trips_per_s": 293211.6016500483,
+        "cpu_us_per_trip": null
+      },
+      {
+        "target": "pacerd",
+        "bulk_mib_s": 5819.158907863894,
+        "p50_us": 95.167,
+        "p99_us": 221.417,
+        "trips_per_s": 133748.8696715838,
+        "cpu_us_per_trip": 21.8125
+      },
+      {
+        "target": "edgefront",
+        "bulk_mib_s": 6025.574119453035,
+        "p50_us": 100.334,
+        "p99_us": 207.542,
+        "trips_per_s": 119610.51449444627,
+        "cpu_us_per_trip": 22.25
+      }
+    ],
+    [
+      {
+        "target": "direct",
+        "bulk_mib_s": 18102.377207622136,
+        "p50_us": 47.084,
+        "p99_us": 110.958,
+        "trips_per_s": 293288.41503941634,
+        "cpu_us_per_trip": null
+      },
+      {
+        "target": "pacerd",
+        "bulk_mib_s": 5716.321938657315,
+        "p50_us": 94.0,
+        "p99_us": 194.458,
+        "trips_per_s": 133032.0110612991,
+        "cpu_us_per_trip": 21.000000000000004
+      },
+      {
+        "target": "edgefront",
+        "bulk_mib_s": 6023.365168769177,
+        "p50_us": 95.417,
+        "p99_us": 173.125,
+        "trips_per_s": 126463.01905165383,
+        "cpu_us_per_trip": 22.625
+      }
+    ]
+  ]
+}

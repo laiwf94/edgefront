@@ -887,3 +887,38 @@ fn racing_accepts_never_exceed_the_quota() {
         (THREADS * ROUNDS - 500) as u64
     );
 }
+
+#[test]
+fn counters_added_from_many_threads_sum_across_their_stripes() {
+    let c = Arc::new(Counters::default());
+    let hs: Vec<_> = (0..40)
+        .map(|i| {
+            let c = Arc::clone(&c);
+            thread::spawn(move || {
+                for _ in 0..1000 {
+                    c.add(Stat::BytesUp, i + 1);
+                }
+                c.count("done");
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+    // 1000 * (1 + 2 + ... + 40)
+    assert_eq!(c.get(Stat::BytesUp), 820_000);
+    assert_eq!(c.get(Stat::ClosedDone), 40);
+    assert_eq!(std::mem::align_of::<Stripe>(), 128);
+    // Counters wrap at 2^64 as one sum, as pacerd's did.
+    let w = Counters::default();
+    w.add(Stat::BytesDown, u64::MAX);
+    thread::spawn({
+        let w = Arc::new(w);
+        move || {
+            w.add(Stat::BytesDown, 2);
+            assert_eq!(w.get(Stat::BytesDown), 1);
+        }
+    })
+    .join()
+    .unwrap();
+}

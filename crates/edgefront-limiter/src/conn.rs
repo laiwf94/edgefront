@@ -312,20 +312,47 @@ impl Stat {
     }
 }
 
-/// A listener's counters. Every worker adds to the same counters with
-/// relaxed atomic adds, and readers see each counter's latest value; a
-/// snapshot is not taken at one instant across counters, as pacerd's sum
-/// over workers was not.
+/// How many sets of counters a listener keeps, so threads adding at the
+/// same time mostly write different cache lines.
+const STRIPES: usize = 16;
+
+/// One set of counters, on cache lines of its own.
+#[derive(Debug, Default)]
+#[repr(align(128))]
+struct Stripe([AtomicU64; Stat::COUNT]);
+
+/// A listener's counters. pacerd kept one set per worker, written with
+/// plain stores, and summed them to read. Here each thread adds, with
+/// relaxed atomic adds, to one of [`STRIPES`] sets picked once per thread,
+/// so the data path's per-read byte counts from different worker threads
+/// do not fight over one cache line; reading sums the sets. A snapshot is
+/// not taken at one instant across counters, as pacerd's sum over workers
+/// was not.
 #[derive(Debug, Default)]
 pub struct Counters {
-    values: [AtomicU64; Stat::COUNT],
+    stripes: [Stripe; STRIPES],
+}
+
+/// This thread's stripe, assigned round robin on first use.
+fn stripe() -> usize {
+    use std::cell::Cell;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    thread_local! {
+        static MINE: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    MINE.with(|m| {
+        if m.get() == usize::MAX {
+            m.set(NEXT.fetch_add(1, Ordering::Relaxed) as usize % STRIPES);
+        }
+        m.get()
+    })
 }
 
 impl Counters {
     /// Add `n` to `stat`.
     #[inline]
     pub fn add(&self, stat: Stat, n: u64) {
-        self.values[stat.index()].fetch_add(n, Ordering::Relaxed);
+        self.stripes[stripe()].0[stat.index()].fetch_add(n, Ordering::Relaxed);
     }
 
     /// Count one close or refusal under its `reason`, as pacerd's
@@ -334,9 +361,11 @@ impl Counters {
         self.add(Stat::for_reason(reason), 1);
     }
 
-    /// The current value of `stat`.
+    /// The current value of `stat`, wrapping like the counters themselves.
     pub fn get(&self, stat: Stat) -> u64 {
-        self.values[stat.index()].load(Ordering::Relaxed)
+        self.stripes.iter().fold(0u64, |sum, s| {
+            sum.wrapping_add(s.0[stat.index()].load(Ordering::Relaxed))
+        })
     }
 
     /// Every counter with its name, in pacerd's order.

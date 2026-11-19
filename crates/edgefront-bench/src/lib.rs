@@ -30,12 +30,16 @@
 //!   tolerance, and fixed size ceilings.
 //! - [`limiter`]: limiter decisions per second at 1 to 16 threads, Rust
 //!   against libpacer's `bench_limiter` (`scenarios/limiter_decisions.toml`).
+//! - [`l4proxy`]: the L4 proxy's bulk throughput, round-trip latency and
+//!   concurrent round trips, direct, through pacerd and through
+//!   `edgefront limits` (`scenarios/l4_proxy.toml`).
 //! - [`cli`]: the `edgefront-bench` command line.
 
 pub mod cli;
 pub mod client;
 pub mod gate;
 pub mod histogram;
+pub mod l4proxy;
 pub mod limiter;
 pub mod load;
 pub mod measure;

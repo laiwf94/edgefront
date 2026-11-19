@@ -12,7 +12,6 @@ use edgefront_limiter::shape::Dir;
 use edgefront_limiter::slowloris::Check;
 use edgefront_limiter::{LogLevel, Refusal, Shaper, SlowCheck, Stat};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::daemon::{Clock, Listener};
@@ -121,16 +120,8 @@ impl Drop for ConnPace {
 pub struct Context {
     pub clock: Clock,
     pub log: Arc<super::log::Log>,
-    /// Becomes true when the drain timeout runs out.
-    pub stop: watch::Receiver<bool>,
-}
-
-/// What a connection is closed with when the drain ends it, as the
-/// relay's stop future gives it.
-async fn stopped(mut stop: watch::Receiver<bool>) -> CloseReason {
-    // A dropped sender means the daemon is gone: stop too.
-    let _ = stop.wait_for(|s| *s).await;
-    CloseReason::DrainTimeout
+    /// Raised when the drain timeout runs out.
+    pub stop: Arc<super::stop::Stop>,
 }
 
 /// Admits `stream` from `peer` on `listener`, or refuses it with nothing
@@ -206,7 +197,7 @@ pub async fn serve(
         l4::connect(cfg.upstream, relay.connect_timeout()),
         &relay,
         pace,
-        stopped(ctx.stop.clone()),
+        ctx.stop.flag(),
     )
     .await;
     listener.admission.counters().count(out.reason.as_str());
