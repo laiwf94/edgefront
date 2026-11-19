@@ -587,6 +587,28 @@ struct Outcome {
     result: Result<Answer, Failure>,
 }
 
+/// How close to a due time the dispatcher stops sleeping and spins.
+/// tokio's timer fires up to a millisecond late, which would show up in
+/// every response time; yielding through the last stretch instead puts
+/// each request on the wire within microseconds of its due time, and lets
+/// the dispatcher's thread run the worker it just woke.
+const SPIN: Duration = Duration::from_millis(2);
+
+/// Waits until `due`: a timer sleep, then yields for the last [`SPIN`].
+async fn wait_until(due: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= due {
+            return;
+        }
+        if due - now > SPIN {
+            sleep_until(due - SPIN).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 /// Hands each request to the workers at its due time, then closes the
 /// queue.
 async fn dispatch(phases: Vec<Phase>, start: Instant, jobs: mpsc::UnboundedSender<Job>) {
@@ -595,7 +617,7 @@ async fn dispatch(phases: Vec<Phase>, start: Instant, jobs: mpsc::UnboundedSende
     for (index, phase) in phases.iter().enumerate() {
         for k in 0..phase.requests() {
             let due = phase_start + phase.offset(k);
-            sleep_until(due).await;
+            wait_until(due).await;
             if jobs
                 .send(Job {
                     seq,
