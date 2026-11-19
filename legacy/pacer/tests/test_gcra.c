@@ -290,3 +290,104 @@ TEST(gcra_take_range_waits_for_the_minimum)
     CHECK_EQ_U64(pacer_gcra_take_range(&g, 10 * SEC, 0, 5, &d), 0);
     CHECK_EQ_U64(d.retry_after_ns, MS);
 }
+
+TEST(gcra_book_goes_into_debt_and_says_when)
+{
+    pacer_gcra g;
+    pacer_rate r = {1000, SEC, 100};
+    pacer_gcra_init(&g, &r);
+    pacer_decision d;
+    /* 30 of 100 available: a booking of 50 is due 20 ms later. */
+    CHECK_EQ_U64(pacer_gcra_take_upto(&g, SEC, 70, NULL), 70);
+    CHECK_EQ_U64(pacer_gcra_book(&g, SEC, 50, &d), 50);
+    CHECK_EQ_U64(d.granted, 50);
+    CHECK_EQ_U64(d.remaining, 0);
+    CHECK_EQ_U64(d.retry_after_ns, 20 * MS);
+    /* A booking that fits now is due at once. */
+    CHECK_EQ_U64(pacer_gcra_book(&g, 10 * SEC, 40, &d), 40);
+    CHECK_EQ_U64(d.remaining, 60);
+    CHECK_EQ_U64(d.retry_after_ns, 0);
+    /* A cost above the burst is lowered to the burst; 0 books nothing. */
+    CHECK_EQ_U64(pacer_gcra_book(&g, 20 * SEC, 1000, &d), 100);
+    CHECK_EQ_U64(pacer_gcra_book(&g, 20 * SEC, 0, &d), 0);
+    CHECK_EQ_U64(d.granted, 0);
+    /* Unused booked tokens go back. */
+    pacer_gcra_refund(&g, 20 * SEC, 100);
+    CHECK_EQ_U64(pacer_gcra_remaining(&g, 20 * SEC), 100);
+    CHECK_EQ_U64(pacer_gcra_book(&g, 20 * SEC, 10, NULL), 10);
+}
+
+struct waiter {
+    uint64_t due; /* when its booked quantum is due, 0 when it has none */
+    uint64_t got;
+};
+
+/* One wake of a consumer that reads 10 tokens at a time. With `book` it
+ * books the quantum it cannot have now; without, it only polls. */
+static void wake(pacer_gcra *g, struct waiter *w, uint64_t now, int book)
+{
+    pacer_decision d;
+    if (w->due != 0) {
+        if (now >= w->due) {
+            w->got += 10;
+            w->due = 0;
+        }
+        return;
+    }
+    if (pacer_gcra_take_range(g, now, 10, 10, &d) == 10) {
+        w->got += 10;
+    } else if (book) {
+        CHECK_EQ_U64(pacer_gcra_book(g, now, 10, &d), 10);
+        w->due = now + d.retry_after_ns;
+    }
+}
+
+TEST(gcra_book_serves_waiters_in_the_order_they_asked)
+{
+    /* Two consumers share an empty limiter and wake at the same moments,
+     * A always first. Polling, A takes every quantum: B is told the next
+     * one is free when A comes back for it. Booking, B's quantum goes
+     * ahead of A's next one and they take turns. */
+    for (int book = 0; book < 2; book++) {
+        pacer_gcra g;
+        pacer_rate r = {1000, SEC, 100};
+        pacer_gcra_init(&g, &r);
+        uint64_t now = SEC;
+        CHECK_EQ_U64(pacer_gcra_take_upto(&g, now, 100, NULL), 100);
+        struct waiter a = {0, 0}, b = {0, 0};
+        for (int turn = 0; turn < 100; turn++) {
+            now += 10 * MS; /* 10 tokens accrue */
+            wake(&g, &a, now, book);
+            wake(&g, &b, now, book);
+        }
+        if (!book) {
+            CHECK_EQ_U64(a.got, 1000);
+            CHECK_EQ_U64(b.got, 0);
+        } else {
+            /* They alternate: 1000 tokens accrued, 500 each, and A has
+             * already booked the next quantum. */
+            CHECK_EQ_U64(a.got, 500);
+            CHECK_EQ_U64(b.got, 500);
+            CHECK(a.due > now);
+        }
+    }
+}
+
+TEST(gcra_book_refuses_debt_past_the_limit)
+{
+    pacer_gcra g;
+    /* One token a day, a burst of 10: each token is 86400 s of debt, and
+     * 2^62 ticks is about 2.3 years, so about 840 bookings fit. */
+    pacer_rate r = {1, 86400 * SEC, 10};
+    pacer_gcra_init(&g, &r);
+    pacer_decision d;
+    uint64_t booked = 0;
+    while (pacer_gcra_book(&g, SEC, 1, &d) == 1) {
+        booked++;
+        CHECK(booked < 2000);
+    }
+    CHECK(booked > 800);
+    CHECK(booked < 900);
+    CHECK_EQ_U64(d.granted, 0);
+    CHECK(d.retry_after_ns > 365ull * 86400 * SEC);
+}
