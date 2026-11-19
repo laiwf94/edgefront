@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +44,7 @@ int proc_spawn(struct proc *p, const char *config_text, const char *const *args)
 {
     memset(p, 0, sizeof *p);
     p->pid = -1;
-    p->err_fd = -1;
+    p->log_fd = -1;
     snprintf(p->conf_path, sizeof p->conf_path, "/tmp/pacerd-test-XXXXXX");
     int cfd = mkstemp(p->conf_path);
     if (cfd < 0) {
@@ -55,8 +54,21 @@ int proc_spawn(struct proc *p, const char *config_text, const char *const *args)
     if (write_file(p->conf_path, config_text) != 0) {
         return -1;
     }
-    int pipefd[2];
-    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+    /* pacerd's output goes to a file, not a pipe. The test reads it only
+     * while it waits on a log line or an exit, and a pipe holds 64 KiB:
+     * a test that makes pacerd log more than that between two reads
+     * (connection churn logs a line per connection) would block every
+     * worker in write() until the next read, and pacerd would stop
+     * accepting and closing while the test looks at its stats (#236). */
+    snprintf(p->log_path, sizeof p->log_path, "/tmp/pacerd-log-XXXXXX");
+    int out = mkstemp(p->log_path);
+    if (out < 0) {
+        return -1;
+    }
+    p->log_fd = open(p->log_path, O_RDONLY | O_CLOEXEC);
+    if (p->log_fd < 0 || fcntl(out, F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(out, F_SETFL, O_APPEND) != 0) {
+        close(out);
         return -1;
     }
     const char *bin = getenv("PACERD_BIN"); // NOLINT(concurrency-mt-unsafe): env is never written
@@ -77,21 +89,19 @@ int proc_spawn(struct proc *p, const char *config_text, const char *const *args)
         if (harness_nofile > 0) {
             setrlimit(RLIMIT_NOFILE, &rl);
         }
-        dup2(pipefd[1], 1);
-        dup2(pipefd[1], 2);
+        dup2(out, 1);
+        dup2(out, 2);
         execv(argv[0], argv);
         _exit(127);
     }
     for (int i = 0; i < argc; i++) {
         free(argv[i]);
     }
+    close(out);
     if (pid < 0) {
         return -1;
     }
-    close(pipefd[1]);
-    fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
     p->pid = pid;
-    p->err_fd = pipefd[0];
     return 0;
 }
 
@@ -114,10 +124,10 @@ static void pump(struct proc *p)
 {
     for (;;) {
         size_t room = sizeof p->log - 1 - p->len;
-        if (room == 0 || p->err_fd < 0) {
+        if (room == 0 || p->log_fd < 0) {
             return;
         }
-        ssize_t r = read(p->err_fd, p->log + p->len, room);
+        ssize_t r = read(p->log_fd, p->log + p->len, room);
         if (r <= 0) {
             return;
         }
@@ -139,12 +149,11 @@ int proc_wait_log(struct proc *p, const char *needle, size_t *from, int timeout_
             }
             return 1;
         }
-        uint64_t now = now_ms();
-        if (now >= deadline) {
+        if (now_ms() >= deadline) {
             return 0;
         }
-        struct pollfd pfd = {p->err_fd, POLLIN, 0};
-        poll(&pfd, 1, (int)(deadline - now));
+        /* A file is always readable, so there is nothing to poll on. */
+        usleep(2000);
     }
 }
 
@@ -193,9 +202,13 @@ void proc_cleanup(struct proc *p)
         waitpid(p->pid, NULL, 0);
         p->pid = -1;
     }
-    if (p->err_fd >= 0) {
-        close(p->err_fd);
-        p->err_fd = -1;
+    if (p->log_fd >= 0) {
+        close(p->log_fd);
+        p->log_fd = -1;
+    }
+    if (p->log_path[0]) {
+        unlink(p->log_path);
+        p->log_path[0] = '\0';
     }
     if (p->conf_path[0]) {
         unlink(p->conf_path);
