@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cachet::cluster::{PurgeMessage, sign};
 use cachet::config::Secrets;
-use std::time::Duration;
 
 use cachet::node::{self, Listeners, Node};
 use common::{Scratch, TOKEN, TestOrigin, eventually, handler, http, node_config, reply, secrets};
@@ -35,19 +34,43 @@ fn reserve() -> Reserved {
     bound("127.0.0.1:0".parse().unwrap()).unwrap()
 }
 
-/// Takes `addr` back right after the node holding it shut down, waiting
-/// out the moment the closing listener still owns it.
-async fn reserve_again(addr: SocketAddr) -> Reserved {
-    for _ in 0..50 {
-        match bound(addr) {
-            Ok(r) => return r,
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Err(e) => panic!("cannot reserve {addr}: {e}"),
+/// The admin port of a node that goes down and comes back. A socket bound
+/// with `SO_REUSEPORT` that never listens holds the port for the whole
+/// test, so nothing outside the test can take it while the node is down,
+/// and a peer connecting then is refused, as by a free port. Each start of
+/// the node binds its own `SO_REUSEPORT` socket to the same address.
+struct Held {
+    addr: SocketAddr,
+    _keeper: TcpSocket,
+}
+
+/// A socket bound to `addr` with `SO_REUSEPORT`. The keeper leaves out
+/// `SO_REUSEADDR`: on Linux two `SO_REUSEADDR` sockets that are not
+/// listening may share a port, so another socket could join it.
+fn reuseport(addr: SocketAddr, reuseaddr: bool) -> std::io::Result<Reserved> {
+    let socket = TcpSocket::new_v4()?;
+    socket.set_reuseaddr(reuseaddr)?;
+    socket.set_reuseport(true)?;
+    socket.bind(addr)?;
+    let addr = socket.local_addr()?;
+    Ok(Reserved { addr, socket })
+}
+
+impl Held {
+    fn new() -> Held {
+        let keeper = reuseport("127.0.0.1:0".parse().unwrap(), false).unwrap();
+        Held {
+            addr: keeper.addr,
+            _keeper: keeper.socket,
         }
     }
-    panic!("{addr} is still in use");
+
+    /// The held port, reserved for the node's next start.
+    fn reserve(&self) -> Reserved {
+        let r = reuseport(self.addr, true).unwrap();
+        assert_eq!(r.addr, self.addr);
+        r
+    }
 }
 
 /// The listeners for a node: a fresh proxy port and the reserved admin port.
@@ -172,19 +195,22 @@ async fn a_purge_spreads_through_a_relay() {
 #[tokio::test]
 async fn a_peer_that_was_down_gets_the_purge_when_it_returns() {
     let o = tagged_origin().await;
-    let (ra, rb) = (reserve(), reserve());
-    let (a, b) = (ra.addr, rb.addr);
+    let ra = reserve();
+    let a = ra.addr;
+    let held_b = Held::new();
+    let b = held_b.addr;
     let dir = Scratch::new("partition");
     let disk = format!(
         "[cache.disk]\npath = \"{}\"\nmax_bytes = 100000000\n",
         dir.0.display()
     );
-    let nb = start("edge-b", rb, o.addr, &[("edge-a", a)], &disk).await;
+    let nb = start("edge-b", held_b.reserve(), o.addr, &[("edge-a", a)], &disk).await;
     let b_proxy = nb.proxy_addr;
     http("GET", b_proxy, "/news", &[], "").await;
     nb.shutdown().await;
-    // Hold edge-b's admin port while it is down, so the restart gets it.
-    let rb = reserve_again(b).await;
+    // edge-b's admin port stays held while it is down, so the restart gets it.
+    let taken = std::net::TcpListener::bind(b).map(|_| ()).unwrap_err();
+    assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse);
 
     let na = start("edge-a", ra, o.addr, &[("edge-b", b)], "").await;
     purge(&na, r#"{"tags": ["news"]}"#).await;
@@ -194,7 +220,7 @@ async fn a_peer_that_was_down_gets_the_purge_when_it_returns() {
     .await;
 
     // edge-b comes back with its disk tier still holding the purged page.
-    let nb = start("edge-b", rb, o.addr, &[("edge-a", a)], &disk).await;
+    let nb = start("edge-b", held_b.reserve(), o.addr, &[("edge-a", a)], &disk).await;
     eventually("purge delivered after the partition", || {
         nb.proxy.metrics.purges_peer.load(Ordering::Relaxed) == 1
     })
