@@ -289,9 +289,23 @@ async fn a_slow_reader_does_not_make_the_proxy_buffer_more() {
     let up = upstream(Mode::Source(TOTAL)).await;
     let mut p = proxy(up.addr, RelayConfig::default()).await;
     let mut c = TcpStream::connect(p.addr).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let stalled = up.sent.load(Ordering::Relaxed);
-    assert!(stalled > 0);
+    // Wait for the upstream to stall rather than for a fixed time: under
+    // ThreadSanitizer the first chunk can take over a second to go out.
+    // Stalled means it moved under 1 MiB in 300 ms after starting.
+    let start = Instant::now();
+    let mut before = up.sent.load(Ordering::Relaxed);
+    let stalled = loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = up.sent.load(Ordering::Relaxed);
+        if now > 0 && now - before <= 1 << 20 {
+            break now;
+        }
+        before = now;
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the upstream never stalled: {now} bytes"
+        );
+    };
     assert!(
         stalled < 32 << 20,
         "the upstream got {stalled} bytes out to a client that reads nothing"
