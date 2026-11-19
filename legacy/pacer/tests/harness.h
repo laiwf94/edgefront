@@ -10,9 +10,10 @@
 
 struct proc {
     pid_t pid;
-    int err_fd;
+    int log_fd; /* reads pacerd's stdout and stderr from log_path */
     size_t len;
     char conf_path[64];
+    char log_path[64];
     char log[PROC_LOG_MAX];
 };
 

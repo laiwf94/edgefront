@@ -154,6 +154,31 @@ TEST(failure_upstream_closes_first_while_client_sends)
     finish();
 }
 
+TEST(failure_unread_output_never_blocks_pacerd)
+{
+    /* pacerd writes a line or two per connection. The test reads none of
+     * them while it connects, so far more than a pipe's 64 KiB piles up;
+     * every connection must still be served (#236). */
+    port = free_port();
+    snprintf(sock, sizeof sock, "/tmp/pacerd-fail-%d-%u.sock", (int)getpid(), port);
+    CHECK_EQ_INT(upstream_start(&u, UP_ECHO, 0), 0);
+    char conf[2048], debug[2100];
+    config(conf, sizeof conf, "");
+    snprintf(debug, sizeof debug, "log_level debug\n%s", conf);
+    CHECK_EQ_INT(proc_start(&p, debug), 0);
+    int served = 0;
+    for (int i = 0; i < 800 && served == i; i++) {
+        int fd = tcp_connect(port);
+        served += works(fd);
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    CHECK_EQ_INT(served, 800);
+    finish();
+    CHECK(p.len > (size_t)128 * 1024);
+}
+
 struct churner {
     uint16_t port;
     char src[16];
