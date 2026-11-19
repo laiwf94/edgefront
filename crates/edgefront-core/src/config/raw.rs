@@ -248,6 +248,8 @@ raw_struct!(RawTls, "an object" {
     handshake_timeout: Option<Duration>,
     max_concurrent_handshakes: Option<i64>,
     strict_sni: bool,
+    ocsp_stapling: Option<bool>,
+    ocsp_responder: String,
 });
 
 raw_struct!(RawCertificate, "an object" {

@@ -340,6 +340,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "proptest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

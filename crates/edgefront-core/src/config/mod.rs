@@ -176,6 +176,36 @@ pub struct Tls {
     /// handshakes without one) instead of answering with the first
     /// certificate.
     pub strict_sni: bool,
+    /// OCSP stapling; on by default for every certificate whose chain has
+    /// its issuer and whose leaf names an OCSP responder.
+    #[serde(skip_serializing_if = "Ocsp::is_default")]
+    pub ocsp: Ocsp,
+}
+
+/// OCSP stapling settings (`ocsp_stapling` and `ocsp_responder` in the
+/// `tls` block).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Ocsp {
+    pub stapling: bool,
+    /// An `http://` responder used instead of each certificate's own, as
+    /// nginx's `ssl_stapling_responder`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responder: Option<String>,
+}
+
+impl Default for Ocsp {
+    fn default() -> Self {
+        Ocsp {
+            stapling: true,
+            responder: None,
+        }
+    }
+}
+
+impl Ocsp {
+    fn is_default(&self) -> bool {
+        *self == Ocsp::default()
+    }
 }
 
 /// The lowest TLS version the listener accepts.

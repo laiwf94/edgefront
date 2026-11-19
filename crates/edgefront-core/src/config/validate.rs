@@ -9,8 +9,8 @@ use std::time::Duration;
 use super::raw::{self, RawCluster, RawConfig, RawTls};
 use super::{
     Budget, Certificate, CipherSuite, Cluster, Config, ConfigError, Endpoint, FieldError,
-    HealthCheck, IpPrefix, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion, defaults, go,
-    limits,
+    HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion, defaults,
+    go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -302,6 +302,9 @@ impl Validator {
             limits::MAX_CONCURRENT_HANDSHAKE_CAP.into(),
         );
 
+        if !rt.ocsp_responder.is_empty() && !rt.ocsp_responder.starts_with("http://") {
+            self.add(format!("{path}.ocsp_responder"), "must be an http:// URL");
+        }
         let certs = rt.certificates.as_deref().unwrap_or_default();
         if certs.is_empty() {
             self.add(
@@ -365,6 +368,10 @@ impl Validator {
             handshake_timeout: to_std(handshake_timeout),
             max_concurrent_handshakes: narrow(max_concurrent_handshakes),
             strict_sni: rt.strict_sni,
+            ocsp: Ocsp {
+                stapling: rt.ocsp_stapling.unwrap_or(true),
+                responder: (!rt.ocsp_responder.is_empty()).then(|| rt.ocsp_responder.clone()),
+            },
         }
     }
 

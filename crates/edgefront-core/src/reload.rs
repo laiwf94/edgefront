@@ -34,10 +34,12 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::admin::{self, Api, Control, ProxyState};
+use crate::clock::MonotonicClock;
 use crate::config::{Config, go};
 use crate::listener::{self, Handler, ServeReport, ServerLimits};
 use crate::telemetry::metrics::TlsMetrics;
-use crate::tls::{Acceptor, Snapshot, Store};
+use crate::tls::ocsp::{Stapler, Staples, Wall};
+use crate::tls::{Acceptor, Shared, Snapshot, Store, TicketKeys, tickets};
 
 /// The settings steer read from its environment, under a prefix
 /// (`EDGEFRONT` for the binary, as `STEER` was steer's).
@@ -114,6 +116,9 @@ pub fn loopback(addr: &str) -> bool {
 pub struct Loaded {
     pub config: Config,
     pub tls: Option<Arc<Snapshot>>,
+    /// What every later snapshot shares with this one: the session ticket
+    /// keys, rotated hourly on the monotonic clock.
+    pub shared: Shared,
 }
 
 /// Loads and checks `path` as steer's `loadConfig` and `loadTLS` did: a
@@ -122,6 +127,23 @@ pub struct Loaded {
 /// that still serve (expired, not yet valid, a name not covered) are
 /// logged as `tls certificate` warnings.
 pub fn load(path: &str, settings: &Settings, prefix: &str) -> Result<Loaded, String> {
+    let tickets = TicketKeys::new(MonotonicClock::shared(), tickets::DEFAULT_PERIOD)
+        .map_err(|e| format!("cannot make session ticket keys: {e}"))?;
+    let shared = Shared {
+        tickets: Some(tickets),
+        staples: Some(Arc::new(Staples::default())),
+    };
+    load_with(path, settings, prefix, shared)
+}
+
+/// Like [`load`], with the snapshot sharing `shared` (a reload passes the
+/// running listener's).
+pub fn load_with(
+    path: &str,
+    settings: &Settings,
+    prefix: &str,
+    shared: Shared,
+) -> Result<Loaded, String> {
     let config = Config::load(path).map_err(|e| format!("{path}: {e}"))?;
     if settings.admin_token.is_empty() && !loopback(&config.admin_listen) {
         return Err(format!(
@@ -132,14 +154,18 @@ pub fn load(path: &str, settings: &Settings, prefix: &str) -> Result<Loaded, Str
     let tls = match &config.tls {
         None => None,
         Some(t) => {
-            let snapshot = Snapshot::load(t).map_err(|e| format!("{path}: {e}"))?;
+            let snapshot = Snapshot::load_with(t, &shared).map_err(|e| format!("{path}: {e}"))?;
             for problem in snapshot.warnings(SystemTime::now()) {
                 tracing::warn!(problem = problem.as_str(), "tls certificate");
             }
             Some(Arc::new(snapshot))
         }
     };
-    Ok(Loaded { config, tls })
+    Ok(Loaded {
+        config,
+        tls,
+        shared,
+    })
 }
 
 /// What [`run`] serves and reloads: the proxy, seen through what its
@@ -178,6 +204,7 @@ pub struct Lifecycle<S> {
     settings: Settings,
     prefix: String,
     tls: Option<Arc<Store>>,
+    shared: Shared,
     /// One reload at a time, from the admin API or SIGHUP.
     reloading: tokio::sync::Mutex<()>,
 }
@@ -215,7 +242,12 @@ impl<S: Service> Lifecycle<S> {
             return Err("tls cannot be turned on or off by a reload; restart edgefront".to_owned());
         }
         drop(config);
-        load(&self.path, &self.settings, &self.prefix)
+        load_with(
+            &self.path,
+            &self.settings,
+            &self.prefix,
+            self.shared.clone(),
+        )
     }
 }
 
@@ -414,6 +446,7 @@ pub async fn run<S: Service>(
         settings: settings.clone(),
         prefix: prefix.to_owned(),
         tls: store.clone(),
+        shared: loaded.shared,
         reloading: tokio::sync::Mutex::new(()),
     });
     let api = Arc::new(
@@ -455,6 +488,20 @@ pub async fn run<S: Service>(
             until_stopped(stopped.clone()),
         )),
         Some(store) => {
+            if let (Some(tls), Some(staples)) = (&config.tls, &lifecycle.shared.staples)
+                && tls.ocsp.stapling
+            {
+                let stapler = Stapler::new(
+                    Arc::clone(&store),
+                    Arc::clone(staples),
+                    Wall::system(),
+                    tls.ocsp.responder.clone(),
+                );
+                let mut stop = stopped.clone();
+                tokio::spawn(stapler.run(MonotonicClock::shared(), async move {
+                    let _ = stop.wait_for(|s| *s).await;
+                }));
+            }
             let acceptor = Acceptor::new(store, None);
             let in_progress = Arc::downgrade(&acceptor);
             let metrics = service.tls_metrics(Box::new(move || {

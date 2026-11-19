@@ -19,6 +19,7 @@ use super::listener::Snapshot;
 #[derive(Debug)]
 pub struct Store {
     current: RwLock<Arc<Snapshot>>,
+    swapped: tokio::sync::Notify,
 }
 
 impl Store {
@@ -26,12 +27,20 @@ impl Store {
     pub fn new(snapshot: Arc<Snapshot>) -> Arc<Store> {
         Arc::new(Store {
             current: RwLock::new(snapshot),
+            swapped: tokio::sync::Notify::new(),
         })
     }
 
     /// Makes `snapshot` serve every handshake that starts from now on.
     pub fn swap(&self, snapshot: Arc<Snapshot>) {
         *self.current.write().unwrap_or_else(|p| p.into_inner()) = snapshot;
+        self.swapped.notify_waiters();
+    }
+
+    /// Resolves at the next [`swap`](Self::swap) after it is polled or
+    /// [enabled](tokio::sync::futures::Notified::enable).
+    pub fn swapped(&self) -> tokio::sync::futures::Notified<'_> {
+        self.swapped.notified()
     }
 
     /// The snapshot new handshakes use.

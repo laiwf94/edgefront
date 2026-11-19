@@ -55,6 +55,7 @@ pub fn tls_config(certs: Vec<Certificate>) -> Tls {
         handshake_timeout: Duration::from_secs(2),
         max_concurrent_handshakes: 64,
         strict_sni: false,
+        ocsp: Default::default(),
     }
 }
 
@@ -266,4 +267,26 @@ impl Client {
     pub fn is_open(&self) -> bool {
         !self.send.is_closed()
     }
+}
+
+/// Connects with `cfg` (and its session cache), sends one request so the
+/// server's tickets are read, and returns whether the handshake resumed.
+pub async fn resumed(addr: std::net::SocketAddr, sni: &str, cfg: &Arc<ClientConfig>) -> bool {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = ServerName::try_from(sni.to_owned()).unwrap();
+    let s = tokio_rustls::TlsConnector::from(Arc::clone(cfg))
+        .connect(name, tcp)
+        .await
+        .unwrap();
+    let kind = s.get_ref().1.handshake_kind();
+    let (mut send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(s))
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    let req = http::Request::get("/")
+        .header("host", "edge.test")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    assert_eq!(send.send_request(req).await.unwrap().status(), 200);
+    kind == Some(rustls::HandshakeKind::Resumed)
 }

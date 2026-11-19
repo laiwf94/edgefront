@@ -1,5 +1,8 @@
 //! Just enough DER to read what the TLS edge needs from an X.509
-//! certificate: its validity period and subject alternative names.
+//! certificate (its validity period, subject alternative names, OCSP
+//! responder, key usages, and the parts an OCSP request or a signature
+//! check is built from), and to write the few structures it sends: OCSP
+//! requests and ACME certificate signing requests.
 //!
 //! rustls checks chains and names itself but does not expose a
 //! certificate's fields, and the store needs them to build its SNI table
@@ -10,13 +13,17 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Tags this module reads.
-pub(crate) mod tag {
+/// Tags this module reads and writes.
+pub mod tag {
     pub const BOOLEAN: u8 = 0x01;
     pub const INTEGER: u8 = 0x02;
     pub const BIT_STRING: u8 = 0x03;
     pub const OCTET_STRING: u8 = 0x04;
+    pub const NULL: u8 = 0x05;
     pub const OID: u8 = 0x06;
+    pub const ENUMERATED: u8 = 0x0a;
+    pub const UTF8_STRING: u8 = 0x0c;
+    pub const SET: u8 = 0x31;
     pub const UTC_TIME: u8 = 0x17;
     pub const GENERALIZED_TIME: u8 = 0x18;
     pub const SEQUENCE: u8 = 0x30;
@@ -44,7 +51,7 @@ impl std::error::Error for Malformed {}
 
 /// Reads DER values one after another from a byte string.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     rest: &'a [u8],
 }
 
@@ -147,30 +154,67 @@ pub struct CertFields {
 /// The DER of `2.5.29.17`, subjectAltName.
 const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 
-/// The parts of a certificate's tbsCertificate this module reads.
-pub(crate) struct Tbs<'a> {
+/// The parts of a certificate.
+#[derive(Debug, Clone)]
+pub struct Tbs<'a> {
+    /// The whole tbsCertificate, tag and length included: what the
+    /// signature covers.
+    pub signed: &'a [u8],
+    /// The signature algorithm's OID.
+    pub signature_algorithm: &'a [u8],
+    /// The signature, without the BIT STRING's unused-bits byte.
+    pub signature: &'a [u8],
+    /// The serial number's contents.
+    pub serial: &'a [u8],
+    /// The issuer Name, tag and length included.
+    pub issuer: &'a [u8],
+    /// The subject Name, tag and length included.
+    pub subject: &'a [u8],
+    /// The SubjectPublicKeyInfo, tag and length included.
+    pub spki: &'a [u8],
+    /// The subjectPublicKey bits, without the unused-bits byte: what ring
+    /// verifies with, and what an OCSP issuer key hash covers.
+    pub public_key: &'a [u8],
+    /// The public key algorithm's OID.
+    pub key_algorithm: &'a [u8],
     pub validity: Reader<'a>,
     /// The extensions as (OID, critical, value) triples.
     pub extensions: Vec<(&'a [u8], bool, &'a [u8])>,
 }
 
-/// Splits a certificate into its tbsCertificate fields.
-pub(crate) fn tbs(cert: &[u8]) -> Result<Tbs<'_>, Malformed> {
+/// A BIT STRING's bits, which must be whole bytes.
+pub fn bits(contents: &[u8]) -> Result<&[u8], Malformed> {
+    match contents.split_first() {
+        Some((0, rest)) => Ok(rest),
+        _ => Err(Malformed),
+    }
+}
+
+/// Splits a certificate into its parts.
+pub fn tbs(cert: &[u8]) -> Result<Tbs<'_>, Malformed> {
     let mut outer = Reader::new(cert);
     let mut certificate = outer.sequence()?;
     outer.finish()?;
-    let mut tbs = certificate.sequence()?;
-    certificate.read(tag::SEQUENCE)?; // signatureAlgorithm
-    certificate.read(tag::BIT_STRING)?; // signatureValue
+    let (t, contents, signed) = certificate.any()?;
+    if t != tag::SEQUENCE {
+        return Err(Malformed);
+    }
+    let mut tbs = Reader::new(contents);
+    let mut alg = certificate.sequence()?;
+    let signature_algorithm = alg.read(tag::OID)?;
+    let signature = bits(certificate.read(tag::BIT_STRING)?)?;
     certificate.finish()?;
 
     tbs.optional(tag::context(0))?; // version
-    tbs.read(tag::INTEGER)?; // serialNumber
+    let serial = tbs.read(tag::INTEGER)?;
     tbs.read(tag::SEQUENCE)?; // signature
-    tbs.read(tag::SEQUENCE)?; // issuer
+    let issuer = whole(&mut tbs, tag::SEQUENCE)?;
     let validity = tbs.sequence()?;
-    tbs.read(tag::SEQUENCE)?; // subject
-    tbs.read(tag::SEQUENCE)?; // subjectPublicKeyInfo
+    let subject = whole(&mut tbs, tag::SEQUENCE)?;
+    let spki = whole(&mut tbs, tag::SEQUENCE)?;
+    let mut info = Reader::new(spki).sequence()?;
+    let key_algorithm = info.sequence()?.read(tag::OID)?;
+    let public_key = bits(info.read(tag::BIT_STRING)?)?;
     tbs.optional(tag::context_primitive(1))?; // issuerUniqueID
     tbs.optional(tag::context_primitive(2))?; // subjectUniqueID
     let mut extensions = Vec::new();
@@ -194,9 +238,207 @@ pub(crate) fn tbs(cert: &[u8]) -> Result<Tbs<'_>, Malformed> {
     }
     tbs.finish()?;
     Ok(Tbs {
+        signed,
+        signature_algorithm,
+        signature,
+        serial,
+        issuer,
+        subject,
+        spki,
+        public_key,
+        key_algorithm,
         validity,
         extensions,
     })
+}
+
+/// Reads a value with tag `want` and returns its whole encoding.
+pub fn whole<'a>(r: &mut Reader<'a>, want: u8) -> Result<&'a [u8], Malformed> {
+    let (t, _, all) = r.any()?;
+    if t != want {
+        return Err(Malformed);
+    }
+    Ok(all)
+}
+
+/// The DER of `1.3.6.1.5.5.7.1.1`, authorityInfoAccess.
+const OID_AUTHORITY_INFO_ACCESS: &[u8] = &[0x2b, 6, 1, 5, 5, 7, 1, 1];
+/// The DER of `1.3.6.1.5.5.7.48.1`, id-ad-ocsp.
+const OID_AD_OCSP: &[u8] = &[0x2b, 6, 1, 5, 5, 7, 48, 1];
+/// The DER of `2.5.29.37`, extKeyUsage.
+const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+/// The DER of `1.3.6.1.5.5.7.3.9`, id-kp-OCSPSigning.
+pub const OID_KP_OCSP_SIGNING: &[u8] = &[0x2b, 6, 1, 5, 5, 7, 3, 9];
+
+impl Tbs<'_> {
+    /// The OCSP responder URLs from authorityInfoAccess.
+    pub fn ocsp_urls(&self) -> Result<Vec<String>, Malformed> {
+        let mut out = Vec::new();
+        for (oid, _, value) in &self.extensions {
+            if *oid != OID_AUTHORITY_INFO_ACCESS {
+                continue;
+            }
+            let mut outer = Reader::new(value);
+            let mut list = outer.sequence()?;
+            outer.finish()?;
+            while !list.is_empty() {
+                let mut ad = list.sequence()?;
+                let method = ad.read(tag::OID)?;
+                let (t, name, _) = ad.any()?;
+                if method == OID_AD_OCSP && t == tag::context_primitive(6) {
+                    out.push(std::str::from_utf8(name).map_err(|_| Malformed)?.to_owned());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The extended key usage OIDs, if the extension is present.
+    pub fn extended_key_usage(&self) -> Result<Option<Vec<&[u8]>>, Malformed> {
+        for (oid, _, value) in &self.extensions {
+            if *oid != OID_EXT_KEY_USAGE {
+                continue;
+            }
+            let mut outer = Reader::new(value);
+            let mut list = outer.sequence()?;
+            outer.finish()?;
+            let mut out = Vec::new();
+            while !list.is_empty() {
+                out.push(list.read(tag::OID)?);
+            }
+            return Ok(Some(out));
+        }
+        Ok(None)
+    }
+}
+
+/// Writing DER: each function returns one whole value.
+pub mod write {
+    use super::tag;
+    use std::time::SystemTime;
+
+    /// A value with `tag` around `contents`.
+    pub fn tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(contents.len() + 6);
+        out.push(tag);
+        let n = contents.len();
+        if n < 0x80 {
+            out.push(n as u8);
+        } else {
+            let bytes = n.to_be_bytes();
+            let skip = bytes.iter().take_while(|&&b| b == 0).count();
+            out.push(0x80 | (bytes.len() - skip) as u8);
+            out.extend_from_slice(&bytes[skip..]);
+        }
+        out.extend_from_slice(contents);
+        out
+    }
+
+    /// A SEQUENCE of already encoded values.
+    pub fn sequence(parts: &[&[u8]]) -> Vec<u8> {
+        tlv(tag::SEQUENCE, &parts.concat())
+    }
+
+    /// A SET of already encoded values, sorted as DER requires.
+    pub fn set(parts: &[&[u8]]) -> Vec<u8> {
+        let mut sorted = parts.to_vec();
+        sorted.sort();
+        tlv(tag::SET, &sorted.concat())
+    }
+
+    /// An INTEGER from big-endian unsigned bytes.
+    pub fn unsigned(be: &[u8]) -> Vec<u8> {
+        let trimmed = match be.iter().position(|&b| b != 0) {
+            Some(i) => &be[i..],
+            None => &[0u8][..],
+        };
+        let mut c = Vec::with_capacity(trimmed.len() + 1);
+        if trimmed[0] & 0x80 != 0 {
+            c.push(0);
+        }
+        c.extend_from_slice(trimmed);
+        tlv(tag::INTEGER, &c)
+    }
+
+    /// An INTEGER whose contents are already DER (a serial number read
+    /// from a certificate).
+    pub fn integer_raw(contents: &[u8]) -> Vec<u8> {
+        tlv(tag::INTEGER, contents)
+    }
+
+    /// An OBJECT IDENTIFIER from its encoded contents.
+    pub fn oid(contents: &[u8]) -> Vec<u8> {
+        tlv(tag::OID, contents)
+    }
+
+    pub fn octet_string(b: &[u8]) -> Vec<u8> {
+        tlv(tag::OCTET_STRING, b)
+    }
+
+    /// A BIT STRING of whole bytes.
+    pub fn bit_string(b: &[u8]) -> Vec<u8> {
+        let mut c = Vec::with_capacity(b.len() + 1);
+        c.push(0);
+        c.extend_from_slice(b);
+        tlv(tag::BIT_STRING, &c)
+    }
+
+    pub fn null() -> Vec<u8> {
+        vec![tag::NULL, 0]
+    }
+
+    pub fn boolean(b: bool) -> Vec<u8> {
+        vec![tag::BOOLEAN, 1, if b { 0xff } else { 0 }]
+    }
+
+    pub fn enumerated(n: u8) -> Vec<u8> {
+        tlv(tag::ENUMERATED, &[n])
+    }
+
+    pub fn utf8(s: &str) -> Vec<u8> {
+        tlv(tag::UTF8_STRING, s.as_bytes())
+    }
+
+    /// `[n]` EXPLICIT around an encoded value.
+    pub fn explicit(n: u8, inner: &[u8]) -> Vec<u8> {
+        tlv(tag::context(n), inner)
+    }
+
+    /// `[n]` IMPLICIT on a primitive's contents.
+    pub fn implicit(n: u8, contents: &[u8]) -> Vec<u8> {
+        tlv(tag::context_primitive(n), contents)
+    }
+
+    /// A GeneralizedTime, `YYYYMMDDHHMMSSZ`.
+    pub fn generalized_time(t: SystemTime) -> Vec<u8> {
+        let secs = match t.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs() as i64),
+        };
+        let (y, m, d) = super::civil_from_days(secs.div_euclid(86_400));
+        let rem = secs.rem_euclid(86_400);
+        let text = format!(
+            "{y:04}{m:02}{d:02}{:02}{:02}{:02}Z",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        );
+        tlv(tag::GENERALIZED_TIME, text.as_bytes())
+    }
+}
+
+/// The date of a day count from 1970-01-01 (Howard Hinnant's
+/// `civil_from_days`).
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
 }
 
 /// Reads the validity period and subject alternative names of a DER
@@ -242,7 +484,7 @@ pub fn cert_fields(cert: &[u8]) -> Result<CertFields, Malformed> {
 
 /// Reads a UTCTime or GeneralizedTime in the forms RFC 5280 allows:
 /// `YYMMDDHHMMSSZ` and `YYYYMMDDHHMMSSZ`.
-pub(crate) fn time(r: &mut Reader<'_>) -> Result<SystemTime, Malformed> {
+pub fn time(r: &mut Reader<'_>) -> Result<SystemTime, Malformed> {
     let (tag, contents, _) = r.any()?;
     let (year, rest) = match tag {
         tag::UTC_TIME if contents.len() == 13 => {
@@ -302,7 +544,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 
 /// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
 /// `days_from_civil`).
-pub(crate) fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
+pub fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
     let y = i64::from(year) - i64::from(month <= 2);
     let era = y.div_euclid(400);
     let yoe = y - era * 400;

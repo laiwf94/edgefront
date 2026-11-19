@@ -693,3 +693,64 @@ async fn reload_100_times_under_load() {
     assert_eq!(presented(&s), "exact");
     server.shutdown().await;
 }
+
+/// Session tickets resume across three hourly rotations, each followed by
+/// a reload: every snapshot shares the listener's ticket keys, and a
+/// ticket from before a rotation still decrypts under the previous key.
+/// A ticket two rotations old does not.
+#[tokio::test]
+async fn resumption_survives_three_rotations_across_reloads() {
+    use edgefront_core::clock::{Clock, ManualClock};
+    use edgefront_core::tls::{Shared, TicketKeys};
+
+    let clock = Arc::new(ManualClock::new());
+    let keys = TicketKeys::new(
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    let shared = Shared {
+        tickets: Some(Arc::clone(&keys)),
+        staples: None,
+    };
+    let snapshot = |certs| Arc::new(Snapshot::load_with(&tls_config(certs), &shared).unwrap());
+    let server = Server::start(Acceptor::new(
+        Store::new(snapshot(vec![cert("exact", &[])])),
+        None,
+    ))
+    .await;
+    for version in [false, true] {
+        let opts = ClientOpts {
+            max_tls12: version,
+            ..ClientOpts::default()
+        };
+        let cfg = client_config(&opts);
+        assert!(
+            !resumed(server.addr, "api.example.com", &cfg).await,
+            "the first handshake is full"
+        );
+        for round in 0..3 {
+            clock.advance(Duration::from_secs(3600));
+            let certs = if round % 2 == 0 { "rotated" } else { "exact" };
+            server
+                .acceptor
+                .store()
+                .swap(snapshot(vec![cert(certs, &[])]));
+            assert!(
+                resumed(server.addr, "api.example.com", &cfg).await,
+                "rotation {round} (TLS 1.2 only: {version}) did not resume"
+            );
+        }
+        // A client whose only ticket is two rotations old does a full
+        // handshake.
+        let stale = client_config(&opts);
+        assert!(!resumed(server.addr, "api.example.com", &stale).await);
+        clock.advance(Duration::from_secs(7200));
+        assert!(
+            !resumed(server.addr, "api.example.com", &stale).await,
+            "a ticket two rotations old resumed"
+        );
+    }
+    assert_eq!(keys.rotations(), 10);
+    server.shutdown().await;
+}

@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use rustls::crypto::{CryptoProvider, ring};
@@ -54,7 +54,9 @@ use tokio::sync::Notify;
 use tokio_rustls::server::TlsStream;
 
 use super::der;
+use super::ocsp::Staples;
 use super::store::Store;
+use super::tickets::TicketKeys;
 use crate::config::{CipherSuite, Tls, TlsVersion};
 pub use crate::telemetry::metrics::HandshakeResult;
 
@@ -113,7 +115,9 @@ impl std::error::Error for UnknownServerName {}
 /// suffix, in configuration order.
 #[derive(Debug)]
 struct Table {
-    keys: Vec<Arc<CertifiedKey>>,
+    /// Each certificate and key, replaced whole when its OCSP staple
+    /// changes.
+    keys: Vec<RwLock<Arc<CertifiedKey>>>,
     exact: HashMap<String, Vec<usize>>,
     /// Keyed by the suffix after `*.`.
     wildcard: HashMap<String, Vec<usize>>,
@@ -121,6 +125,10 @@ struct Table {
 }
 
 impl Table {
+    fn key(&self, i: usize) -> Arc<CertifiedKey> {
+        Arc::clone(&self.keys[i].read().unwrap_or_else(|p| p.into_inner()))
+    }
+
     /// The index of the certificate for `name`, with `usable` saying
     /// which certificates the client can use.
     fn select(
@@ -156,7 +164,7 @@ impl Table {
         let candidates = candidates?;
         if candidates.len() > 1 {
             for &i in candidates {
-                if usable(&self.keys[i]) {
+                if usable(&self.key(i)) {
                     return Some(i);
                 }
             }
@@ -206,8 +214,20 @@ impl ResolvesServerCert for Resolver {
             .0
             .select(hello.server_name(), |k| usable(k, &hello))
             .ok()?;
-        Some(Arc::clone(&self.0.keys[i]))
+        Some(self.0.key(i))
     }
+}
+
+/// What a listener's snapshots share across reloads.
+#[derive(Debug, Clone, Default)]
+pub struct Shared {
+    /// Session ticket keys; `None` leaves rustls's default (TLS 1.3
+    /// resumption from a per-snapshot session cache, which a reload
+    /// empties, and no TLS 1.2 tickets).
+    pub tickets: Option<Arc<TicketKeys>>,
+    /// OCSP staples already fetched, applied to a new snapshot's
+    /// certificates as it loads.
+    pub staples: Option<Arc<Staples>>,
 }
 
 /// One loaded `tls` block. Immutable; a reload builds a new one.
@@ -228,6 +248,13 @@ impl Snapshot {
     /// does not match its certificate, or (past the first, which is the
     /// fallback) whose certificate has no names to be chosen by.
     pub fn load(tls: &Tls) -> Result<Snapshot, LoadError> {
+        Snapshot::load_with(tls, &Shared::default())
+    }
+
+    /// Like [`load`](Self::load), with what outlives a reload: the
+    /// session ticket keys every snapshot of a listener shares, so tickets
+    /// issued before a reload still resume after it.
+    pub fn load_with(tls: &Tls, shared: &Shared) -> Result<Snapshot, LoadError> {
         let mut table = Table {
             keys: Vec::new(),
             exact: HashMap::new(),
@@ -257,7 +284,13 @@ impl Snapshot {
                 .or_default()
                 .push(index);
             }
-            table.keys.push(Arc::new(key));
+            let mut key = key;
+            if let Some(staples) = &shared.staples
+                && let Some(leaf) = key.cert.first()
+            {
+                key.ocsp = staples.get(leaf, SystemTime::now()).map(|s| s.der);
+            }
+            table.keys.push(RwLock::new(Arc::new(key)));
             certs.push(CertInfo {
                 cert_file: c.cert_file.clone(),
                 names,
@@ -291,6 +324,9 @@ impl Snapshot {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Resolver(Arc::clone(&table))));
         config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+        if let Some(keys) = &shared.tickets {
+            config.ticketer = Arc::clone(keys) as Arc<dyn rustls::server::ProducesTickets>;
+        }
         Ok(Snapshot {
             config: Arc::new(config),
             table,
@@ -311,6 +347,29 @@ impl Snapshot {
     /// The loaded certificates in configuration order.
     pub fn certificates(&self) -> &[CertInfo] {
         &self.certs
+    }
+
+    /// The chain of certificate `i`, leaf first, as served.
+    pub fn chain(&self, i: usize) -> Vec<CertificateDer<'static>> {
+        self.table.key(i).cert.clone()
+    }
+
+    /// The OCSP response stapled to certificate `i`.
+    pub fn staple(&self, i: usize) -> Option<Vec<u8>> {
+        self.table.key(i).ocsp.clone()
+    }
+
+    /// Staples `ocsp` to certificate `i` (or withdraws its staple) for
+    /// every handshake from now on.
+    pub fn set_staple(&self, i: usize, ocsp: Option<Vec<u8>>) {
+        let mut slot = self.table.keys[i]
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if slot.ocsp != ocsp {
+            let mut next = CertifiedKey::clone(&slot);
+            next.ocsp = ocsp;
+            *slot = Arc::new(next);
+        }
     }
 
     /// The index in [`certificates`](Self::certificates) of the
@@ -340,7 +399,8 @@ impl Snapshot {
                 ));
             }
         }
-        for (c, key) in self.certs.iter().zip(&self.table.keys) {
+        for (i, c) in self.certs.iter().enumerate() {
+            let key = self.table.key(i);
             let Some(leaf) = key.cert.first() else {
                 continue;
             };
@@ -462,18 +522,8 @@ fn rfc3339(t: SystemTime) -> String {
         Ok(d) => d.as_secs() as i64,
         Err(e) => -(e.duration().as_secs() as i64),
     };
-    let days = secs.div_euclid(86_400);
+    let (year, month, day) = der::civil_from_days(secs.div_euclid(86_400));
     let rem = secs.rem_euclid(86_400);
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         rem / 3600,

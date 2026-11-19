@@ -404,6 +404,8 @@ async fn run_tls() {
     let proxy = p.bound.proxy;
     let opts = tlsc::ClientOpts::default();
 
+    let resuming = tlsc::client_config(&opts);
+    assert!(!tlsc::resumed(proxy, "api.example.com", &resuming).await);
     let mut live = tlsc::Client::connect(proxy, "api.example.com", &opts).await;
     assert_eq!(live.cert, "exact");
     assert_eq!(live.get("/").await.unwrap(), (200, "https".to_owned()));
@@ -421,6 +423,9 @@ async fn run_tls() {
     );
     p.signals.hup();
     logs.wait_for(r#""message":"reloaded on SIGHUP""#).await;
+    // The session ticket keys outlive the reload: the ticket from before
+    // it resumes.
+    assert!(tlsc::resumed(proxy, "api.example.com", &resuming).await);
     assert_eq!(live.get("/").await.unwrap(), (200, "https".to_owned()));
     assert!(live.is_open(), "the live connection carries on");
     let fresh = tlsc::Client::connect(proxy, "api.example.com", &opts).await;
@@ -445,7 +450,7 @@ async fn run_tls() {
     // The handshake series are on /metrics.
     let (_, metrics) = get(p.bound.admin, "/metrics", "").await;
     assert!(
-        metrics.contains(r#"steer_tls_handshakes_total{result="ok"} 3"#),
+        metrics.contains(r#"steer_tls_handshakes_total{result="ok"} 5"#),
         "{metrics}"
     );
     assert!(
