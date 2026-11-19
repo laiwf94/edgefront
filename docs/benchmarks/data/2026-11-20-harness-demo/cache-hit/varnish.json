@@ -1,0 +1,126 @@
+{
+  "command": "edgefront-bench run --scenario bench/scenarios/cache-hit.toml --targets edgefront,varnish --out target/bench/demo --run demo",
+  "extra": {},
+  "machine": {
+    "arch": "aarch64",
+    "cpus": 16,
+    "description": "16-core arm64, Docker 28",
+    "kernel": "6.10.14-linuxkit",
+    "loadgen_cpus": "10-15",
+    "memory_bytes": 8217190400,
+    "origin_cpus": "4-9",
+    "runtime": "docker 28.0.4",
+    "target_cpus": "0-3"
+  },
+  "measured": {
+    "body_bytes": 1174373376,
+    "completed": 300000,
+    "errors": {
+      "connect": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 0.97995,
+    "latency": {
+      "max_ms": 4.534655,
+      "mean_ms": 0.05277849931333333,
+      "p50_ms": 0.045823,
+      "p90_ms": 0.062719,
+      "p999_ms": 0.592895,
+      "p99_ms": 0.180479
+    },
+    "origin_requests": 6015,
+    "scheduled": 300000,
+    "service_latency": {
+      "max_ms": 4.533834,
+      "mean_ms": 0.05120854666333333,
+      "p50_ms": 0.044479,
+      "p90_ms": 0.061279,
+      "p999_ms": 0.505087,
+      "p99_ms": 0.178687
+    },
+    "status_classes": [
+      0,
+      300000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 5000.0
+  },
+  "phases": [
+    {
+      "completed": 20000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 19.4055,
+        "mean_ms": 0.07687675440000001,
+        "p50_ms": 0.049855,
+        "p90_ms": 0.066047,
+        "p999_ms": 10.534911,
+        "p99_ms": 0.193279
+      },
+      "name": "warmup",
+      "rate": 2000.0,
+      "scheduled": 20000,
+      "throughput_rps": 2000.0,
+      "warmup": true
+    },
+    {
+      "completed": 300000,
+      "duration_secs": 60.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 4.534655,
+        "mean_ms": 0.05277849931333333,
+        "p50_ms": 0.045823,
+        "p90_ms": 0.062719,
+        "p999_ms": 0.592895,
+        "p99_ms": 0.180479
+      },
+      "name": "load",
+      "rate": 5000.0,
+      "scheduled": 300000,
+      "throughput_rps": 5000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 0.13987394066130457,
+    "cpu_seconds": 8.392383,
+    "cpuset": "0-3",
+    "peak_memory_bytes": 148267008,
+    "peak_rss_bytes": 135421952
+  },
+  "run": "demo",
+  "scenario": {
+    "connections": 64,
+    "description": "1,000 small objects under a Zipf 1.0 law, 98% hits at a constant 5,000 requests per second.",
+    "hit_ratio_target": 0.98,
+    "measured_secs": 60.0,
+    "name": "cache-hit",
+    "protocol": "http1",
+    "rate": 5000.0,
+    "seed": 1,
+    "warmup_secs": 10.0,
+    "working_set_bytes": 3755008
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-19T22:19:40Z",
+  "target": {
+    "image_size_bytes": 125643630,
+    "images": [
+      {
+        "id": "sha256:801d9ed8fa84ca018b3949de4b3c669040a1700dd3d8f2da627341327cc38f1e",
+        "reference": "varnish:9.0.4@sha256:801d9ed8fa84ca018b3949de4b3c669040a1700dd3d8f2da627341327cc38f1e",
+        "size_bytes": 125643630
+      }
+    ],
+    "kind": "cache",
+    "name": "varnish",
+    "product": "Varnish Cache",
+    "version": "9.0.4"
+  },
+  "track": "cache"
+}

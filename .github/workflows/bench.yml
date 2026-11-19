@@ -1,0 +1,67 @@
+name: bench
+
+# The benchmark harness on a Linux host. It runs only when something it
+# measures or is made of changes, to keep GitHub minutes for the rest.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "src/**"
+      - "bench/**"
+      - "Cargo.lock"
+      - "examples/bench.sh"
+      - ".github/workflows/bench.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "src/**"
+      - "bench/**"
+      - "Cargo.lock"
+      - "examples/bench.sh"
+      - ".github/workflows/bench.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build edgefront and the harness
+        run: cargo build --release --locked --bin edgefront --bin edgefront-bench
+      # The images from the binaries just built (bench/Dockerfile.prebuilt),
+      # under the tags the runner uses, so it builds nothing itself.
+      - name: Build the benchmark images
+        run: |
+          mkdir -p target/bench-images
+          cp target/release/edgefront target/release/edgefront-bench target/bench-images/
+          docker build -f bench/Dockerfile.prebuilt --target harness -t edgefront-bench/harness:local target/bench-images
+          docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:local target/bench-images
+      # Every target, pinned to its CPUs on the runner's cgroup v2 (systemd
+      # driver), for ten seconds each: the containers start, answer, cache,
+      # and are measured.
+      - name: Smoke run against every target
+        run: |
+          target/release/edgefront-bench run --scenario bench/ci/smoke.toml \
+            --targets edgefront,varnish,nginx,haproxy,envoy,ats,envoy-ratelimit \
+            --target-cpus 2 --out target/bench/smoke --run smoke
+      # An independent, complete JSON Schema validator over the results, on
+      # top of the harness's own check before it writes each one.
+      - name: Results match bench/schema/result.schema.json
+        run: pipx run check-jsonschema==0.38.2 --schemafile bench/schema/result.schema.json target/bench/smoke/smoke/*.json
+      - name: Every request answered
+        run: |
+          for f in target/bench/smoke/smoke/*.json; do
+            jq -e '.measured.completed == .measured.scheduled and (.measured.errors | [.[]] | add) == 0' "$f" >/dev/null \
+              || { echo "$f:"; jq .measured "$f"; exit 1; }
+          done
+          cat target/bench/smoke/report.md >> "$GITHUB_STEP_SUMMARY"

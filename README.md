@@ -289,6 +289,19 @@ End to end with [oha](https://github.com/hatoo/oha), 64 connections for 10 secon
 
 Hits through cachet run at about the rate of the in-memory origin serving the same bytes, which suggests the load generator and the loopback stack set the limit here rather than the cache. In the collapsing run, 250 clients requested a cold URL that takes 300 ms at the same moment; the origin saw one request, and `cachet_collapsed_requests_total` counted 249 waiters.
 
+## Benchmarking against other caches
+
+`crates/edgefront-bench` is the benchmark harness every track uses: an open-loop load generator that measures each response from its scheduled send time, TOML scenarios under `bench/scenarios/`, and a runner that starts edgefront, Varnish, NGINX, HAProxy, Envoy, Apache Traffic Server and Envoy with envoyproxy/ratelimit in containers pinned by digest (`bench/targets/`), each on its own CPUs behind the same origin. Each run writes a result per target, checked against `bench/schema/result.schema.json`, with throughput, p50, p99 and p99.9, the hit ratio seen at the origin, peak RSS and memory from the target's cgroup, CPU seconds and image size, and a Markdown report.
+
+```sh
+examples/bench.sh                     # cache-hit against edgefront and Varnish, then the report
+cargo run --release -p edgefront-bench -- run --scenario bench/scenarios/web-mix.toml \
+    --targets edgefront,varnish,nginx,haproxy,envoy,ats --out target/bench/web-mix
+cargo run --release -p edgefront-bench -- report --results target/bench/web-mix --out report.md
+```
+
+The runner needs Docker and builds the edgefront and harness images from `bench/Dockerfile` the first time. On a 16-core arm64 Mac, `examples/bench.sh` takes under two and a half minutes with the images built. [docs/DESIGN.md](docs/DESIGN.md#the-benchmark-harness) explains how it measures, and `bench/targets/README.md` how each product is configured.
+
 ## Where it stops
 
 HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are buffered in memory up to the per-object limit (8 MiB by default); larger responses stream through uncached. Only single byte ranges are served. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#what-it-does-not-do-well) for the full list.

@@ -1,0 +1,26 @@
+# CI's check that the runner works end to end on a Linux host: a few
+# seconds of small hits against each target, enough to exercise the
+# containers, the cgroup readings and the result schema, not to measure.
+name = "smoke"
+description = "Ten seconds of small objects, 90% hits, at 1,000 requests per second."
+protocol = "http1"
+connections = 16
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 500
+duration = "3s"
+
+[load]
+rate = 1000
+duration = "7s"
+
+[keys]
+count = 200
+zipf = 1.0
+hit_ratio = 0.9
+
+[[objects]]
+size = "4KiB"
+weight = 1
