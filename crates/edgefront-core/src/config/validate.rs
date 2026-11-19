@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use super::raw::{self, RawCluster, RawConfig, RawTls};
 use super::{
-    Budget, Certificate, CipherSuite, Cluster, Config, ConfigError, Endpoint, FieldError,
-    HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion, defaults,
-    go, limits,
+    Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config, ConfigError, Endpoint,
+    FieldError, HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy, Retry, Route, Tls,
+    TlsVersion, defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -202,6 +202,16 @@ impl Validator {
             cfg.clusters.push(c);
         }
 
+        let client_auth = cfg.tls.as_ref().is_some_and(|t| t.client_auth.is_some());
+        for (i, c) in cfg.clusters.iter().enumerate() {
+            if c.allowed_clients.is_some() && !client_auth {
+                self.add(
+                    format!("clusters[{i}].allowed_clients"),
+                    "needs tls.client_auth, so clients present certificates",
+                );
+            }
+        }
+
         let routes = raw.routes.as_deref().unwrap_or_default();
         if routes.is_empty() {
             self.add("routes", "at least one route is required");
@@ -372,6 +382,15 @@ impl Validator {
                 stapling: rt.ocsp_stapling.unwrap_or(true),
                 responder: (!rt.ocsp_responder.is_empty()).then(|| rt.ocsp_responder.clone()),
             },
+            client_auth: rt.client_auth.as_ref().map(|a| {
+                if a.ca_file.is_empty() {
+                    self.add(format!("{path}.client_auth.ca_file"), "is required");
+                }
+                ClientAuth {
+                    ca_file: a.ca_file.clone(),
+                    required: a.required.unwrap_or(true),
+                }
+            }),
         }
     }
 
@@ -539,7 +558,36 @@ impl Validator {
             health_check,
             outlier_detection,
             retry,
+            allowed_clients: rc
+                .allowed_clients
+                .as_ref()
+                .map(|list| self.allowed_clients(&format!("{path}.allowed_clients"), list)),
         }
+    }
+
+    fn allowed_clients(&mut self, path: &str, list: &[String]) -> Vec<String> {
+        if list.is_empty() {
+            self.add(path, "must not be empty; omit it to admit every client");
+        }
+        for (i, p) in list.iter().enumerate() {
+            let ok = if let Some(name) = p.strip_prefix("dns:") {
+                check_hostname(name).is_ok()
+            } else {
+                p.get(..9)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("spiffe://"))
+                    && p.len() > 9
+            };
+            if !ok {
+                self.add(
+                    format!("{path}[{i}]"),
+                    format!(
+                        "{} must be a spiffe:// ID, a spiffe:// prefix ending in /*, or dns:<name>",
+                        go::quote(p)
+                    ),
+                );
+            }
+        }
+        list.to_vec()
     }
 
     fn health_check(&mut self, hp: &str, h: &raw::RawHealth) -> HealthCheck {

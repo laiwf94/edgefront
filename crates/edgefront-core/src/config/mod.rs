@@ -180,6 +180,19 @@ pub struct Tls {
     /// its issuer and whose leaf names an OCSP responder.
     #[serde(skip_serializing_if = "Ocsp::is_default")]
     pub ocsp: Ocsp,
+    /// Ask clients for certificates and verify them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<ClientAuth>,
+}
+
+/// Client certificate verification on the listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientAuth {
+    /// The CAs client certificates must chain to.
+    pub ca_file: String,
+    /// Refuse clients without a certificate; without it they are let in
+    /// with no identity. On by default.
+    pub required: bool,
 }
 
 /// OCSP stapling settings (`ocsp_stapling` and `ocsp_responder` in the
@@ -287,6 +300,12 @@ pub struct Cluster {
     pub outlier_detection: Option<OutlierDetection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<Retry>,
+    /// Only clients whose certificate matches one of these reach the
+    /// cluster: `spiffe://` IDs (exact, or a prefix ending in `/*`) and
+    /// `dns:<name>` for a DNS name in the certificate. Needs
+    /// `tls.client_auth`. `None` admits every client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_clients: Option<Vec<String>>,
 }
 
 /// One upstream address, `host:port`.
@@ -545,6 +564,11 @@ impl Config {
                         *file = go::join(&dir, file);
                     }
                 }
+            }
+            if let Some(auth) = &mut tls.client_auth
+                && !auth.ca_file.starts_with('/')
+            {
+                auth.ca_file = go::join(&dir, &auth.ca_file);
             }
         }
         Ok(cfg)

@@ -105,7 +105,8 @@ use edgefront_core::http1::{Client, ClientLimits};
 use edgefront_core::listener::Handler;
 use edgefront_core::reload;
 use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics, TlsMetrics};
-use edgefront_core::tls::TlsInfo;
+use edgefront_core::tls::client_auth::spiffe_matches;
+use edgefront_core::tls::{ClientIdentity, TlsInfo};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
@@ -824,13 +825,30 @@ impl Proxy {
         let cluster = &rt.clusters[ci];
         let record = Record::new(cluster, started);
         let access = access.cluster(&cluster.config.name);
+        let tls = parts.extensions.get::<Arc<TlsInfo>>().cloned();
+        let client = tls.as_ref().and_then(|t| t.client.as_ref());
+        if let Some(allowed) = &cluster.config.allowed_clients
+            && !client.is_some_and(|c| admits(allowed, c))
+        {
+            let resp = error(
+                &id,
+                StatusCode::FORBIDDEN,
+                "client_not_allowed",
+                "this client certificate may not reach this route",
+            );
+            log(&access, started, &resp, "client_not_allowed");
+            return record.attach(resp);
+        }
         let fwd = Forwarding {
             trusted: Arc::clone(&rt.trusted),
             peer: access.peer,
             host: host.clone(),
             id: id.clone(),
             absolute: parts.uri.authority().is_some(),
-            tls: parts.extensions.get::<Arc<TlsInfo>>().is_some(),
+            tls: tls.is_some(),
+            client_spiffe_id: client
+                .and_then(|c| c.spiffe_id.as_deref())
+                .and_then(|s| HeaderValue::from_str(s).ok()),
         };
         // The request phase runs before the cluster's `max_requests`, so
         // an answer from a filter, such as a cache hit, takes no place.
@@ -955,6 +973,23 @@ impl Proxy {
     }
 }
 
+/// The verified client's SPIFFE ID, as the upstream sees it.
+pub const X_CLIENT_SPIFFE_ID: HeaderName = HeaderName::from_static("x-client-spiffe-id");
+
+/// Whether a cluster's `allowed_clients` admits `client`.
+fn admits(allowed: &[String], client: &ClientIdentity) -> bool {
+    allowed.iter().any(|p| match p.strip_prefix("dns:") {
+        Some(name) => client
+            .dns_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name)),
+        None => client
+            .spiffe_id
+            .as_deref()
+            .is_some_and(|id| spiffe_matches(p, id)),
+    })
+}
+
 /// How a request's headers are turned into the upstream's, kept so a
 /// resend or a background refresh gets the same treatment.
 #[derive(Clone)]
@@ -967,6 +1002,9 @@ struct Forwarding {
     absolute: bool,
     /// The request came over TLS, so `X-Forwarded-Proto` is `https`.
     tls: bool,
+    /// The verified client certificate's SPIFFE ID, sent upstream as
+    /// `X-Client-Spiffe-Id`.
+    client_spiffe_id: Option<HeaderValue>,
 }
 
 impl Forwarding {
@@ -982,6 +1020,12 @@ impl Forwarding {
             &self.trusted,
         );
         headers.insert(reqid::HEADER, self.id.clone());
+        // Only the proxy says who the client is: an inbound value is
+        // dropped whatever it claims.
+        headers.remove(&X_CLIENT_SPIFFE_ID);
+        if let Some(id) = &self.client_spiffe_id {
+            headers.insert(X_CLIENT_SPIFFE_ID, id.clone());
+        }
         if self.absolute {
             // Go sends `Request.Host`, which an absolute-form target sets.
             headers.insert(

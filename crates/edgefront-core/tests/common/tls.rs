@@ -56,6 +56,7 @@ pub fn tls_config(certs: Vec<Certificate>) -> Tls {
         max_concurrent_handshakes: 64,
         strict_sni: false,
         ocsp: Default::default(),
+        client_auth: None,
     }
 }
 

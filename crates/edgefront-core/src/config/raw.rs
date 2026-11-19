@@ -250,6 +250,12 @@ raw_struct!(RawTls, "an object" {
     strict_sni: bool,
     ocsp_stapling: Option<bool>,
     ocsp_responder: String,
+    client_auth: Option<RawClientAuth>,
+});
+
+raw_struct!(RawClientAuth, "an object" {
+    ca_file: String,
+    required: Option<bool>,
 });
 
 raw_struct!(RawCertificate, "an object" {
@@ -276,6 +282,7 @@ raw_struct!(RawCluster, "an object" {
     health_check: Option<RawHealth>,
     outlier_detection: Option<RawOutlier>,
     retry: Option<RawRetry>,
+    allowed_clients: Option<Vec<String>>,
 });
 
 raw_struct!(RawEndpoint, "an object" {

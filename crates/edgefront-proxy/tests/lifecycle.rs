@@ -497,3 +497,156 @@ async fn startup_tls_error() {
     assert!(logs.text().contains(r#""message":"tls certificate""#));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An upstream that answers with the `X-Client-Spiffe-Id` it was sent.
+async fn identity_upstream() -> SocketAddr {
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = socket.accept().await {
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(|req: http::Request<Incoming>| async move {
+                    let id = req
+                        .headers()
+                        .get("x-client-spiffe-id")
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .unwrap_or_else(|| "none".to_owned());
+                    Ok::<_, Infallible>(http::Response::new(Full::new(Bytes::from(id))))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tcp), svc)
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// A TLS client trusting the fixture CA, presenting `client` if given.
+fn mtls_client(client: Option<&str>) -> Arc<rustls::ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_file(tlsc::fixture("ca.crt")).unwrap())
+        .unwrap();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots);
+    Arc::new(match client {
+        None => builder.with_no_client_auth(),
+        Some(base) => builder
+            .with_client_auth_cert(
+                vec![CertificateDer::from_pem_file(tlsc::fixture(&format!("{base}.crt"))).unwrap()],
+                PrivateKeyDer::from_pem_file(tlsc::fixture(&format!("{base}.key"))).unwrap(),
+            )
+            .unwrap(),
+    })
+}
+
+/// `GET path` over mutual TLS, with a spoofed identity header the proxy
+/// must drop.
+async fn mtls_get(addr: SocketAddr, cfg: Arc<rustls::ClientConfig>, path: &str) -> (u16, String) {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("api.example.com").unwrap();
+    let Ok(tls) = tokio_rustls::TlsConnector::from(cfg)
+        .connect(name, tcp)
+        .await
+    else {
+        return (0, "handshake refused".to_owned());
+    };
+    let Ok((mut send, conn)) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await
+    else {
+        return (0, "handshake refused".to_owned());
+    };
+    tokio::spawn(conn);
+    let req = http::Request::get(path)
+        .header("host", "api.example.com")
+        .header("x-client-spiffe-id", "spiffe://edge.test/ns/admin/sa/root")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    match send.send_request(req).await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+        Err(e) => (0, e.to_string()),
+    }
+}
+
+/// Client certificates reach routing: a cluster with `allowed_clients`
+/// admits only matching identities (403 `client_not_allowed` otherwise),
+/// one without admits every verified client, the verified SPIFFE ID goes
+/// upstream as `X-Client-Spiffe-Id` while a client's own value never
+/// does, and the handshake refuses untrusted certificates outright.
+#[tokio::test]
+async fn client_certificates_reach_routing() {
+    let dir = scratch("mtls");
+    copy_pair(&dir, "exact", "site");
+    std::fs::copy(tlsc::fixture("ca.crt"), dir.join("clients.pem")).unwrap();
+    let up = identity_upstream().await;
+    let cfg = dir.join("steer.json");
+    let js = format!(
+        r#"{{"listen":"127.0.0.1:0","admin_listen":"127.0.0.1:0",
+        "routes":[{{"path_prefix":"/web/","cluster":"web"}},{{"path_prefix":"/admin/","cluster":"admin"}},
+                  {{"path_prefix":"/dns/","cluster":"dns"}},{{"cluster":"open"}}],
+        "clusters":[
+          {{"name":"web","endpoints":[{{"address":"{up}"}}],"allowed_clients":["spiffe://edge.test/ns/web/*"]}},
+          {{"name":"admin","endpoints":[{{"address":"{up}"}}],"allowed_clients":["spiffe://edge.test/ns/admin/*"]}},
+          {{"name":"dns","endpoints":[{{"address":"{up}"}}],"allowed_clients":["dns:client.example.com"]}},
+          {{"name":"open","endpoints":[{{"address":"{up}"}}]}}],
+        "tls":{{"certificates":[{{"cert_file":"site.crt","key_file":"site.key"}}],
+                "client_auth":{{"ca_file":"clients.pem"}}}}}}"#
+    );
+    std::fs::write(&cfg, js).unwrap();
+    let p = start(&cfg, settings("", 0, 1000)).await;
+    let proxy = p.bound.proxy;
+    let frontend = mtls_client(Some("client"));
+    assert_eq!(
+        mtls_get(proxy, Arc::clone(&frontend), "/web/x").await,
+        (200, "spiffe://edge.test/ns/web/sa/frontend".to_owned())
+    );
+    let (code, body) = mtls_get(proxy, Arc::clone(&frontend), "/admin/x").await;
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("client_not_allowed"), "{body}");
+    assert_eq!(
+        mtls_get(proxy, Arc::clone(&frontend), "/dns/x").await.0,
+        200
+    );
+    assert_eq!(
+        mtls_get(proxy, Arc::clone(&frontend), "/other").await,
+        (200, "spiffe://edge.test/ns/web/sa/frontend".to_owned())
+    );
+    for bad in [None, Some("client-expired"), Some("client-other")] {
+        assert_eq!(
+            mtls_get(proxy, mtls_client(bad), "/other").await.0,
+            0,
+            "{bad:?}"
+        );
+    }
+    p.signals.stop();
+    p.task.await.unwrap().unwrap();
+
+    // Optional client certificates: a client without one reaches the open
+    // cluster with no identity (and the spoofed header dropped) but not a
+    // restricted one.
+    let js = std::fs::read_to_string(&cfg).unwrap().replace(
+        r#""ca_file":"clients.pem""#,
+        r#""ca_file":"clients.pem","required":false"#,
+    );
+    std::fs::write(&cfg, js).unwrap();
+    let p = start(&cfg, settings("", 0, 1000)).await;
+    let anonymous = mtls_client(None);
+    assert_eq!(
+        mtls_get(p.bound.proxy, Arc::clone(&anonymous), "/other").await,
+        (200, "none".to_owned())
+    );
+    assert_eq!(mtls_get(p.bound.proxy, anonymous, "/web/x").await.0, 403);
+    p.signals.stop();
+    p.task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

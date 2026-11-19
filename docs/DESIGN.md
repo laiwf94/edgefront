@@ -119,6 +119,20 @@ Two things differ from steer because rustls does not do them. rustls implements 
 
 On a manual clock, a stapler against a fake responder fetches and staples at once (a client reads the staple from the handshake), does not refetch before the halfway point, refreshes after it, staples a reloaded snapshot from the cache, keeps the staple through 503s with retries at one and then two minutes, refuses a revoked answer, and withdraws the staple once it expires. `Stapler::run` fetches for a certificate swapped into the store without waiting. `tests/tls.rs` resumes TLS 1.3 and TLS 1.2 sessions across three hourly rotations, each followed by a reload, and a ticket two rotations old does not resume. `crates/edgefront-proxy/tests/lifecycle.rs` resumes a session across a SIGHUP reload of the running binary.
 
+### Client certificates
+
+`tls::client_auth` turns on mutual TLS for a listener. With `tls.client_auth`, every snapshot's `ServerConfig` gets rustls's WebPKI client verifier over the CA bundle in `client_auth.ca_file` (resolved against the file's directory, like the certificates). A client certificate is accepted only if it chains to one of those CAs, every certificate in the chain is inside its validity, and the leaf allows client authentication. With `required` (the default) a client without a certificate fails the handshake. With `required: false` it is let in without an identity, but a certificate it does present must still be valid. A verified leaf becomes the connection's `ClientIdentity`: its DNS and URI SANs, and its SPIFFE ID, the one URI SAN with the `spiffe` scheme (a certificate with two has none, as the X.509-SVID rules say). Every request on the connection carries it in `TlsInfo::client`.
+
+Routing reads it through a cluster's `allowed_clients`: `spiffe://` IDs, exact or as a `/*` prefix that matches every ID below it (the trust domain compared without case, the path exactly), and `dns:<name>` for a DNS SAN. A request routed to a cluster whose list its client does not match gets `403 client_not_allowed` before anything is sent upstream. A cluster without the list admits every client the handshake let in. Configuration validation refuses `allowed_clients` without `tls.client_auth`. The proxy tells the upstream who called: `X-Client-Spiffe-Id` carries the verified ID, and a value the client sent itself is always removed, so an upstream can trust the header whenever the proxy is its only way in.
+
+`crates/edgefront-core/tests/client_auth.rs` checks the handshake against the fixture client certificates:
+- A valid one gets through, and its SAN and SPIFFE ID reach the request.
+- An expired one, one from another CA, a server certificate and no certificate at all are refused when certificates are required.
+- When they are optional, a client without one gets in with no identity.
+- Bad CA bundles and the configuration rules are refused.
+
+`crates/edgefront-proxy/tests/lifecycle.rs` runs the proxy with three restricted clusters and an open one. It checks the 403, the forwarded ID, that a spoofed header never reaches the upstream, the refused handshakes, and the anonymous client under optional verification.
+
 ### The failover drill
 
 steer's README publishes one table as the measure of its resilience: its failover drill, in which two priority-0 upstreams and a priority-1 backup take 200 requests per second while one fault lands per 10-second phase (a primary killed with SIGKILL, the other failing half its requests, then that one blackholed), and every phase keeps 100.00% of requests with health checks, outlier detection and retries on. The port is held to the same table. `examples/failover.sh` is steer's script with the proxy swapped, and the configurations in `examples/failover/` are steer's, byte for byte, so the comparison is between the two binaries and nothing else.

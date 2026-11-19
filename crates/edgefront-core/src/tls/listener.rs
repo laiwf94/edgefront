@@ -53,6 +53,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio_rustls::server::TlsStream;
 
+use super::client_auth::{self, ClientIdentity};
 use super::der;
 use super::ocsp::Staples;
 use super::store::Store;
@@ -321,7 +322,10 @@ impl Snapshot {
         let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(versions)
             .expect("ring supports TLS 1.2 and 1.3 with these suites")
-            .with_no_client_auth()
+            .with_client_cert_verifier(match &tls.client_auth {
+                None => Arc::new(rustls::server::NoClientAuth),
+                Some(auth) => client_auth::verifier(auth).map_err(LoadError::Certificate)?,
+            })
             .with_cert_resolver(Arc::new(Resolver(Arc::clone(&table))));
         config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
         if let Some(keys) = &shared.tickets {
@@ -541,6 +545,8 @@ pub type OnHandshake = Arc<dyn Fn(HandshakeResult, Duration) + Send + Sync>;
 pub struct TlsInfo {
     /// The SNI the client sent, as sent.
     pub server_name: Option<String>,
+    /// The verified client certificate's identity, under `client_auth`.
+    pub client: Option<ClientIdentity>,
     /// The negotiated protocol version, such as `0x0304` for TLS 1.3.
     pub version: u16,
     /// The negotiated cipher suite's IANA number.
@@ -552,6 +558,10 @@ impl TlsInfo {
         let (_, conn) = stream.get_ref();
         TlsInfo {
             server_name: conn.server_name().map(str::to_owned),
+            client: conn
+                .peer_certificates()
+                .and_then(|c| c.first())
+                .map(ClientIdentity::of),
             version: conn.protocol_version().map_or(0, u16::from),
             cipher_suite: conn
                 .negotiated_cipher_suite()
