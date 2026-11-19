@@ -1,6 +1,7 @@
 //! Model check for the GCRA limiter, replacing libpacer's
 //! tests/model_gcra.c. Random operation sequences drive `Gcra::take`,
-//! `take_upto`, `take_range`, `refund`, `remaining` and `reconfigure` and
+//! `take_upto`, `take_range`, `book`, `refund`, `remaining` and
+//! `reconfigure` and
 //! the same operations on a slow reference: a plain token bucket whose
 //! level is an exact fraction, refilled continuously and capped at the
 //! burst. The two must agree on every result and every decision field.
@@ -259,6 +260,40 @@ impl RefBucket {
         }
     }
 
+    /// Booking takes the tokens whether or not the level covers them; the
+    /// level may go negative, down to the documented debt limit of 2^62
+    /// ticks (1/64 ns each) behind a full bucket.
+    fn book(&mut self, now: u64, cost: u64) -> Decision {
+        self.advance(now);
+        let cost = cost.min(self.burst);
+        let mut d = Decision {
+            allowed: false,
+            granted: 0,
+            remaining: self.whole(),
+            retry_after_ns: 0,
+        };
+        if cost == 0 {
+            return d;
+        }
+        let level = self.level.sub(Rat::int(cost));
+        let debt_ticks = Rat::int(self.burst)
+            .sub(level)
+            .div(self.rate)
+            .mul(Rat::int(64));
+        if debt_ticks.cmp(Rat::int(MAX_TOL_TICKS)) == Ordering::Greater {
+            d.retry_after_ns = self.wait(cost);
+            return d;
+        }
+        self.level = level;
+        d.allowed = true;
+        d.granted = cost;
+        d.remaining = self.whole();
+        if level.cmp(Rat::int(0)) == Ordering::Less {
+            d.retry_after_ns = self.wait(0);
+        }
+        d
+    }
+
     fn refund(&mut self, now: u64, tokens: u64) {
         self.advance(now);
         self.level = Rat::int(self.burst).min(self.level.add(Rat::int(tokens)));
@@ -487,7 +522,14 @@ fn run_in(s: &mut impl Source, steps: usize, span: Span) -> Result<(), String> {
                 Ok(m.take_range(now, min, max)),
                 Ok(g.take_range(now, min, max)),
             )
-        } else if kind < 80 {
+        } else if kind < 72 {
+            let cost = s.below(b + 3);
+            (
+                format!("t={now} book {cost}"),
+                Ok(m.book(now, cost)),
+                Ok(g.book(now, cost)),
+            )
+        } else if kind < 85 {
             let tokens = if s.below(20) == 0 {
                 u64::MAX
             } else {

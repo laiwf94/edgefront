@@ -231,6 +231,51 @@ macro_rules! decision_steps {
             Some((grant, base + T::from(grant) * iv))
         }
 
+        /// Book `cost` tokens whether or not they are available yet: the
+        /// bucket goes into debt, and `retry_after_ns` says when the booked
+        /// tokens are due (0 when they already are). Returns the booking
+        /// and the new arrival time. A cost above the burst is lowered to
+        /// the burst. Nothing is booked for a cost of 0, or when the debt
+        /// would pass [`MAX_TOL_TICKS`]; then `retry_after_ns` says when
+        /// `cost` would fit without debt. libpacer's `pacer_step_book`.
+        #[inline]
+        pub(crate) fn book(
+            tat: T,
+            now: T,
+            cost: u64,
+            iv: T,
+            tol: T,
+            d: &mut Decision,
+        ) -> Option<(u64, T)> {
+            let base = tat.max(now);
+            let cost = cost.min(out(tol / iv));
+            *d = Decision {
+                allowed: false,
+                granted: 0,
+                remaining: avail(base - now, tol, iv),
+                retry_after_ns: 0,
+            };
+            if cost == 0 {
+                return None;
+            }
+            // cost * iv <= tol <= MAX_TOL_TICKS, and a booking never leaves
+            // more debt than MAX_TOL_TICKS, so the sum cannot overflow a
+            // u64 even after a reconfigure left a larger debt (it saturates
+            // and is refused).
+            let debt = (base - now).saturating_add(T::from(cost) * iv);
+            if debt > T::from(MAX_TOL_TICKS) {
+                d.retry_after_ns = ns_ceil(debt - tol);
+                return None;
+            }
+            d.allowed = true;
+            d.granted = cost;
+            d.remaining = avail(debt, tol, iv);
+            if debt > tol {
+                d.retry_after_ns = ns_ceil(debt - tol);
+            }
+            Some((cost, base + T::from(cost) * iv))
+        }
+
         /// Arrival time after giving back `tokens`. Never moves before
         /// `now`, so a refund cannot create more than a full bucket. The
         /// debt can exceed the tolerance after a reconfigure shrinks the
@@ -254,14 +299,14 @@ macro_rules! decision_steps {
 
 #[allow(clippy::useless_conversion)]
 pub(crate) mod step {
-    use super::{Decision, TICK_SHIFT};
+    use super::{Decision, MAX_TOL_TICKS, TICK_SHIFT};
 
     decision_steps!(u64);
 }
 
 #[allow(clippy::useless_conversion)]
 pub(crate) mod wide {
-    use super::{Decision, TICK_SHIFT};
+    use super::{Decision, MAX_TOL_TICKS, TICK_SHIFT};
 
     decision_steps!(u128);
 }
@@ -599,6 +644,44 @@ impl Gcra {
                 let mut d = Decision::default();
                 (
                     wide::range(tat, now, min, max, wiv, wtol, &mut d).map(|(_, n)| n),
+                    d,
+                )
+            },
+        )
+    }
+
+    /// Book `cost` tokens that may not be available yet: the limiter goes
+    /// into debt and `retry_after_ns` says when they are due (0 when they
+    /// already are). Consumers that share one limiter and find it short
+    /// book their next share instead of polling for it, so they are served
+    /// in the order they asked rather than by who wakes first. A cost above
+    /// the burst is lowered to the burst. Books nothing for a cost of 0, or
+    /// when the debt would pass [`MAX_TOL_TICKS`] (about 2.3 years); then
+    /// `retry_after_ns` says when `cost` would fit. Unused booked tokens go
+    /// back through [`Gcra::refund`]. libpacer's `pacer_gcra_book`.
+    #[inline]
+    pub fn book(&self, now_ns: u64, cost: u64) -> Decision {
+        let (iv, tol) = self.config();
+        let fast = move |tat, now, d: &mut Decision| {
+            step::book(tat, now, cost, iv, tol, d).map(|(_, n)| n)
+        };
+        if let Some(d) = self.update_fast(now_ns, fast) {
+            return d;
+        }
+        let (wiv, wtol) = (u128::from(iv), u128::from(tol));
+        self.update(
+            now_ns,
+            move |tat, now| {
+                let mut d = Decision::default();
+                (
+                    step::book(tat, now, cost, iv, tol, &mut d).map(|(_, n)| n),
+                    d,
+                )
+            },
+            move |tat, now| {
+                let mut d = Decision::default();
+                (
+                    wide::book(tat, now, cost, wiv, wtol, &mut d).map(|(_, n)| n),
                     d,
                 )
             },
@@ -1187,5 +1270,139 @@ mod tests {
             assert_eq!(g.remaining(3 * EPOCH_NS + 1), 0);
             assert_eq!(g.base_epoch(), 1);
         }
+    }
+
+    // test_gcra.c: gcra_book_goes_into_debt_and_says_when
+    #[test]
+    fn book_goes_into_debt_and_says_when() {
+        let g = gcra(1000, SEC, 100);
+        // 30 of 100 available: a booking of 50 is due 20 ms later.
+        assert_eq!(g.take_upto(SEC, 70).granted, 70);
+        let d = g.book(SEC, 50);
+        assert!(d.allowed);
+        assert_eq!(d.granted, 50);
+        assert_eq!(d.remaining, 0);
+        assert_eq!(d.retry_after_ns, 20 * MS);
+        // A booking that fits now is due at once.
+        let d = g.book(10 * SEC, 40);
+        assert_eq!(d.granted, 40);
+        assert_eq!(d.remaining, 60);
+        assert_eq!(d.retry_after_ns, 0);
+        // A cost above the burst is lowered to the burst; 0 books nothing.
+        assert_eq!(g.book(20 * SEC, 1000).granted, 100);
+        let d = g.book(20 * SEC, 0);
+        assert_eq!(d.granted, 0);
+        assert!(!d.allowed);
+        // Unused booked tokens go back.
+        g.refund(20 * SEC, 100);
+        assert_eq!(g.remaining(20 * SEC), 100);
+        assert_eq!(g.book(20 * SEC, 10).granted, 10);
+    }
+
+    /// One wake of a consumer that reads 10 tokens at a time: `due` is when
+    /// its booked quantum is due, 0 when it has none. With `book` it books
+    /// the quantum it cannot have now; without, it only polls.
+    fn wake(g: &Gcra, due: &mut u64, got: &mut u64, now: u64, book: bool) {
+        if *due != 0 {
+            if now >= *due {
+                *got += 10;
+                *due = 0;
+            }
+            return;
+        }
+        if g.take_range(now, 10, 10).granted == 10 {
+            *got += 10;
+        } else if book {
+            let d = g.book(now, 10);
+            assert_eq!(d.granted, 10);
+            *due = now + d.retry_after_ns;
+        }
+    }
+
+    // test_gcra.c: gcra_book_serves_waiters_in_the_order_they_asked
+    #[test]
+    fn book_serves_waiters_in_the_order_they_asked() {
+        // Two consumers share an empty limiter and wake at the same
+        // moments, A always first. Polling, A takes every quantum. Booking,
+        // B's quantum goes ahead of A's next one and they take turns.
+        for book in [false, true] {
+            let g = gcra(1000, SEC, 100);
+            let mut now = SEC;
+            assert_eq!(g.take_upto(now, 100).granted, 100);
+            let (mut a_due, mut a_got, mut b_due, mut b_got) = (0, 0, 0, 0);
+            for _ in 0..100 {
+                now += 10 * MS;
+                wake(&g, &mut a_due, &mut a_got, now, book);
+                wake(&g, &mut b_due, &mut b_got, now, book);
+            }
+            if book {
+                assert_eq!((a_got, b_got), (500, 500));
+                assert!(a_due > now);
+            } else {
+                assert_eq!((a_got, b_got), (1000, 0));
+            }
+        }
+    }
+
+    // test_gcra.c: gcra_book_refuses_debt_past_the_limit
+    #[test]
+    fn book_refuses_debt_past_the_limit() {
+        // One token a day, a burst of 10: each token is 86400 s of debt,
+        // and 2^62 ticks is about 2.3 years, so about 840 bookings fit.
+        let g = gcra(1, 86_400 * SEC, 10);
+        let mut booked = 0;
+        let last = loop {
+            let d = g.book(SEC, 1);
+            if d.granted != 1 {
+                break d;
+            }
+            booked += 1;
+            assert!(booked < 2000);
+        };
+        assert!((800..900).contains(&booked), "{booked}");
+        assert_eq!(last.granted, 0);
+        assert!(last.retry_after_ns > 365 * 86_400 * SEC);
+        // The debt is exactly what was booked: refunding it all gives a
+        // full bucket back.
+        g.refund(SEC, booked);
+        assert_eq!(g.remaining(SEC), 10);
+    }
+
+    #[test]
+    fn book_works_across_epochs() {
+        // The slow path: a limiter last written in epoch 0, booked in
+        // epoch 3, and a booking whose arrival time crosses into the next
+        // epoch.
+        let g = gcra(1, SEC, 4);
+        assert!(g.take(5, 4).unwrap().allowed);
+        let now = 3 * EPOCH_NS - 1;
+        let d = g.book(now, 4);
+        assert_eq!(d.granted, 4);
+        assert_eq!(d.retry_after_ns, 0);
+        let d = g.book(now, 2);
+        assert_eq!(d.granted, 2);
+        assert_eq!(d.retry_after_ns, 2 * SEC);
+        assert_eq!(g.take_upto(now + 4 * SEC, 10).granted, 2);
+        // Six booked, two taken: the arrival time is 8 s past now.
+        assert_eq!(g.tat(), u128::from(now + 8 * SEC) << 6);
+    }
+
+    #[test]
+    fn concurrent_bookings_queue_without_losing_any() {
+        // Eight threads book one token each 1,000 times on an empty
+        // limiter: every booking lands, and the debt is exactly their sum.
+        let g = Arc::new(gcra(1_000_000, SEC, 10_000));
+        assert_eq!(g.take_upto(SEC, 10_000).granted, 10_000);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let g = Arc::clone(&g);
+                std::thread::spawn(move || (0..1_000).map(|_| g.book(SEC, 1).granted).sum::<u64>())
+            })
+            .collect();
+        let total: u64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(total, 8_000);
+        // 18,000 tokens behind at 10^6 a second: full again 18 ms later.
+        assert_eq!(g.remaining(SEC + 18 * MS - 1), 9_999);
+        assert_eq!(g.remaining(SEC + 18 * MS), 10_000);
     }
 }

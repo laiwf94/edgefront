@@ -12,6 +12,7 @@ pub mod conn;
 pub mod gcra;
 pub mod lint;
 pub mod rate;
+pub mod shape;
 pub mod siphash;
 pub mod table;
 pub mod window;
@@ -24,6 +25,7 @@ pub use conn::{Admission, ClientKey, Counters, Permit, QuotaTable, Refusal, Stat
 pub use gcra::{Decision, Error, Gcra, Rate};
 pub use lint::{Class, Lint, lint};
 pub use rate::{Limiter, Plan, Quota, RateError, RateSpec};
+pub use shape::{Bandwidth, Reserve, Shaper};
 pub use siphash::KeyHash;
 pub use table::{EntryState, FullPolicy, Table, TableConfig, TableStats};
 pub use window::Window;

@@ -324,7 +324,7 @@ impl Counters {
 
 /// What a limit that is switched off is set to in the client table, so a
 /// reload can switch it on in place. pacerd's `rate_or_unlimited`.
-const UNLIMITED: Rate = Rate::new(1_000_000_000, 1_000_000_000, 1_000_000_000);
+pub(crate) const UNLIMITED: Rate = Rate::new(1_000_000_000, 1_000_000_000, 1_000_000_000);
 
 /// `rate_on` in [`Admission::client`].
 const RATE_ON: u32 = 1 << 8;

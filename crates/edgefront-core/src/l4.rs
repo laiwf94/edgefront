@@ -28,9 +28,24 @@
 //!   compared with pacerd's. A connection reset or broken pipe on a side is
 //!   its `_reset` reason, any other I/O error its `_error` reason.
 //!
-//! The limiter's byte shaping and slow-client check, the listener with its
-//! admission limits and drain, and proxy week 12's UDP, TLS passthrough and
-//! PROXY protocol build on this module; it has no policy of its own.
+//! - **Pacing.** [`proxy_paced`] takes a [`Pace`], which the limiter's
+//!   byte shaping and slow-client check plug into, as pacerd's `reserve`,
+//!   `give_back` and `check_rate` sit in its data path. Before every read
+//!   the relay asks [`Pace::reserve`] how many bytes it may read. A wait
+//!   leaves that direction unread until the time given, so the kernel's
+//!   buffer fills and TCP flow control pushes back on the sender; bytes
+//!   granted and not read go back through [`Pace::give_back`]. Every read
+//!   is reported to [`Pace::moved`], and [`Pace::check`] runs whenever
+//!   [`Pace::deadline`] passes. The connection's idle, throttle and check
+//!   deadlines share one timer, set to the earliest of them, as pacerd kept
+//!   one timer heap entry per connection.
+//! - **Stopping.** [`proxy_paced`] also takes a future that ends the relay
+//!   with its reason when it completes, which a draining listener uses to
+//!   close what is still open when its drain timeout runs out.
+//!
+//! The listener with its admission limits and drain, and proxy week 12's
+//! UDP, TLS passthrough and PROXY protocol build on this module; it has no
+//! policy of its own.
 
 use std::fmt;
 use std::future::{Future, poll_fn, ready};
@@ -75,11 +90,16 @@ pub enum CloseReason {
     UpstreamReset,
     /// Any other I/O error on the upstream side.
     UpstreamError,
+    /// The connection moved fewer bytes than the listener's minimum rate
+    /// in its last window ([`Pace::check`]).
+    SlowClient,
+    /// The connection was still open when the drain timeout ran out.
+    DrainTimeout,
 }
 
 impl CloseReason {
     /// Every reason, in the order above.
-    pub const ALL: [CloseReason; 10] = [
+    pub const ALL: [CloseReason; 12] = [
         CloseReason::Done,
         CloseReason::IdleTimeout,
         CloseReason::ConnectTimeout,
@@ -90,6 +110,8 @@ impl CloseReason {
         CloseReason::ClientError,
         CloseReason::UpstreamReset,
         CloseReason::UpstreamError,
+        CloseReason::SlowClient,
+        CloseReason::DrainTimeout,
     ];
 
     /// pacerd's name for the reason.
@@ -105,6 +127,8 @@ impl CloseReason {
             CloseReason::ClientError => "client_error",
             CloseReason::UpstreamReset => "upstream_reset",
             CloseReason::UpstreamError => "upstream_error",
+            CloseReason::SlowClient => "slow_client",
+            CloseReason::DrainTimeout => "drain_timeout",
         }
     }
 
@@ -254,6 +278,70 @@ pub struct Outcome {
     pub bytes_down: u64,
 }
 
+/// One direction of a relayed connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    /// Client to upstream: bytes read from the client.
+    Up,
+    /// Upstream to client: bytes read from the upstream.
+    Down,
+}
+
+impl Direction {
+    fn of(dir: usize) -> Direction {
+        if dir == UP {
+            Direction::Up
+        } else {
+            Direction::Down
+        }
+    }
+}
+
+/// The answer to [`Pace::reserve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    /// Read at most this many bytes now. Must not be 0.
+    Read(usize),
+    /// Read nothing in this direction until this time.
+    Wait(Instant),
+}
+
+/// The policy a paced relay consults on its data path. See the
+/// [module docs](self).
+pub trait Pace {
+    /// How many of the `want` bytes the buffer has room for direction
+    /// `dir` may read now (`want` is never 0).
+    fn reserve(&mut self, dir: Direction, want: usize) -> Grant;
+    /// Hand back `unused` bytes of the last grant that were not read.
+    fn give_back(&mut self, dir: Direction, unused: usize);
+    /// `n` bytes were read in direction `dir`.
+    fn moved(&mut self, dir: Direction, n: usize);
+    /// When [`Pace::check`] should next run, if ever.
+    fn deadline(&self) -> Option<Instant>;
+    /// Runs once the deadline has passed. An error ends the relay with
+    /// that reason.
+    fn check(&mut self) -> Result<(), CloseReason>;
+}
+
+/// The [`Pace`] that never holds anything back: what [`proxy`],
+/// [`proxy_with`] and [`relay`] use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Unpaced;
+
+impl Pace for Unpaced {
+    fn reserve(&mut self, _: Direction, want: usize) -> Grant {
+        Grant::Read(want)
+    }
+    fn give_back(&mut self, _: Direction, _: usize) {}
+    fn moved(&mut self, _: Direction, _: usize) {}
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
+    fn check(&mut self) -> Result<(), CloseReason> {
+        Ok(())
+    }
+}
+
 /// Opens a TCP connection to `addr` with Nagle's algorithm off, within
 /// `timeout`. Errors are the close reasons pacerd gives a failed connect.
 pub async fn connect(addr: SocketAddr, timeout: Duration) -> Result<TcpStream, CloseReason> {
@@ -297,21 +385,53 @@ where
 /// reset or error in that time ends the relay with its reason and drops
 /// `connect`. A connect that fails ends it with the connect's reason.
 /// `connect` should carry its own deadline, as [`connect`] does.
-pub async fn proxy_with<C, U, F>(mut client: C, connect: F, cfg: &RelayConfig) -> Outcome
+pub async fn proxy_with<C, U, F>(client: C, connect: F, cfg: &RelayConfig) -> Outcome
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
     F: Future<Output = Result<U, CloseReason>>,
 {
+    proxy_paced(client, connect, cfg, Unpaced, std::future::pending()).await
+}
+
+/// [`proxy_with`] with a [`Pace`] on the data path and a `stop` future:
+/// when `stop` completes, the relay ends at once with the reason it gives
+/// and both sockets are closed.
+pub async fn proxy_paced<C, U, F, P, S>(
+    mut client: C,
+    connect: F,
+    cfg: &RelayConfig,
+    mut pace: P,
+    stop: S,
+) -> Outcome
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+    F: Future<Output = Result<U, CloseReason>>,
+    P: Pace,
+    S: Future<Output = CloseReason>,
+{
     let mut pipe = Pipe::new(cfg.buffer_size);
     let mut connect = pin!(connect);
+    let mut stop = pin!(stop);
+    let far = deadline(Instant::now(), Duration::MAX);
+    let mut timer = pin!(sleep_until(far));
     let connected = poll_fn(|cx| {
+        if let Poll::Ready(reason) = stop.as_mut().poll(cx) {
+            return Poll::Ready(Err(reason));
+        }
         if let Poll::Ready(r) = connect.as_mut().poll(cx) {
             return Poll::Ready(r);
         }
-        match pipe.fill(UP, &mut client, cx) {
-            Ok(()) => Poll::Pending,
-            Err(reason) => Poll::Ready(Err(reason)),
+        loop {
+            if let Err(reason) = pipe.fill(UP, &mut client, &mut pace, cx) {
+                return Poll::Ready(Err(reason));
+            }
+            match pipe.timers(&mut pace, None, &mut timer, cx) {
+                Ok(true) => continue,
+                Ok(false) => return Poll::Pending,
+                Err(reason) => return Poll::Ready(Err(reason)),
+            }
         }
     })
     .await;
@@ -321,27 +441,27 @@ where
     };
     pipe.last_io = Instant::now();
     let idle_timeout = cfg.idle_timeout;
-    let mut idle = pin!(sleep_until(deadline(pipe.last_io, idle_timeout)));
     let reason = poll_fn(|cx| {
-        if let Err(reason) = pipe.pump(UP, &mut client, &mut upstream, cx) {
+        if let Poll::Ready(reason) = stop.as_mut().poll(cx) {
             return Poll::Ready(reason);
         }
-        if let Err(reason) = pipe.pump(DOWN, &mut upstream, &mut client, cx) {
-            return Poll::Ready(reason);
-        }
-        if pipe.shut[UP] && pipe.shut[DOWN] {
-            return Poll::Ready(CloseReason::Done);
-        }
-        // The timer is moved only when it fires: a busy connection costs
-        // one clock read per read, not a timer update.
-        while idle.as_mut().poll(cx).is_ready() {
-            let due = deadline(pipe.last_io, idle_timeout);
-            if due <= Instant::now() {
-                return Poll::Ready(CloseReason::IdleTimeout);
+        loop {
+            if let Err(reason) = pipe.pump(UP, &mut client, &mut upstream, &mut pace, cx) {
+                return Poll::Ready(reason);
             }
-            idle.as_mut().reset(due);
+            if let Err(reason) = pipe.pump(DOWN, &mut upstream, &mut client, &mut pace, cx) {
+                return Poll::Ready(reason);
+            }
+            if pipe.shut[UP] && pipe.shut[DOWN] {
+                return Poll::Ready(CloseReason::Done);
+            }
+            match pipe.timers(&mut pace, Some(idle_timeout), &mut timer, cx) {
+                // A throttle ended: read again.
+                Ok(true) => continue,
+                Ok(false) => return Poll::Pending,
+                Err(reason) => return Poll::Ready(reason),
+            }
         }
-        Poll::Pending
     })
     .await;
     pipe.outcome(reason)
@@ -371,6 +491,8 @@ struct Pipe {
     bytes: [u64; 2],
     /// When anything was last read.
     last_io: Instant,
+    /// A direction its [`Pace`] told to wait is not read before this.
+    throttled: [Option<Instant>; 2],
 }
 
 impl Pipe {
@@ -384,6 +506,61 @@ impl Pipe {
             shut: [false; 2],
             bytes: [0; 2],
             last_io: Instant::now(),
+            throttled: [None; 2],
+        }
+    }
+
+    /// Runs whatever is due on the connection's one timer and sets it to
+    /// the next deadline: the idle timeout (once connected, `idle` is the
+    /// timeout), the end of each throttle and the pace's check. Returns
+    /// `Ok(true)` when a throttle ended, so the caller reads again, and
+    /// `Ok(false)` with the timer's waker registered otherwise. The timer
+    /// is reset only when the next deadline is earlier than it, or when it
+    /// fires: a busy connection costs one clock read per read, not a timer
+    /// update.
+    fn timers<P: Pace>(
+        &mut self,
+        pace: &mut P,
+        idle: Option<Duration>,
+        timer: &mut Pin<&mut tokio::time::Sleep>,
+        cx: &mut Context<'_>,
+    ) -> Result<bool, CloseReason> {
+        let mut resumed = false;
+        loop {
+            let mut next = idle.map(|d| deadline(self.last_io, d));
+            for t in self.throttled.into_iter().flatten() {
+                next = Some(next.map_or(t, |n| n.min(t)));
+            }
+            if let Some(t) = pace.deadline() {
+                next = Some(next.map_or(t, |n| n.min(t)));
+            }
+            let Some(next) = next else {
+                return Ok(resumed);
+            };
+            if next < timer.deadline() {
+                timer.as_mut().reset(next);
+            }
+            if timer.as_mut().poll(cx).is_pending() {
+                return Ok(resumed);
+            }
+            let now = Instant::now();
+            if let Some(d) = idle
+                && deadline(self.last_io, d) <= now
+            {
+                return Err(CloseReason::IdleTimeout);
+            }
+            if pace.deadline().is_some_and(|t| t <= now) {
+                pace.check()?;
+            }
+            for t in &mut self.throttled {
+                if t.is_some_and(|t| t <= now) {
+                    *t = None;
+                    resumed = true;
+                }
+            }
+            // Park the fired timer far ahead; the loop sets it to the next
+            // deadline.
+            timer.as_mut().reset(deadline(now, Duration::MAX));
         }
     }
 
@@ -396,16 +573,20 @@ impl Pipe {
     }
 
     /// Reads direction `dir`'s source into its buffer until the buffer is
-    /// full, the source has nothing more for now, or it ends. When it
-    /// returns with room left and no end of stream, the source's waker is
-    /// registered.
-    fn fill<S: AsyncRead + Unpin>(
+    /// full, the source has nothing more for now, it ends, or `pace` says
+    /// to wait. When it returns with room left, no end of stream and no
+    /// wait, the source's waker is registered.
+    fn fill<S: AsyncRead + Unpin, P: Pace>(
         &mut self,
         dir: usize,
         src: &mut S,
+        pace: &mut P,
         cx: &mut Context<'_>,
     ) -> Result<(), CloseReason> {
         while !self.eof[dir] {
+            if self.throttled[dir].is_some() {
+                return Ok(());
+            }
             if self.end[dir] == self.cap {
                 if self.start[dir] == 0 {
                     return Ok(());
@@ -418,19 +599,37 @@ impl Pipe {
                 self.end[dir] -= self.start[dir];
                 self.start[dir] = 0;
             }
+            let d = Direction::of(dir);
+            let room = self.cap - self.end[dir];
+            let grant = match pace.reserve(d, room) {
+                Grant::Read(n) => n.clamp(1, room),
+                Grant::Wait(until) => {
+                    self.throttled[dir] = Some(until);
+                    return Ok(());
+                }
+            };
             let base = dir * self.cap;
-            let mut rb = ReadBuf::new(&mut self.mem[base + self.end[dir]..base + self.cap]);
+            let mut rb =
+                ReadBuf::new(&mut self.mem[base + self.end[dir]..base + self.end[dir] + grant]);
             match Pin::new(&mut *src).poll_read(cx, &mut rb) {
-                Poll::Pending => return Ok(()),
-                Poll::Ready(Err(e)) => return Err(CloseReason::of_io(dir == UP, &e)),
+                Poll::Pending => {
+                    pace.give_back(d, grant);
+                    return Ok(());
+                }
+                Poll::Ready(Err(e)) => {
+                    pace.give_back(d, grant);
+                    return Err(CloseReason::of_io(dir == UP, &e));
+                }
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
+                    pace.give_back(d, grant - n);
                     if n == 0 {
                         self.eof[dir] = true;
                     } else {
                         self.end[dir] += n;
                         self.bytes[dir] += n as u64;
                         self.last_io = Instant::now();
+                        pace.moved(d, n);
                     }
                 }
             }
@@ -442,16 +641,18 @@ impl Pipe {
     /// an end of stream on once the buffer is empty, and reads more while
     /// there is room. Returns once nothing more can happen without a wake,
     /// with every waker it waits on registered.
-    fn pump<S, D>(
+    fn pump<S, D, P>(
         &mut self,
         dir: usize,
         src: &mut S,
         dst: &mut D,
+        pace: &mut P,
         cx: &mut Context<'_>,
     ) -> Result<(), CloseReason>
     where
         S: AsyncRead + Unpin,
         D: AsyncWrite + Unpin,
+        P: Pace,
     {
         // The destination is the client for the client-bound direction.
         let dst_is_client = dir == DOWN;
@@ -491,11 +692,12 @@ impl Pipe {
                 return Ok(());
             }
             let before = self.bytes[dir];
-            self.fill(dir, src, cx)?;
+            self.fill(dir, src, pace, cx)?;
             if self.bytes[dir] == before && !self.eof[dir] {
                 // Nothing was read: the source is pending (its waker is
-                // registered) or the buffer is full behind a blocked
-                // write (the destination's waker is).
+                // registered), the buffer is full behind a blocked write
+                // (the destination's waker is), or the direction is
+                // throttled (the caller's timer is).
                 return Ok(());
             }
         }
@@ -532,6 +734,8 @@ mod tests {
                 "client_error",
                 "upstream_reset",
                 "upstream_error",
+                "slow_client",
+                "drain_timeout",
             ]
         );
         for r in CloseReason::ALL {
@@ -571,6 +775,9 @@ mod tests {
         );
         assert!(!CloseReason::Done.is_reset() && !CloseReason::Done.is_upstream_failure());
         assert!(!CloseReason::IdleTimeout.is_reset());
+        for r in [CloseReason::SlowClient, CloseReason::DrainTimeout] {
+            assert!(!r.is_reset() && !r.is_upstream_failure());
+        }
     }
 
     #[test]
@@ -934,6 +1141,279 @@ mod tests {
         });
         assert_eq!(out.reason, CloseReason::Done);
         assert_eq!(written, data);
+    }
+
+    /// A [`Pace`] that grants from a shared byte budget per direction,
+    /// refilled by the test, and records what the relay told it.
+    #[derive(Default)]
+    struct Budget {
+        left: [usize; 2],
+        /// How long to wait when the budget is empty.
+        wait: Duration,
+        reserved: [usize; 2],
+        given_back: [usize; 2],
+        moved: [usize; 2],
+        waits: usize,
+        check_at: Option<Instant>,
+        check_every: Duration,
+        checks: usize,
+        fail_after_checks: Option<usize>,
+    }
+
+    #[derive(Clone)]
+    struct Shared(Arc<Mutex<Budget>>);
+
+    impl Pace for Shared {
+        fn reserve(&mut self, dir: Direction, want: usize) -> Grant {
+            let mut b = self.0.lock().unwrap();
+            let i = dir as usize;
+            if b.left[i] == 0 {
+                b.waits += 1;
+                return Grant::Wait(Instant::now() + b.wait);
+            }
+            let n = want.min(b.left[i]);
+            b.left[i] -= n;
+            b.reserved[i] += n;
+            Grant::Read(n)
+        }
+        fn give_back(&mut self, dir: Direction, unused: usize) {
+            let mut b = self.0.lock().unwrap();
+            b.left[dir as usize] += unused;
+            b.given_back[dir as usize] += unused;
+        }
+        fn moved(&mut self, dir: Direction, n: usize) {
+            self.0.lock().unwrap().moved[dir as usize] += n;
+        }
+        fn deadline(&self) -> Option<Instant> {
+            self.0.lock().unwrap().check_at
+        }
+        fn check(&mut self) -> Result<(), CloseReason> {
+            let mut b = self.0.lock().unwrap();
+            b.checks += 1;
+            if b.fail_after_checks.is_some_and(|n| b.checks > n) {
+                return Err(CloseReason::SlowClient);
+            }
+            let every = b.check_every;
+            b.check_at = b.check_at.map(|_| Instant::now() + every);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unpaced_grants_everything() {
+        let mut p = Unpaced;
+        assert_eq!(p.reserve(Direction::Up, 7), Grant::Read(7));
+        p.give_back(Direction::Down, 3);
+        p.moved(Direction::Down, 3);
+        assert_eq!(p.deadline(), None);
+        assert_eq!(p.check(), Ok(()));
+        assert_eq!(Direction::of(UP), Direction::Up);
+        assert_eq!(Direction::of(DOWN), Direction::Down);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_direction_waits_for_its_grant_and_resumes() {
+        let (mut c, c_proxy) = duplex(1 << 16);
+        let (u_proxy, mut u) = duplex(1 << 16);
+        let budget = Shared(Arc::new(Mutex::new(Budget {
+            left: [10, usize::MAX / 2],
+            wait: Duration::from_millis(100),
+            ..Budget::default()
+        })));
+        let pace = budget.clone();
+        let task = tokio::spawn(async move {
+            proxy_paced(
+                c_proxy,
+                ready(Ok(u_proxy)),
+                &cfg(64),
+                pace,
+                std::future::pending(),
+            )
+            .await
+        });
+        c.write_all(&[7u8; 25]).await.unwrap();
+        let mut buf = [0u8; 10];
+        u.read_exact(&mut buf).await.unwrap();
+        // The upstream got the first 10 and nothing more while the budget
+        // is empty.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut more = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), u.read(&mut more))
+                .await
+                .is_err()
+        );
+        assert!(budget.0.lock().unwrap().waits >= 1);
+        // Refill: after the wait the rest flows.
+        budget.0.lock().unwrap().left[0] = 1000;
+        let mut rest = [0u8; 15];
+        u.read_exact(&mut rest).await.unwrap();
+        c.shutdown().await.unwrap();
+        u.shutdown().await.unwrap();
+        let out = task.await.unwrap();
+        assert_eq!(out.reason, CloseReason::Done);
+        assert_eq!(out.bytes_up, 25);
+        let b = budget.0.lock().unwrap();
+        assert_eq!(b.moved[0], 25);
+        // Every byte reserved and not read went back.
+        assert_eq!(b.reserved[0] - b.given_back[0], 25);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_throttle_while_connecting_holds_the_client_back() {
+        let (mut c, c_proxy) = duplex(1 << 16);
+        let (u_proxy, mut u) = duplex(1 << 16);
+        let budget = Shared(Arc::new(Mutex::new(Budget {
+            left: [4, 0],
+            wait: Duration::from_millis(100),
+            ..Budget::default()
+        })));
+        let pace = budget.clone();
+        let connect = async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(u_proxy)
+        };
+        let task = tokio::spawn(async move {
+            proxy_paced(c_proxy, connect, &cfg(64), pace, std::future::pending()).await
+        });
+        c.write_all(b"abcdefgh").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Four bytes were read while connecting; the rest wait.
+        assert_eq!(budget.0.lock().unwrap().moved[0], 4);
+        {
+            let mut b = budget.0.lock().unwrap();
+            b.left = [100, 100];
+        }
+        let mut got = [0u8; 8];
+        u.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"abcdefgh");
+        drop(c);
+        drop(u);
+        let out = task.await.unwrap();
+        assert_eq!(out.bytes_up, 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_check_ends_the_relay_with_its_reason() {
+        let (mut c, c_proxy) = duplex(1024);
+        let (u_proxy, _u) = duplex(1024);
+        let budget = Shared(Arc::new(Mutex::new(Budget {
+            left: [usize::MAX / 2; 2],
+            check_at: Some(Instant::now() + Duration::from_secs(2)),
+            check_every: Duration::from_millis(200),
+            fail_after_checks: Some(3),
+            ..Budget::default()
+        })));
+        let pace = budget.clone();
+        let start = Instant::now();
+        let task = tokio::spawn(async move {
+            proxy_paced(
+                c_proxy,
+                ready(Ok(u_proxy)),
+                &cfg(64),
+                pace,
+                std::future::pending(),
+            )
+            .await
+        });
+        c.write_all(b"x").await.unwrap();
+        let out = task.await.unwrap();
+        assert_eq!(out.reason, CloseReason::SlowClient);
+        assert_eq!(out.bytes_up, 1);
+        // Checks at 2.0, 2.2 and 2.4 s pass; the one at 2.6 s cuts.
+        assert_eq!(start.elapsed(), Duration::from_millis(2600));
+        assert_eq!(budget.0.lock().unwrap().checks, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_check_can_fail_while_connecting() {
+        let (_c, c_proxy) = duplex(1024);
+        let budget = Shared(Arc::new(Mutex::new(Budget {
+            left: [10; 2],
+            check_at: Some(Instant::now() + Duration::from_secs(1)),
+            fail_after_checks: Some(0),
+            ..Budget::default()
+        })));
+        let out = proxy_paced(
+            c_proxy,
+            std::future::pending::<Result<tokio::io::DuplexStream, CloseReason>>(),
+            &cfg(64),
+            budget,
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(out.reason, CloseReason::SlowClient);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_ends_the_relay_with_its_reason_connected_or_not() {
+        let (_c, c_proxy) = duplex(1024);
+        let (u_proxy, _u) = duplex(1024);
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            CloseReason::DrainTimeout
+        };
+        let out = proxy_paced(c_proxy, ready(Ok(u_proxy)), &cfg(64), Unpaced, stop).await;
+        assert_eq!(out.reason, CloseReason::DrainTimeout);
+        let (_c, c_proxy) = duplex(1024);
+        let stop = async { CloseReason::DrainTimeout };
+        let out = proxy_paced(
+            c_proxy,
+            std::future::pending::<Result<tokio::io::DuplexStream, CloseReason>>(),
+            &cfg(64),
+            Unpaced,
+            stop,
+        )
+        .await;
+        assert_eq!(out.reason, CloseReason::DrainTimeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_timeout_still_fires_under_pacing() {
+        let (_c, c_proxy) = duplex(1024);
+        let (u_proxy, _u) = duplex(1024);
+        let budget = Shared(Arc::new(Mutex::new(Budget {
+            left: [0, 0],
+            wait: Duration::from_millis(100),
+            ..Budget::default()
+        })));
+        let start = Instant::now();
+        let cfg = RelayConfig::new(64, Duration::from_secs(5), Duration::from_secs(3)).unwrap();
+        let out = proxy_paced(
+            c_proxy,
+            ready(Ok(u_proxy)),
+            &cfg,
+            budget.clone(),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(out.reason, CloseReason::IdleTimeout);
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        // It asked again after every wait, about 30 times in 3 s.
+        let waits = budget.0.lock().unwrap().waits;
+        assert!((50..=70).contains(&waits), "{waits}");
+    }
+
+    #[tokio::test]
+    async fn an_error_on_a_paced_read_gives_the_grant_back() {
+        let client = Scripted::new(vec![Step::ReadErr(io::ErrorKind::ConnectionReset)]);
+        let upstream = Scripted::new(vec![Step::Pending]);
+        let budget = Shared(Arc::new(Mutex::new(Budget {
+            left: [100, 100],
+            ..Budget::default()
+        })));
+        let out = proxy_paced(
+            client,
+            ready(Ok(upstream)),
+            &cfg(16),
+            budget.clone(),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(out.reason, CloseReason::ClientReset);
+        let b = budget.0.lock().unwrap();
+        assert_eq!(b.reserved[0], b.given_back[0]);
+        assert_eq!(b.left[0], 100);
     }
 
     proptest! {
