@@ -1,0 +1,41 @@
+# The limiter track's reference: Envoy in front of the origin with its
+# global rate limit filter asking envoyproxy/ratelimit (backed by Redis)
+# about every request. The limit is set far above any scenario, so nothing
+# is refused and the cost measured is the decision in the request path.
+# All three containers share the target's CPUs and count as the target.
+product = "Envoy + envoyproxy/ratelimit"
+version = "1.39.6 + 9b8d6515"
+kind = "proxy"
+track = "limiter"
+image = "envoyproxy/envoy:v1.39.6@sha256:1fde8efee875e4e4f6a39a90fe49d9338e1caacce5762034ef9fb4bbb9ad6aed"
+port = 10000
+command = ["envoy", "-c", "/etc/envoy/envoy.yaml", "--concurrency", "{{cpus}}", "-l", "warn"]
+
+[files]
+"/etc/envoy/envoy.yaml" = "envoy.yaml"
+
+[[sidecars]]
+name = "redis"
+image = "redis:8.8.4-alpine@sha256:1273af45b299d2b8b60d0e400d90aa6c2c5b1794f01d6a7ca60ff3ba6e65efb5"
+command = ["redis-server", "--save", "", "--appendonly", "no"]
+
+[[sidecars]]
+name = "ratelimit"
+image = "envoyproxy/ratelimit:9b8d6515@sha256:eb91f04d863adb881e24b41743ec8befd9476f076b4de539c5cfb8979fbd8dc3"
+[sidecars.env]
+USE_STATSD = "false"
+LOG_LEVEL = "warn"
+REDIS_SOCKET_TYPE = "tcp"
+REDIS_URL = "redis:6379"
+# The service reads <root>/<subdirectory>/<app directory>/*.yaml: here
+# /home/nonroot/bench.yaml, a directory the image already has.
+RUNTIME_ROOT = "/"
+RUNTIME_SUBDIRECTORY = "home"
+RUNTIME_APPDIRECTORY = "nonroot"
+RUNTIME_WATCH_ROOT = "false"
+RUNTIME_IGNOREDOTFILES = "true"
+GRPC_PORT = "8081"
+PORT = "8080"
+DEBUG_PORT = "6070"
+[sidecars.files]
+"/home/nonroot/bench.yaml" = "ratelimit.yaml"

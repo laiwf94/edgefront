@@ -1,0 +1,14 @@
+# Apache Traffic Server, its Docker Hub image, as a reverse proxy with a RAM
+# cache and a cache volume of the shared size, the volume on a tmpfs.
+product = "Apache Traffic Server"
+version = "10.1.2"
+kind = "cache"
+image = "trafficserver/trafficserver:10.1.2@sha256:473e7a691fddb20b121f64f7b0cc57147a2a95e005b9d6d2950bede822b9f2fa"
+port = 8080
+command = ["traffic_server"]
+tmpfs = ["/opt/var/trafficserver:mode=1777"]
+
+[files]
+"/opt/etc/trafficserver/records.yaml" = "records.yaml"
+"/opt/etc/trafficserver/remap.config" = "remap.config"
+"/opt/etc/trafficserver/storage.config" = "storage.config"

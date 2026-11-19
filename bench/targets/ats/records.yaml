@@ -1,0 +1,22 @@
+# Everything not set here is ATS's default. One worker thread per CPU,
+# a RAM cache of the shared size holding objects up to the largest one,
+# no access log, and no Via headers.
+records:
+  accept_threads: 1
+  exec_thread:
+    autoconfig:
+      enabled: 0
+    limit: {{cpus}}
+  http:
+    server_ports: {{port}}
+    insert_request_via_str: 0
+    insert_response_via_str: 0
+  cache:
+    max_doc_size: 0
+    ram_cache:
+      size: {{cache_bytes}}
+    ram_cache_cutoff: {{max_object_bytes}}
+  log:
+    logging_enabled: 0
+  url_remap:
+    remap_required: 1

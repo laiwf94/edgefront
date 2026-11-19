@@ -1,0 +1,16 @@
+# edgefront's cache node, built from this repository at the commit under
+# test: the binary alone on distroless, as it ships.
+product = "edgefront"
+version = "0.1.0"
+kind = "cache"
+image = "edgefront-bench/edgefront:local"
+build = { dockerfile = "bench/Dockerfile", stage = "edgefront" }
+port = 8080
+command = ["--config", "/etc/edgefront.toml"]
+
+[env]
+# Errors only, as every other target logs: no line per request.
+CACHET_LOG = "warn"
+
+[files]
+"/etc/edgefront.toml" = "edgefront.toml"

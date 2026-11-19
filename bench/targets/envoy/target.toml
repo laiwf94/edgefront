@@ -1,0 +1,12 @@
+# Envoy, the official image, with the HTTP cache filter on its in-memory
+# simple_http_cache. That store has no size limit, so Envoy is the one cache
+# here that is not held to the shared size; the working sets fit in memory.
+product = "Envoy"
+version = "1.39.6"
+kind = "cache"
+image = "envoyproxy/envoy:v1.39.6@sha256:1fde8efee875e4e4f6a39a90fe49d9338e1caacce5762034ef9fb4bbb9ad6aed"
+port = 10000
+command = ["envoy", "-c", "/etc/envoy/envoy.yaml", "--concurrency", "{{cpus}}", "-l", "warn"]
+
+[files]
+"/etc/envoy/envoy.yaml" = "envoy.yaml"

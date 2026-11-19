@@ -1,0 +1,14 @@
+# Varnish Cache, the official image, with malloc storage of the shared size.
+product = "Varnish Cache"
+version = "9.0.4"
+kind = "cache"
+image = "varnish:9.0.4@sha256:801d9ed8fa84ca018b3949de4b3c669040a1700dd3d8f2da627341327cc38f1e"
+port = 80
+entrypoint = "varnishd"
+# One thread pool per CPU (default 2), the rest at the defaults.
+command = ["-F", "-f", "/etc/varnish/bench.vcl", "-a", ":80", "-s", "malloc,{{cache_mib}}M", "-p", "thread_pools={{cpus}}"]
+# varnishd compiles its VCL into its working directory, so it needs exec.
+tmpfs = ["/var/lib/varnish/varnishd:exec,mode=1777"]
+
+[files]
+"/etc/varnish/bench.vcl" = "bench.vcl"

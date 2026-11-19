@@ -1,0 +1,44 @@
+# One worker per CPU, the cache filter before the router, and no limits
+# below the load: the circuit breakers are raised past any scenario.
+static_resources:
+  listeners:
+  - name: bench
+    address:
+      socket_address: { address: 0.0.0.0, port_value: {{port}} }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: bench
+          codec_type: AUTO
+          route_config:
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/" }
+                route: { cluster: origin, timeout: 60s }
+          http_filters:
+          - name: envoy.filters.http.cache
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.cache.v3.CacheConfig
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.http.cache.simple_http_cache.v3.SimpleHttpCacheConfig
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: origin
+    type: STRICT_DNS
+    connect_timeout: 5s
+    circuit_breakers:
+      thresholds:
+      - { max_connections: 100000, max_pending_requests: 100000, max_requests: 100000 }
+    load_assignment:
+      cluster_name: origin
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: {{origin_host}}, port_value: {{origin_port}} }

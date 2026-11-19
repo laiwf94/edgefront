@@ -1,0 +1,10 @@
+# HAProxy, the official image, with its built-in cache of the shared size.
+product = "HAProxy"
+version = "3.2.26"
+kind = "cache"
+image = "haproxy:3.2.26@sha256:1242e4006ac3f1ed15871efadca3d8d089e76f720017a1c51747133ee40cc953"
+port = 8080
+command = ["haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+
+[files]
+"/usr/local/etc/haproxy/haproxy.cfg" = "haproxy.cfg"

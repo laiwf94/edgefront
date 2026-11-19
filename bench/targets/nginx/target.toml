@@ -1,0 +1,12 @@
+# NGINX open source, the official Alpine image, with proxy_cache on a tmpfs
+# of the shared size.
+product = "NGINX"
+version = "1.30.7"
+kind = "cache"
+image = "nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598"
+port = 80
+command = ["nginx", "-g", "daemon off;"]
+tmpfs = ["/var/cache/nginx"]
+
+[files]
+"/etc/nginx/nginx.conf" = "nginx.conf"

@@ -1,0 +1,8 @@
+# One descriptor for every request, with a limit no scenario reaches.
+domain: bench
+descriptors:
+  - key: generic_key
+    value: all
+    rate_limit:
+      unit: second
+      requests_per_unit: 1000000000

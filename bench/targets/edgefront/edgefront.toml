@@ -1,0 +1,16 @@
+# The benchmark's edgefront node: the shared cache size and largest object,
+# everything else at its default.
+node_id = "bench"
+listen = "0.0.0.0:{{port}}"
+admin_listen = "127.0.0.1:9090"
+
+[[origins]]
+name = "origin"
+url = "http://{{origin}}"
+
+[cache]
+memory_bytes = {{cache_bytes}}
+max_object_bytes = {{max_object_bytes}}
+
+[health]
+path = "/__origin/healthz"
