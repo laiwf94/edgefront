@@ -27,6 +27,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The runner uses the images built below under their :local tags.
+  EDGEFRONT_BENCH_TAG: local
 
 jobs:
   harness:

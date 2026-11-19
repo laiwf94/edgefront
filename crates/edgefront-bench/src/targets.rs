@@ -81,6 +81,36 @@ pub const READY_WITHIN: Duration = Duration::from_secs(90);
 /// generator.
 pub const HARNESS_IMAGE: &str = "edgefront-bench/harness:local";
 
+/// The container that is the runtime-wide benchmark lock.
+pub const LOCK: &str = "edgefront-bench-lock";
+
+/// This host's name, as `hostname` prints it.
+fn host() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Whether a lock owner, `pid@host`, is a process on this host that no
+/// longer runs. An owner on another host, or one that cannot be read, is
+/// never taken for dead.
+fn is_dead(owner: &str) -> bool {
+    let Some((pid, owner_host)) = owner.split_once('@') else {
+        return false;
+    };
+    if owner_host != host() || pid.parse::<u32>().is_err() {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| !s.success())
+}
+
 /// The smallest cache any target gets.
 const MIN_CACHE: u64 = 64 << 20;
 
@@ -448,6 +478,32 @@ pub struct RunnerConfig {
     pub machine: String,
     /// The command line that started the run, recorded in each result.
     pub command: String,
+    /// The tag for images built from this repository in place of `local`
+    /// ([`local_tag`]).
+    pub local_tag: String,
+    /// How long to wait for another benchmark holding the runtime.
+    pub lock_wait: Duration,
+    /// How often to look while waiting.
+    pub lock_poll: Duration,
+}
+
+/// The tag for this checkout's own images: `EDGEFRONT_BENCH_TAG` when set
+/// (CI sets `local`, for the images it builds itself), otherwise `local-`
+/// and a hash of the repository root, so each checkout on a machine builds
+/// and runs its own.
+pub fn local_tag(root: &Path) -> String {
+    if let Ok(tag) = std::env::var("EDGEFRONT_BENCH_TAG")
+        && !tag.is_empty()
+    {
+        return tag;
+    }
+    // FNV-1a: stable across Rust releases, unlike the std hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in root.display().to_string().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("local-{:012x}", hash & 0xffff_ffff_ffff)
 }
 
 /// Runs scenarios against targets through a [`Runtime`].
@@ -525,6 +581,24 @@ impl<R: Runtime> Runner<R> {
         &self.machine
     }
 
+    /// The image a container runs: its own reference, except that an image
+    /// this repository builds, tagged `:local`, takes the runner's
+    /// [`RunnerConfig::local_tag`] instead, so two checkouts sharing one
+    /// container runtime never run each other's builds.
+    pub fn image(&self, container: &Container) -> String {
+        match container.image.strip_suffix(":local") {
+            Some(name) if container.build.is_some() => format!("{name}:{}", self.config.local_tag),
+            _ => container.image.clone(),
+        }
+    }
+
+    fn harness_image(&self) -> String {
+        match self.config.harness_image.strip_suffix(":local") {
+            Some(name) => format!("{name}:{}", self.config.local_tag),
+            None => self.config.harness_image.clone(),
+        }
+    }
+
     /// Makes sure every image is present: pulls pinned ones, builds local
     /// ones. `rebuild` builds local images even when they exist.
     pub fn prepare(&mut self, targets: &[Target], rebuild: bool) -> Result<(), String> {
@@ -544,15 +618,14 @@ impl<R: Runtime> Runner<R> {
         };
         let mut seen = Vec::new();
         for c in std::iter::once(&harness).chain(targets.iter().flat_map(Target::containers)) {
-            if seen.contains(&c.image) {
+            let image = self.image(c);
+            if seen.contains(&image) {
                 continue;
             }
-            seen.push(c.image.clone());
+            seen.push(image.clone());
             let present = self
                 .runtime
-                .exec(&args(&[
-                    "image", "inspect", "--format", "{{.Id}}", &c.image,
-                ]))
+                .exec(&args(&["image", "inspect", "--format", "{{.Id}}", &image]))
                 .is_ok();
             match &c.build {
                 Some(build) if rebuild || !present => {
@@ -564,12 +637,12 @@ impl<R: Runtime> Runner<R> {
                         "--target".into(),
                         build.stage.clone(),
                         "--tag".into(),
-                        c.image.clone(),
+                        image.clone(),
                         self.config.root.display().to_string(),
                     ])?;
                 }
                 None if !present => {
-                    self.runtime.exec(&args(&["pull", "--quiet", &c.image]))?;
+                    self.runtime.exec(&args(&["pull", "--quiet", &image]))?;
                 }
                 _ => {}
             }
@@ -584,6 +657,87 @@ impl<R: Runtime> Runner<R> {
         scenario: &Scenario,
         scenario_path: &Path,
         target: &Target,
+    ) -> Result<BenchResult, String> {
+        let stem = target.name.clone();
+        self.run_as(scenario, scenario_path, target, &stem)
+    }
+
+    /// As [`Runner::run`], writing `<out>/<scenario>/<stem>.json`: one of
+    /// several repeats, say.
+    pub fn run_as(
+        &mut self,
+        scenario: &Scenario,
+        scenario_path: &Path,
+        target: &Target,
+        stem: &str,
+    ) -> Result<BenchResult, String> {
+        self.lock()?;
+        let result = self.run_unlocked(scenario, scenario_path, target, stem);
+        let _ = self.runtime.exec(&args(&["rm", "--force", LOCK]));
+        result
+    }
+
+    /// Takes the runtime-wide benchmark lock: the container [`LOCK`],
+    /// which only one process can create. Two runs on one container runtime
+    /// would share its CPUs and measure each other, so a run waits for the
+    /// one before it, up to [`RunnerConfig::lock_wait`]. A lock whose owner
+    /// is a process on this host that has died is taken over.
+    fn lock(&mut self) -> Result<(), String> {
+        let owner = format!("{}@{}", std::process::id(), host());
+        let harness = self.harness_image();
+        let deadline = std::time::Instant::now() + self.config.lock_wait;
+        let mut said = false;
+        loop {
+            match self.runtime.exec(&[
+                "create".into(),
+                "--name".into(),
+                LOCK.into(),
+                "--label".into(),
+                format!("edgefront-bench.owner={owner}"),
+                harness.clone(),
+            ]) {
+                Ok(_) => return Ok(()),
+                Err(e) if !e.contains("already in use") => {
+                    return Err(format!("taking the benchmark lock: {e}"));
+                }
+                Err(_) => {}
+            }
+            let holder = self
+                .runtime
+                .exec(&args(&[
+                    "inspect",
+                    "--format",
+                    "{{index .Config.Labels \"edgefront-bench.owner\"}}",
+                    LOCK,
+                ]))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if is_dead(&holder) {
+                eprintln!("edgefront-bench: taking over the lock of {holder}, which has exited");
+                let _ = self.runtime.exec(&args(&["rm", "--force", LOCK]));
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "another benchmark ({holder}) has held the runtime for over {:?}; remove the container {LOCK} if it is stale",
+                    self.config.lock_wait
+                ));
+            }
+            if !said {
+                eprintln!("edgefront-bench: waiting for another benchmark ({holder}) to finish");
+                said = true;
+            }
+            std::thread::sleep(self.config.lock_poll);
+        }
+    }
+
+    fn run_unlocked(
+        &mut self,
+        scenario: &Scenario,
+        scenario_path: &Path,
+        target: &Target,
+        stem: &str,
     ) -> Result<BenchResult, String> {
         self.sequence += 1;
         let prefix = format!("efb-{}-{}", std::process::id(), self.sequence);
@@ -653,7 +807,7 @@ impl<R: Runtime> Runner<R> {
         let json = result.to_json()?;
         let dir = self.config.out.join(&scenario.name);
         std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-        let file = dir.join(format!("{}.json", target.name));
+        let file = dir.join(format!("{stem}.json"));
         std::fs::write(&file, json).map_err(|e| format!("{}: {e}", file.display()))?;
         Ok(result)
     }
@@ -670,7 +824,7 @@ impl<R: Runtime> Runner<R> {
     ) -> Result<(LoadOutcome, Vec<Image>), String> {
         let (target_cpus, origin_cpus, load_cpus) = self.cpus.clone();
         let vars = Vars::new(scenario, target.port, target_cpus.len());
-        let harness = self.config.harness_image.clone();
+        let harness = self.harness_image();
 
         let origin = format!("{prefix}-origin");
         let mut command = vec!["create".into(), "--name".into(), origin.clone()];
@@ -735,24 +889,25 @@ impl<R: Runtime> Runner<R> {
             .map_err(|e| format!("the load generator's output: {e}: {}", out.trim()))?;
 
         let mut images = Vec::new();
-        for container in target.containers() {
+        let refs: Vec<String> = target.containers().map(|c| self.image(c)).collect();
+        for image in refs {
             let text = self.runtime.exec(&args(&[
                 "image",
                 "inspect",
                 "--format",
                 "{{.Id}} {{.Size}}",
-                &container.image,
+                &image,
             ]))?;
             let (id, size) = text
                 .trim()
                 .split_once(' ')
-                .ok_or_else(|| format!("docker image inspect {}: {text:?}", container.image))?;
+                .ok_or_else(|| format!("docker image inspect {image}: {text:?}"))?;
             images.push(Image {
-                reference: container.image.clone(),
+                reference: image.clone(),
                 id: id.to_owned(),
                 size_bytes: size
                     .parse()
-                    .map_err(|_| format!("docker image inspect {}: {text:?}", container.image))?,
+                    .map_err(|_| format!("docker image inspect {image}: {text:?}"))?,
             });
         }
         // The target first, then its sidecars.
@@ -788,7 +943,7 @@ impl<R: Runtime> Runner<R> {
             command.push("--tmpfs".into());
             command.push(vars.render(mount)?);
         }
-        command.push(container.image.clone());
+        command.push(self.image(container));
         for arg in &container.command {
             command.push(vars.render(arg)?);
         }
@@ -1141,6 +1296,9 @@ mod tests {
             out: root.join("out"),
             machine: String::new(),
             command: "edgefront-bench run …".into(),
+            local_tag: "local-test".into(),
+            lock_wait: Duration::from_millis(300),
+            lock_poll: Duration::from_millis(50),
         }
     }
 
@@ -1218,10 +1376,18 @@ mod tests {
             && l.contains("-target:/etc/thing.conf")));
         assert!(log.iter().any(|l| l.contains(":/scenario.toml")));
         // Removed in reverse order, then the network.
-        let removes: Vec<&String> = log.iter().filter(|l| l.starts_with("rm --force")).collect();
+        let removes: Vec<&String> = log
+            .iter()
+            .filter(|l| l.starts_with("rm --force --volumes"))
+            .collect();
         assert_eq!(removes.len(), 4);
         assert!(removes[0].ends_with("-load") && removes[3].ends_with("-origin"));
-        assert!(log.last().unwrap().starts_with("network rm"));
+        assert!(log[log.len() - 2].starts_with("network rm"));
+        // The lock is taken first and given back last.
+        assert!(log.iter().any(|l| {
+            l.starts_with("create --name edgefront-bench-lock --label edgefront-bench.owner=")
+        }));
+        assert_eq!(log.last().unwrap(), "rm --force edgefront-bench-lock");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1255,10 +1421,17 @@ mod tests {
         );
         let log: Vec<String> = runner.runtime.log.iter().map(|a| a.join(" ")).collect();
         assert_eq!(
-            log.iter().filter(|l| l.starts_with("rm --force")).count(),
+            log.iter()
+                .filter(|l| l.starts_with("rm --force --volumes"))
+                .count(),
             3
         );
-        assert!(log.last().unwrap().starts_with("network rm"));
+        assert!(log[log.len() - 2].starts_with("network rm"));
+        // The lock is taken first and given back last.
+        assert!(log.iter().any(|l| {
+            l.starts_with("create --name edgefront-bench-lock --label edgefront-bench.owner=")
+        }));
+        assert_eq!(log.last().unwrap(), "rm --force edgefront-bench-lock");
 
         // A target not on its CPUs is refused.
         let fake = Fake {
@@ -1375,9 +1548,8 @@ mod tests {
             log.iter()
                 .any(|l| l == &format!("pull --quiet p:1{DIGEST}"))
         );
-        assert!(log.iter().any(
-            |l| l.starts_with("build --file") && l.contains("--target edgefront --tag b:local")
-        ));
+        assert!(log.iter().any(|l| l.starts_with("build --file")
+            && l.contains("--target edgefront --tag b:local-test")));
         assert!(!log.iter().any(|l| l.contains("--target harness")));
         assert_eq!(
             log.iter()
@@ -1396,6 +1568,143 @@ mod tests {
         let log: Vec<String> = runner.runtime.log.iter().map(|a| a.join(" ")).collect();
         assert!(log.iter().any(|l| l.contains("--target harness")));
         assert!(!log.iter().any(|l| l.starts_with("pull")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn each_checkout_tags_its_own_images() {
+        let a = local_tag(Path::new("/work/a"));
+        let b = local_tag(Path::new("/work/b"));
+        if std::env::var("EDGEFRONT_BENCH_TAG").is_err() {
+            assert!(a.starts_with("local-") && a.len() == 18, "{a}");
+            assert_ne!(a, b);
+            assert_eq!(a, local_tag(Path::new("/work/a")));
+        }
+        let mut built = scenario_container("edgefront-bench/edgefront:local");
+        built.build = Some(Build {
+            dockerfile: "bench/Dockerfile".into(),
+            stage: "edgefront".into(),
+        });
+        let pinned = scenario_container(&format!("varnish:9{DIGEST}"));
+        let root = scratch("tags");
+        let fake = Fake {
+            log: vec![],
+            answers: VecDeque::from([("info", Ok(INFO.into()))]),
+        };
+        let runner = Runner::new(fake, config(&root)).unwrap();
+        assert_eq!(runner.image(&built), "edgefront-bench/edgefront:local-test");
+        assert_eq!(runner.image(&pinned), format!("varnish:9{DIGEST}"));
+        assert_eq!(runner.harness_image(), "edgefront-bench/harness:local-test");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn scenario_container(image: &str) -> Container {
+        Container {
+            name: "target".into(),
+            image: image.into(),
+            build: None,
+            entrypoint: None,
+            command: vec![],
+            env: BTreeMap::new(),
+            tmpfs: vec![],
+            files: BTreeMap::new(),
+            user: None,
+        }
+    }
+
+    #[test]
+    fn a_held_lock_is_waited_for_and_a_dead_one_taken_over() {
+        let root = scratch("lock");
+        let dir = write_target(
+            &root,
+            "thing",
+            &format!(
+                "product = \"Thing\"\nversion = \"1\"\nkind = \"proxy\"\nimage = \"thing:1{DIGEST}\"\nport = 80\n"
+            ),
+            &[],
+        );
+        let target = Target::load(&dir).unwrap();
+        let held = || {
+            Err::<String, String>(
+                "Conflict. The container name \"/edgefront-bench-lock\" is already in use".into(),
+            )
+        };
+        // Held by a live process on another host: wait, then give up.
+        let fake = Fake {
+            log: vec![],
+            answers: VecDeque::from([
+                ("info", Ok(INFO.into())),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("create --name edgefront-bench-lock", held()),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+                ("inspect", Ok("1@elsewhere\n".into())),
+            ]),
+        };
+        let mut runner = Runner::new(fake, config(&root)).unwrap();
+        let err = runner
+            .run(&scenario(), &root.join("s.toml"), &target)
+            .unwrap_err();
+        assert!(err.contains("another benchmark (1@elsewhere)"), "{err}");
+        assert!(!runner.runtime.log.iter().any(|a| a[0] == "network"));
+
+        // Held by a process of this host that has exited: taken over.
+        let dead = format!("4000000@{}", host());
+        assert!(is_dead(&dead));
+        assert!(!is_dead(&format!("{}@{}", std::process::id(), host())));
+        assert!(!is_dead("nonsense") && !is_dead("x@y"));
+        let fake = Fake {
+            log: vec![],
+            answers: VecDeque::from([
+                ("info", Ok(INFO.into())),
+                ("create --name edgefront-bench-lock", held()),
+                ("inspect", Ok(dead.clone())),
+                ("start --attach", Ok(outcome("0-3"))),
+                ("image inspect", Ok("sha256:t 250".into())),
+            ]),
+        };
+        let mut runner = Runner::new(fake, config(&root)).unwrap();
+        runner
+            .run(&scenario(), &root.join("s.toml"), &target)
+            .unwrap();
+        let log: Vec<String> = runner.runtime.log.iter().map(|a| a.join(" ")).collect();
+        let creates = log
+            .iter()
+            .filter(|l| l.starts_with("create --name edgefront-bench-lock"))
+            .count();
+        assert_eq!(creates, 2, "{log:#?}");
+
+        // Any other failure to create the lock stops the run.
+        let fake = Fake {
+            log: vec![],
+            answers: VecDeque::from([
+                ("info", Ok(INFO.into())),
+                (
+                    "create --name edgefront-bench-lock",
+                    Err("docker create failed: no such image".into()),
+                ),
+            ]),
+        };
+        let mut runner = Runner::new(fake, config(&root)).unwrap();
+        let err = runner
+            .run(&scenario(), &root.join("s.toml"), &target)
+            .unwrap_err();
+        assert!(err.contains("taking the benchmark lock"), "{err}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -3,7 +3,8 @@
 # host's cargo cache makes this much faster than building in a container.
 # The context is a directory holding only `edgefront` and `edgefront-bench`
 # (release builds for the image's architecture, linked against a glibc no
-# newer than Debian 13's). Same stages and tags as bench/Dockerfile.
+# newer than Debian 13's). Same stages as bench/Dockerfile; CI tags them
+# :local and sets EDGEFRONT_BENCH_TAG=local.
 FROM gcr.io/distroless/cc-debian13:nonroot AS harness
 COPY edgefront-bench /edgefront-bench
 USER nonroot:nonroot

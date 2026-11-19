@@ -3,9 +3,13 @@
 # (or examples/bench.sh):
 #
 #   --target edgefront  the edgefront binary alone, the image the cache
-#                       comparison measures (edgefront-bench/edgefront:local)
+#                       comparison measures (edgefront-bench/edgefront)
 #   --target harness    edgefront-bench, for the origin and the load
-#                       generator (edgefront-bench/harness:local)
+#                       generator (edgefront-bench/harness)
+#
+# The runner tags them local-<hash of the checkout's path>, so checkouts
+# sharing one Docker never run each other's builds; EDGEFRONT_BENCH_TAG
+# overrides the tag.
 #
 # Both come from one build stage, so building the second reuses the first.
 FROM rust:1.99-slim-trixie AS build

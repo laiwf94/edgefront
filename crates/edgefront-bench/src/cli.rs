@@ -258,6 +258,9 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
         out: out.clone(),
         machine: flags.one("machine")?.unwrap_or("").to_owned(),
         command,
+        local_tag: targets::local_tag(&root),
+        lock_wait: Duration::from_secs(3 * 3600),
+        lock_poll: Duration::from_secs(5),
     };
     let mut runner = Runner::new(Docker, config).map_err(failed)?;
     eprintln!("edgefront-bench: preparing images");
