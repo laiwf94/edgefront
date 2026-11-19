@@ -1,0 +1,10 @@
+# libpacer's bench/bench_limiter.c as a scenario: decisions per second for
+# one shared GCRA (lock-free, and the mutex baseline) and a 200,000-key
+# table (spread over 10,000 keys per thread, and one hot key), at a rate of
+# 10^7 per second with a burst of 1000 and 50 ns between a thread's
+# decisions. `edgefront-bench limiter --scenario THIS [--c-bench BIN]`.
+name = "limiter-decisions"
+threads = [1, 2, 4, 8, 16]
+ops = 4000000
+runs = 3
+workloads = ["shared-gcra", "mutex-gcra", "table-spread", "table-hot"]

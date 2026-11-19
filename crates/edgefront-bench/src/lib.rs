@@ -28,12 +28,15 @@
 //! - [`gate`]: the regression gate: repeated runs against the baseline
 //!   commit's, judged metric by metric with a Mann-Whitney U test and a
 //!   tolerance, and fixed size ceilings.
+//! - [`limiter`]: limiter decisions per second at 1 to 16 threads, Rust
+//!   against libpacer's `bench_limiter` (`scenarios/limiter_decisions.toml`).
 //! - [`cli`]: the `edgefront-bench` command line.
 
 pub mod cli;
 pub mod client;
 pub mod gate;
 pub mod histogram;
+pub mod limiter;
 pub mod load;
 pub mod measure;
 pub mod origin;

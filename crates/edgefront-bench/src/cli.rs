@@ -31,6 +31,9 @@
 //! edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT
 //!                      [--cgroup-root DIR] [--cgroup ID]...
 //!     The load generator's side of a run, inside the network; prints JSON.
+//! edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
+//!     Limiter decisions per second, Rust and optionally libpacer's
+//!     bench_limiter, at each thread count; prints a Markdown table.
 //! ```
 //!
 //! Exit codes: 0 on success, 2 for bad usage, 1 when the work fails.
@@ -53,6 +56,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench validate FILE...
        edgefront-bench origin [--listen ADDR]
        edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
+       edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
 ";
 
 /// Why a command failed.
@@ -161,6 +165,7 @@ pub fn run(args: &[String]) -> Result<(), Failure> {
         "baseline" => baseline(rest),
         "origin" => serve_origin(rest),
         "load" => load(rest),
+        "limiter" => limiter(rest),
         "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
@@ -536,6 +541,38 @@ fn load(args: &[String]) -> Result<(), Failure> {
     let json = serde_json::to_string(&outcome).map_err(|e| failed(e.to_string()))?;
     println!("{json}");
     Ok(())
+}
+
+/// Writes `value` as JSON to `path`, when one was given.
+fn write_json<T: serde::Serialize>(path: Option<&str>, value: &T) -> Result<(), Failure> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let json = serde_json::to_string_pretty(value).map_err(|e| failed(e.to_string()))?;
+    std::fs::write(path, json + "\n").map_err(|e| failed(format!("{path}: {e}")))
+}
+
+fn read_text(path: &str) -> Result<String, Failure> {
+    std::fs::read_to_string(path).map_err(|e| failed(format!("{path}: {e}")))
+}
+
+fn limiter(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(args, &["scenario", "c-bench", "json"], &[])?;
+    flags.no_positional()?;
+    let path = flags.required("scenario")?;
+    let s = crate::limiter::Scenario::parse(&read_text(path)?)
+        .map_err(|e| failed(format!("{path}: {e}")))?;
+    let mut series = vec![crate::limiter::run_rust(&s)];
+    if let Some(c) = flags.one("c-bench")? {
+        series.push(crate::limiter::run_c(Path::new(c), &s).map_err(failed)?);
+    }
+    let report = crate::limiter::Report {
+        scenario: s.name.clone(),
+        threads: s.threads.clone(),
+        series,
+    };
+    print!("{}", report.markdown());
+    write_json(flags.one("json")?, &report)
 }
 
 /// How long a whole run of `scenarios` against `targets` takes at least.

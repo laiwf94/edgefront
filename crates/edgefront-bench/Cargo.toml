@@ -9,6 +9,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+edgefront-limiter.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true

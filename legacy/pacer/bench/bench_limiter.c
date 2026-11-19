@@ -116,7 +116,8 @@ static double run(enum kind kind, int threads)
     return (double)OPS_PER_THREAD * threads / secs;
 }
 
-int main(void)
+/* Thread counts come from the arguments (1 to 16 each), 1 2 4 8 without. */
+int main(int argc, char **argv)
 {
     static const struct {
         enum kind kind;
@@ -127,12 +128,29 @@ int main(void)
         {K_TABLE_SPREAD, "table, 10k keys per thread"},
         {K_TABLE_HOT, "table, one hot key"},
     };
-    static const int threads[] = {1, 2, 4, 8};
-    printf("%-44s %12s %12s %12s %12s\n", "decisions per second (millions)", "1 thread",
-           "2 threads", "4 threads", "8 threads");
+    int threads[16] = {1, 2, 4, 8};
+    int nthreads = 4;
+    if (argc > 1) {
+        nthreads = 0;
+        for (int i = 1; i < argc && nthreads < 16; i++) {
+            int t = atoi(argv[i]);
+            if (t < 1 || t > 16) {
+                fprintf(stderr, "usage: bench_limiter [THREADS...] (1 to 16 each)\n");
+                return 2;
+            }
+            threads[nthreads++] = t;
+        }
+    }
+    printf("%-44s", "decisions per second (millions)");
+    for (int i = 0; i < nthreads; i++) {
+        char col[16];
+        snprintf(col, sizeof col, "%d thread%s", threads[i], threads[i] == 1 ? "" : "s");
+        printf(" %12s", col);
+    }
+    printf("\n");
     for (size_t k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
         printf("%-44s", kinds[k].name);
-        for (size_t i = 0; i < sizeof threads / sizeof threads[0]; i++) {
+        for (int i = 0; i < nthreads; i++) {
             printf(" %12.1f", run(kinds[k].kind, threads[i]) / 1e6);
             fflush(stdout);
         }

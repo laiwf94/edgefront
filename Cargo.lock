@@ -299,6 +299,7 @@ name = "edgefront-bench"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "edgefront-limiter",
  "http",
  "http-body-util",
  "hyper",
