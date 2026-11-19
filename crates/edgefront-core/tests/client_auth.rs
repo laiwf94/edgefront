@@ -221,7 +221,11 @@ fn config_checks_client_auth_and_allowed_clients() {
     );
     assert_eq!(ok.clusters[0].allowed_clients.as_ref().unwrap().len(), 2);
     let optional = Config::from_json(
-        base("", r#","client_auth":{"ca_file":"/ca.pem","required":false}"#).as_bytes(),
+        base(
+            "",
+            r#","client_auth":{"ca_file":"/ca.pem","required":false}"#,
+        )
+        .as_bytes(),
     )
     .unwrap();
     assert!(!optional.tls.unwrap().client_auth.unwrap().required);
@@ -246,8 +250,16 @@ fn config_checks_client_auth_and_allowed_clients() {
             r#","client_auth":{"ca_file":"/ca.pem"}"#,
             "clusters[0].allowed_clients[0]",
         ),
-        ("", r#","client_auth":{}"#, "tls.client_auth.ca_file: is required"),
-        ("", r#","client_auth":{"ca_file":"x","bogus":1}"#, "tls.client_auth"),
+        (
+            "",
+            r#","client_auth":{}"#,
+            "tls.client_auth.ca_file: is required",
+        ),
+        (
+            "",
+            r#","client_auth":{"ca_file":"x","bogus":1}"#,
+            "tls.client_auth",
+        ),
     ] {
         let err = Config::from_json(base(cluster, tls).as_bytes())
             .unwrap_err()
