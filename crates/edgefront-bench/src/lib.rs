@@ -14,8 +14,13 @@
 //!   deterministic request source for [`load`].
 //! - [`measure`]: CPU sets, and the target's peak RSS, peak memory and CPU
 //!   time read from its cgroup.
+//! - [`report`]: the result of one scenario against one target as JSON,
+//!   held to `bench/schema/result.schema.json` ([`schema`]), and the
+//!   Markdown report made from many.
 
 pub mod histogram;
 pub mod load;
 pub mod measure;
+pub mod report;
 pub mod scenario;
+pub mod schema;

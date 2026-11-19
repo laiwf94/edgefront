@@ -1,6 +1,6 @@
 [package]
 name = "edgefront-bench"
-description = "The shared benchmark harness: an open-loop load generator with HDR latency histograms and TOML scenarios."
+description = "The shared benchmark harness: an open-loop load generator, TOML scenarios, a competitor runner over pinned containers, result schema and reports."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2"] }
 hyper-util.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 
