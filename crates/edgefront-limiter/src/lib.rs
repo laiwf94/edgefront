@@ -14,6 +14,7 @@ pub mod lint;
 pub mod rate;
 pub mod shape;
 pub mod siphash;
+pub mod slowloris;
 pub mod table;
 pub mod window;
 
@@ -27,5 +28,6 @@ pub use lint::{Class, Lint, lint};
 pub use rate::{Limiter, Plan, Quota, RateError, RateSpec};
 pub use shape::{Bandwidth, Reserve, Shaper};
 pub use siphash::KeyHash;
+pub use slowloris::{Check, SlowCheck};
 pub use table::{EntryState, FullPolicy, Table, TableConfig, TableStats};
 pub use window::Window;
