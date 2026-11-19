@@ -46,6 +46,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::histogram::Histogram;
+use crate::tls::TlsClient;
 
 /// The HTTP version the generator speaks, over cleartext TCP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,6 +209,8 @@ pub struct LoadConfig {
     pub timeout: Duration,
     /// The arrival schedule.
     pub schedule: Schedule,
+    /// Speak TLS to the target, with this client; `None` is cleartext.
+    pub tls: Option<TlsClient>,
 }
 
 impl LoadConfig {
@@ -221,6 +224,7 @@ impl LoadConfig {
             connections: 8,
             timeout: Duration::from_secs(10),
             schedule,
+            tls: None,
         }
     }
 }
@@ -453,6 +457,7 @@ struct Target {
     protocol: Protocol,
     timeout: Duration,
     source: Arc<dyn RequestSource>,
+    tls: Option<TlsClient>,
 }
 
 impl Target {
@@ -486,6 +491,7 @@ impl Target {
             protocol: config.protocol,
             timeout: config.timeout,
             source,
+            tls: config.tls.clone(),
         }))
     }
 
@@ -509,7 +515,11 @@ impl Target {
             }
             Protocol::Http2 => {
                 let mut parts = http::uri::Parts::default();
-                parts.scheme = Some(Scheme::HTTP);
+                parts.scheme = Some(if self.tls.is_some() {
+                    Scheme::HTTPS
+                } else {
+                    Scheme::HTTP
+                });
                 parts.authority = Some(self.authority.clone());
                 parts.path_and_query = Some(path);
                 // Scheme, authority and path are each valid, so the URI is.
@@ -527,7 +537,19 @@ impl Target {
             .map_err(|_| Failure::Connect)?;
         // Small requests are written whole; Nagle would only delay them.
         let _ = stream.set_nodelay(true);
-        let io = TokioIo::new(stream);
+        match &self.tls {
+            None => self.handshake(TokioIo::new(stream)).await,
+            Some(tls) => {
+                let stream = tls.connect(stream).await.map_err(|_| Failure::Connect)?;
+                self.handshake(TokioIo::new(stream)).await
+            }
+        }
+    }
+
+    async fn handshake<I>(&self, io: I) -> Result<Conn, Failure>
+    where
+        I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    {
         match self.protocol {
             Protocol::Http1 => {
                 let (sender, connection) =

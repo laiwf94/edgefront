@@ -90,6 +90,9 @@ pub struct ScenarioInfo {
     pub hit_ratio_target: f64,
     /// The bytes its popular objects take.
     pub working_set_bytes: u64,
+    /// The SNI the load went over TLS with; absent for cleartext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_name: Option<String>,
 }
 
 impl ScenarioInfo {
@@ -117,6 +120,7 @@ impl ScenarioInfo {
             },
             hit_ratio_target: scenario.keys.hit_ratio,
             working_set_bytes: scenario.working_set(),
+            tls_server_name: scenario.tls.clone(),
         }
     }
 }
@@ -614,6 +618,7 @@ pub(crate) mod tests {
                 rate: 1000.0,
                 hit_ratio_target: 0.9,
                 working_set_bytes: 1 << 20,
+                tls_server_name: None,
             },
             target: TargetInfo {
                 name: target.into(),

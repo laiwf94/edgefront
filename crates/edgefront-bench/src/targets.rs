@@ -66,6 +66,7 @@ use crate::report::{
     BenchResult, Image, Machine, Measured, PhaseSummary, SCHEMA, ScenarioInfo, TargetInfo,
 };
 use crate::scenario::Scenario;
+use crate::tls::TlsClient;
 
 /// The port the origin listens on inside the network.
 pub const ORIGIN_PORT: u16 = 9000;
@@ -177,6 +178,9 @@ struct TargetFile {
     user: Option<String>,
     #[serde(default)]
     sidecars: Vec<Container>,
+    /// The path of the target's binary in its image, whose size the result
+    /// records as `extra.binary_bytes`.
+    binary: Option<String>,
 }
 
 fn default_track() -> String {
@@ -204,6 +208,8 @@ pub struct Target {
     pub container: Container,
     /// The containers it needs, started first, in order.
     pub sidecars: Vec<Container>,
+    /// The path of its binary in the image, for `extra.binary_bytes`.
+    pub binary: Option<String>,
 }
 
 impl Target {
@@ -285,6 +291,11 @@ impl Target {
                 }
             }
         }
+        if let Some(b) = &file.binary
+            && !b.starts_with('/')
+        {
+            return Err(bad(format!("binary {b:?} must be an absolute path")));
+        }
         Ok(Target {
             name,
             dir: dir.to_owned(),
@@ -295,6 +306,7 @@ impl Target {
             port: file.port,
             container,
             sidecars: file.sidecars,
+            binary: file.binary,
         })
     }
 
@@ -650,6 +662,34 @@ impl<R: Runtime> Runner<R> {
         Ok(())
     }
 
+    /// The size of the file at `path` in `image`, copied out of a
+    /// container made from the image and never started.
+    fn binary_size(&mut self, prefix: &str, image: &str, path: &str) -> Result<u64, String> {
+        let name = format!("{prefix}-binary");
+        let dir = std::env::temp_dir().join(&name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let copy = dir.join("binary");
+        let result = self
+            .runtime
+            .exec(&args(&["create", "--name", &name, image]))
+            .and_then(|_| {
+                self.runtime.exec(&args(&[
+                    "cp",
+                    &format!("{name}:{path}"),
+                    &copy.display().to_string(),
+                ]))
+            })
+            .and_then(|_| {
+                std::fs::metadata(&copy)
+                    .map(|m| m.len())
+                    .map_err(|e| format!("{image}:{path}: {e}"))
+            });
+        let _ = self.runtime.exec(&args(&["rm", "--force", &name]));
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
     /// Runs `scenario` (read from `scenario_path`) against `target` and
     /// writes its result. Every container is removed afterwards.
     pub fn run(
@@ -777,6 +817,11 @@ impl<R: Runtime> Runner<R> {
         let _ = self.runtime.exec(&args(&["network", "rm", &network]));
         let (outcome, images) = outcome?;
         let image_size_bytes = images.iter().map(|i| i.size_bytes).sum();
+        let mut extra = BTreeMap::new();
+        if let Some(path) = &target.binary {
+            let bytes = self.binary_size(&prefix, &target.container.image, path)?;
+            extra.insert("binary_bytes".to_owned(), bytes as f64);
+        }
         let result = BenchResult {
             schema: SCHEMA.into(),
             run: self.config.run.clone(),
@@ -796,7 +841,7 @@ impl<R: Runtime> Runner<R> {
             measured: outcome.measured,
             phases: outcome.phases,
             resources: outcome.resources,
-            extra: BTreeMap::new(),
+            extra,
         };
         if result.resources.cpuset != self.machine.target_cpus {
             return Err(format!(
@@ -1026,7 +1071,18 @@ pub async fn load_and_measure(
 ) -> Result<LoadOutcome, String> {
     let target = resolve(&options.target).await?;
     let origin_addr = resolve(&options.origin).await?;
-    client::wait_ready(target, READY_PATH, options.ready_within)
+    let tls = scenario
+        .tls
+        .as_deref()
+        .map(|name| TlsClient::new(name, scenario.protocol))
+        .transpose()?;
+    // The readiness probe speaks HTTP/1.1, whatever the load speaks.
+    let probe = scenario
+        .tls
+        .as_deref()
+        .map(|name| TlsClient::new(name, crate::load::Protocol::Http1))
+        .transpose()?;
+    client::wait_ready_over(target, READY_PATH, options.ready_within, probe.as_ref())
         .await
         .map_err(|e| format!("the target at {}: {e}", options.target))?;
     let mut cgroups = Vec::new();
@@ -1063,6 +1119,7 @@ pub async fn load_and_measure(
     config.authority = options.target.clone();
     config.connections = scenario.connections;
     config.timeout = scenario.timeout;
+    config.tls = tls;
     let report = load::run(config, scenario.requests())
         .await
         .map_err(|e| e.to_string())?;

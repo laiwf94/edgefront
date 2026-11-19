@@ -12,6 +12,8 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 
+use crate::tls::TlsClient;
+
 /// The most a control response may carry.
 const MAX_BODY: usize = 1 << 20;
 
@@ -19,20 +21,46 @@ const MAX_BODY: usize = 1 << 20;
 /// Returns the body of a 2xx response; anything else is an error naming
 /// what went wrong.
 pub async fn get(addr: SocketAddr, path: &str, timeout: Duration) -> Result<Bytes, String> {
-    match tokio::time::timeout(timeout, exchange(addr, path)).await {
+    get_over(addr, path, timeout, None).await
+}
+
+/// Like [`get`], over TLS when `tls` is set.
+pub async fn get_over(
+    addr: SocketAddr,
+    path: &str,
+    timeout: Duration,
+    tls: Option<&TlsClient>,
+) -> Result<Bytes, String> {
+    match tokio::time::timeout(timeout, exchange(addr, path, tls)).await {
         Ok(result) => result,
         Err(_) => Err(format!("GET {path}: no answer within {timeout:?}")),
     }
 }
 
-async fn exchange(addr: SocketAddr, path: &str) -> Result<Bytes, String> {
+async fn exchange(addr: SocketAddr, path: &str, tls: Option<&TlsClient>) -> Result<Bytes, String> {
     let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("connect to {addr}: {e}"))?;
-    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|e| format!("handshake with {addr}: {e}"))?;
-    tokio::spawn(connection);
+    let handshake = |e: hyper::Error| format!("handshake with {addr}: {e}");
+    let (mut sender, connection) = match tls {
+        None => {
+            let (sender, connection) = http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(handshake)?;
+            (sender, tokio::spawn(connection))
+        }
+        Some(tls) => {
+            let stream = tls
+                .connect(stream)
+                .await
+                .map_err(|e| format!("tls handshake with {addr}: {e}"))?;
+            let (sender, connection) = http1::handshake(TokioIo::new(stream))
+                .await
+                .map_err(handshake)?;
+            (sender, tokio::spawn(connection))
+        }
+    };
+    drop(connection);
     let request = Request::get(path)
         .header(header::HOST, addr.to_string())
         .body(Empty::<Bytes>::new())
@@ -62,9 +90,19 @@ async fn exchange(addr: SocketAddr, path: &str) -> Result<Bytes, String> {
 /// Polls `GET path` on `addr` every 100 ms until it answers 2xx, for up to
 /// `within`. Returns the last error when it never does.
 pub async fn wait_ready(addr: SocketAddr, path: &str, within: Duration) -> Result<(), String> {
+    wait_ready_over(addr, path, within, None).await
+}
+
+/// Like [`wait_ready`], over TLS when `tls` is set.
+pub async fn wait_ready_over(
+    addr: SocketAddr,
+    path: &str,
+    within: Duration,
+    tls: Option<&TlsClient>,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
-        let error = match get(addr, path, Duration::from_secs(2)).await {
+        let error = match get_over(addr, path, Duration::from_secs(2), tls).await {
             Ok(_) => return Ok(()),
             Err(e) => e,
         };

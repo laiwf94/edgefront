@@ -23,6 +23,8 @@
 //! - [`report`]: the result of one scenario against one target as JSON,
 //!   held to `bench/schema/result.schema.json` ([`schema`]), and the
 //!   Markdown report made from many.
+//! - [`tls`]: the TLS client a scenario with `[tls]` loads its target
+//!   through.
 //! - [`cli`]: the `edgefront-bench` command line.
 
 pub mod cli;
@@ -35,3 +37,4 @@ pub mod report;
 pub mod scenario;
 pub mod schema;
 pub mod targets;
+pub mod tls;

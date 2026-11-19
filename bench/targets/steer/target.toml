@@ -1,0 +1,19 @@
+# steer, the Go proxy edgefront's proxy is ported from, built from
+# legacy/steer: one route to the origin, every setting at its default.
+product = "steer"
+version = "0.1.0"
+kind = "proxy"
+track = "proxy"
+image = "edgefront-bench/steer:local"
+build = { dockerfile = "bench/Dockerfile", stage = "steer" }
+port = 8080
+binary = "/steer"
+
+[env]
+STEER_CONFIG = "/etc/steer.json"
+# Warnings only, as every other target logs: no line per request.
+STEER_LOG_LEVEL = "warn"
+STEER_DRAIN_PERIOD = "0s"
+
+[files]
+"/etc/steer.json" = "proxy.json"

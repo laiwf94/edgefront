@@ -1,0 +1,27 @@
+# steer against edgefront proxy: cleartext HTTP/1.1 over 64 connections, stepped from
+# 20,000 to 120,000 requests per second, to find the rate each sustains.
+name = "steer-port-http1-64-ramp"
+description = "cleartext HTTP/1.1 to the origin through the proxy over 64 connections, from 20,000 to 120,000 requests per second in six 10-second steps."
+protocol = "http1"
+connections = 64
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 10000
+duration = "5s"
+
+[load]
+start = 20000
+step = 20000
+steps = 6
+step_duration = "10s"
+
+# The proxy caches nothing, so every request reaches the origin.
+[keys]
+count = 1000
+zipf = 1.0
+hit_ratio = 0.9
+
+[[objects]]
+size = "1KiB"

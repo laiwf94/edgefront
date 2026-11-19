@@ -13,3 +13,5 @@ Requests are `GET /obj/<size>/<name>`. `<size>` is the body length the origin se
 | `ramp` | 10,000, Zipf 1.0 | 2 to 8 KiB | 5,000 to 40,000/s in 8 steps, HTTP/2 | 95% | 5.0% | 34 MiB | 140 s |
 
 `crates/edgefront-bench/tests/scenarios.rs` reads every file here. It checks that each scenario reaches its target, that each working set fits in 1 GiB, and that `cache-hit` can run against two targets in under four minutes.
+
+`steer-port/` holds the proxy track's Go-vs-Rust scenarios, which `examples/bench-steer.sh` runs against steer and edgefront proxy (`docs/benchmarks/steer-go-vs-rust.md`). Each sends 1 KiB objects through the proxy to the origin: cleartext HTTP/1.1 (`http1-*`) and HTTP/1.1 over TLS (`tls-*`, with `[tls] server_name`), over 1 connection at 500 requests per second, and over 64 and 10,000 connections at 20,000, for 30 seconds after 5 of warm-up; and a ramp over 64 connections from 20,000 to 120,000 requests per second in six 10-second steps. The proxies cache nothing, so the hit ratio target only spreads requests over paths.

@@ -162,6 +162,8 @@ pub struct Scenario {
     pub keys: Keys,
     /// The size mix.
     pub objects: Vec<ObjectClass>,
+    /// Load the target over TLS with this SNI; `None` is cleartext.
+    pub tls: Option<String>,
     /// The probability a measured request asks for a once-only object.
     once_only: f64,
     /// The expected hit ratio of the measured requests.
@@ -182,6 +184,13 @@ struct RawScenario {
     load: RawLoad,
     keys: RawKeys,
     objects: Vec<RawObject>,
+    tls: Option<RawTls>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTls {
+    server_name: String,
 }
 
 #[derive(Deserialize)]
@@ -370,7 +379,20 @@ impl Scenario {
             });
         }
 
+        let tls = match raw.tls {
+            None => None,
+            Some(t) => {
+                rustls::pki_types::ServerName::try_from(t.server_name.as_str()).map_err(|_| {
+                    invalid(
+                        "tls.server_name",
+                        format!("{:?} is not a DNS name or IP address", t.server_name),
+                    )
+                })?;
+                Some(t.server_name)
+            }
+        };
         let mut scenario = Scenario {
+            tls,
             name: raw.name,
             description: raw.description,
             protocol,

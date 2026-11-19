@@ -303,9 +303,11 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "toml",
 ]
 

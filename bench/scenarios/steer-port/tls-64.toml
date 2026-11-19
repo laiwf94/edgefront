@@ -1,0 +1,29 @@
+# steer against edgefront proxy: HTTP/1.1 over TLS 1.3 through the proxy to the origin
+# over 64 keep-alive connections, at a constant 20,000 requests per second.
+name = "steer-port-tls-64"
+description = "HTTP/1.1 over TLS 1.3 to the origin through the proxy over 64 connections, 20,000 requests per second of 1 KiB objects."
+protocol = "http1"
+connections = 64
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 10000
+duration = "5s"
+
+[load]
+rate = 20000
+duration = "30s"
+
+# The proxy caches nothing, so every request reaches the origin; the keys
+# only spread the requests over distinct paths.
+[keys]
+count = 1000
+zipf = 1.0
+hit_ratio = 0.9
+
+[[objects]]
+size = "1KiB"
+
+[tls]
+server_name = "api.example.com"

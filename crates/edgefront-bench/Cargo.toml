@@ -15,9 +15,11 @@ http-body-util.workspace = true
 # HTTP/2 for the h2 client; the edge binary itself does not take it.
 hyper = { workspace = true, features = ["http2"] }
 hyper-util.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 toml.workspace = true
 
 [lints]

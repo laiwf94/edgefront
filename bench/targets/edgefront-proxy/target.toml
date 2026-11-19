@@ -1,0 +1,19 @@
+# edgefront proxy, the Rust port of steer, on steer's configuration: the binary
+# built from this repository at the commit under test, as it ships.
+product = "edgefront proxy"
+version = "0.1.0"
+kind = "proxy"
+track = "proxy"
+image = "edgefront-bench/edgefront:local"
+build = { dockerfile = "bench/Dockerfile", stage = "edgefront" }
+port = 8080
+command = ["proxy", "--config", "/etc/edgefront-proxy.json"]
+binary = "/edgefront"
+
+[env]
+# Warnings only, as every other target logs: no line per request.
+EDGEFRONT_LOG = "warn"
+EDGEFRONT_DRAIN_PERIOD = "0s"
+
+[files]
+"/etc/edgefront-proxy.json" = "proxy.json"
