@@ -178,6 +178,8 @@ jobs:
         run: DEMO_BIN=cachet examples/demo.sh
       - name: Limiter config demo
         run: examples/limiter_config.sh
+      - name: L4 limits demo (pacer's live demo on edgefront limits)
+        run: examples/l4_limits.sh
 
   docker:
     runs-on: ubuntu-latest

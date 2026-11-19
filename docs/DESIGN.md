@@ -317,7 +317,13 @@ The steps cover connecting from a given loopback address, an echo through the pr
 
 `make difftest-l4` builds pacerd and runs every script against both; it needs Linux, and the legacy-pacer workflow runs it on every push. `crates/edgefront/tests/pacer_scripts.rs` runs them against edgefront alone under `make test`. On 20 Nov 2026 all 23 passed against both binaries with identical transcripts, in an Ubuntu 24.04 container on this repository's benchmark Mac.
 
-`legacy/pacer` stays until its L4 data path and `pacerctl` are ported too (week 4).
+### The data path, end to end
+
+A connection's path through `edgefront limits`, in order: `Acceptor::accept` (or a shed on the spare descriptor), `Admission::admit` (listener cap, client hold and rate, quota), `l4::connect` to the listener's upstream as configured now, then `proxy_paced` with the connection's `ConnPace`. Each read first asks the `Shaper` (client bucket, then the listener's bucket or the direction's booking) and is reported to the `SlowCheck`; each wait is a throttle on the connection's one timer, which also carries the idle timeout and the slow-client check. The relay ends on `done`, a timeout, an error with its side, `slow_client`, or `drain_timeout` from the drain's stop signal; the reason is counted, the permit dropped, then `conn closed` logged. Memory per connection is the two buffers, allocated once (`buffer`, 16 KiB each by default), plus the task; memory per listener is fixed at start: the client table, the byte table and, with a quota, the quota table, each sized by `table_size`.
+
+`examples/l4_limits.sh` is pacer's live demo run against `edgefront limits` with the same config, peers and checks; it passes on Linux and macOS.
+
+`legacy/pacer` stays until `pacerctl`'s port and the published benchmark are done (week 4).
 
 ## What cachet is for
 

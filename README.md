@@ -109,7 +109,25 @@ if !d.allowed {
 
 `edgefront-difftest` holds the port to libpacer through `legacy/pacer/tests/diffdrive.c`, a C driver that reads one operation per line and prints each decision with the full state after it. `make difftest-pacer` diffs 100 generated scripts of 10,000 operations against the Rust crate and prints the seed, step and replay command of the first difference. `crates/edgefront-difftest/tests/e2e_limiter_port.rs` runs one million of those operations in CI on every push, plus a worked example of per-key limits, retry times and an hourly quota that both sides must answer exactly. How the port was checked and where it deliberately differs from the C is in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
 
-Still to come from pacer: the L4 data path with connection limits and shaping, which will enforce this config (week 3), and `pacerctl` with the published C-versus-Rust benchmark (week 4), after which `legacy/pacer` is removed.
+### L4 limits
+
+`edgefront limits -c CONFIG` runs pacerd's TCP proxy from a pacerd.conf, unchanged, or from the TOML limiter section. Each listener relays to its upstream through one fixed buffer per direction and enforces the config at accept and on every read:
+
+- **Connection limits.** `max_conns` per listener, `per_ip_max_conns` and `per_ip_conn_rate` per client (IPv6 clients grouped by `ipv6_prefix`), and the TOML-only `per_ip_conn_quota`. A refused connection is closed before any byte is read, and logged and counted under its reason.
+- **Bandwidth.** `per_ip_bandwidth` and `bandwidth` shape both directions by leaving a socket unread until its bucket refills, so TCP flow control holds the sender back; connections waiting for a listener's shared bucket are served in the order they asked.
+- **Slow clients.** `min_rate` closes a connection that moves fewer bytes than the minimum in a window, unless shaping held it back.
+- **Failures.** Out of file descriptors, pending connections are accepted and closed at once and the process stays idle; with the client table full of active clients, new addresses are refused and tracked ones keep their limits; an upstream that refuses, times out, resets or goes silent closes the client with its reason.
+- **Operation.** SIGTERM stops accepting and lets open connections finish until `drain_timeout`; SIGHUP applies new limits in place and refuses what needs a restart, keeping the running config. The log lines, counters and exit codes are pacerd's. The `admin_socket` speaks HTTP, and `edgefront ctl limits [-s SOCKET] stats|ping|reload|drain` is pacerctl.
+
+```sh
+edgefront limits -c pacerd.conf -t      # check the config
+edgefront limits -c pacerd.conf         # run
+edgefront ctl limits -s /run/pacerd/admin.sock stats
+```
+
+`examples/l4_limits.sh` is pacer's live demo on edgefront: the same config and clients, checking the connection-rate limit and its recovery, a slowloris client cut off beside a steady one, and a drain that finishes a download in flight byte for byte. CI runs it, and `crates/edgefront/tests/e2e_l4_limits.rs` runs it under `make test`. How it maps onto pacerd, and the two places it differs, are in [docs/DESIGN.md](docs/DESIGN.md#running-the-data-path-edgefront-limits).
+
+Still to come from pacer: the published C-versus-Rust benchmark and the rest of `pacerctl` (week 4), after which `legacy/pacer` is removed.
 
 ### Limiter config reference
 
