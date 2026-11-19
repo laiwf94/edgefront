@@ -220,7 +220,17 @@ Before two changes the table was 15 to 30% slower than the C on the same machine
 - **SipHash tail.** The bytes after the last whole block were copied into a zeroed buffer and loaded back as one 64-bit word. That load spans several narrower stores, which the processor cannot forward, so every hash waited for the stores to retire, on the path from key to shard to slot. The tail is now assembled in registers from at most a 4-, a 2- and a 1-byte load. libpacer's byte-at-a-time load never had the stall. This alone doubled the 10k-key rate.
 - **Entry alignment.** `Entry` is now `#[repr(align(64))]`, so each of its 64 bytes sits on one cache line and a probe or an LRU relink touches one line per entry. A heap slice of 64-byte values had only 16-byte alignment, and libpacer's `calloc` returns a large table's slots 16 bytes into a line, so three entries in four straddled two lines. This added about 8% with 10k keys and no memory.
 
-The absolute targets of 300 million GCRA and 18 million keyed-table decisions per second come from pacer's own numbers (313 and 19) on its reference machine, the Docker Desktop Linux VM on an Apple M4 Max; that machine still has to run these benchmarks. On the Xeon above the table reaches 18 million and the GCRA does not reach 300 million, and the C is further from both. To compare on any machine, run `cargo bench -p edgefront-limiter --bench decisions` and `make -C legacy/pacer bench-build && legacy/pacer/build/release/bench_limiter`, and read the 1-thread column.
+The absolute targets of 300 million GCRA and 18 million keyed-table decisions per second come from pacer's own numbers (313 and 19) on its reference machine, the Docker Desktop Linux VM (arm64, 16 vCPUs) on an Apple M4 Max. On that machine (Docker 28.0.4; Rust 1.99.1 and clang 18 in an Ubuntu 24.04 container), on 20 Nov 2026, four runs of each, single thread, in millions of decisions per second:
+
+| workload | Rust, SipHash-1-3 | Rust, SipHash-2-4 | C | target |
+|---|---:|---:|---:|---:|
+| GCRA take | 434 to 476 (median 456) | | 346 to 372 (median 360) | 300 |
+| table take, 10k keys | 32.0 to 32.8 (median 32.2) | 28.8 to 32.7 (median 31.7) | 20.8 to 24.5 (median 22.4) | 18 |
+| table take, one hot key | 107 to 114 (median 113) | 101 to 103 (median 102) | 67.3 to 68.7 (median 68.0) | |
+
+The Rust medians clear both targets and are ahead of the C on every row: by 27% on the GCRA, 44% with 10k keys and 67% with one hot key. The C numbers are close to pacer's published 313, 19 and 66. The Mac was shared with other jobs (load average 7 to 12 on 16 cores during these runs). An earlier set under heavier load (40 to 60) gave the C 345 to 351, 18.0 to 20.6 and 66.6 to 68.8, and the Rust 280 to 435, 23.1 to 32.3 and 99 to 113; every Rust median was ahead of the C there too, and above both targets.
+
+`scripts/bench-limiter-vm.sh [runs]` reproduces this: it builds the container image on first use, then runs `legacy/pacer/build/release/bench_limiter` (read its 1-thread column) and `cargo bench -p edgefront-limiter --bench decisions` (criterion's `Melem/s`) the given number of times each. On a Linux host the same two commands run without the container.
 
 ### Admission at accept
 
