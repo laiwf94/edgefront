@@ -12,7 +12,10 @@
 //!   `bench/scenarios/`: the schedule, the object size mix, Zipf key
 //!   popularity and a hit ratio target, turned into a schedule and a
 //!   deterministic request source for [`load`].
+//! - [`measure`]: CPU sets, and the target's peak RSS, peak memory and CPU
+//!   time read from its cgroup.
 
 pub mod histogram;
 pub mod load;
+pub mod measure;
 pub mod scenario;
