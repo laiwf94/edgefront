@@ -133,6 +133,8 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
   - A proxy with rules, a connection quota, overload, listener caps and a recording: a rate change refused for a restart, a mode change applied in place, and the recording flushed at SIGTERM.
   - `edgefront limits`' ban endpoints: bad arguments, IPv6 and IPv4-mapped bans, unbanning, and a bans file that cannot be saved.
 
+  - `edgefront ctl limits replay`: a report and its JSON, and each bad argument, recording, policy or output path refused with exit 2.
+
   They cover the binary's #100 and #103 paths that the gate's coverage floor found untested. (#100)
 - `shaping_off_is_fast` compares its unshaped 32 MiB download with the same download straight from the upstream, timed just before in the same run, and passes at up to ten times it (`max_vs_direct`, a new step field). It used to pass under a fixed 1.5 s, and failed CI's coverage gate at 1,615 ms. Locally the proxied download takes two to four times the direct one. (#88)
 - Listener-wide caps reach a running listener. `[listener] conn_rate`, `request_rate` and `max_in_flight` in an `edgefront proxy --limits` file put a filter on every route, checked before any rule: 429 with `Retry-After` past a rate, 503 past the in-flight cap, with a request's place held until its response is delivered. The connection rate goes through a new `Handler::admit_connection` in `edgefront_core::listener` (every connection by default) and `Proxy::with_connection_gate`, so a refused connection is closed before any handshake. `examples/penalty_box.sh` checks that six fresh connections under `conn_rate = "3/s burst 3"` get three served. (#100)

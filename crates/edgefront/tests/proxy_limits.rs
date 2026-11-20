@@ -366,3 +366,119 @@ fn the_ban_endpoints_check_what_they_are_given() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn ctl_replay(args: &[&str]) -> (i32, String) {
+    let out = Command::new(BIN)
+        .args(["ctl", "limits", "replay"])
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+#[test]
+fn ctl_replay_reports_and_refuses_what_it_cannot_read() {
+    use edgefront_limiter::record::{Outcome, Record, RecordConfig, Recorder};
+    let dir = scratch("ctl-replay");
+    let rec_dir = dir.join("rec");
+    let rec = Recorder::new(
+        RecordConfig {
+            dir: rec_dir.clone(),
+            ring: 1000,
+            file_bytes: 1 << 20,
+            files: 4,
+        },
+        vec!["api".into()],
+    )
+    .unwrap();
+    for i in 0..20u64 {
+        let outcome = if i < 2 {
+            Outcome::Allowed
+        } else {
+            Outcome::WouldRefuse
+        };
+        rec.record(Record::new(
+            1_000_000_000 + i,
+            0,
+            rec.hash(b"k"),
+            1,
+            outcome,
+        ));
+    }
+    rec.flush().unwrap();
+    let policy = dir.join("p.toml");
+    std::fs::write(
+        &policy,
+        "[[http_limits]]\nname = \"api\"\nrate = \"5/min burst 5\"\n",
+    )
+    .unwrap();
+    let json = dir.join("r.json");
+    let (code, out) = ctl_replay(&[
+        "--recording",
+        rec_dir.to_str().unwrap(),
+        "--policy",
+        policy.to_str().unwrap(),
+        "--top",
+        "5",
+        "--json",
+        json.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("| api | 20 | 18 | 15 | 0 | 3 | 1 | 1 |"),
+        "{out}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    assert_eq!(report["rules"][0]["refused_after"], 15);
+    let r = rec_dir.to_str().unwrap();
+    let p = policy.to_str().unwrap();
+    for (args, want) in [
+        (vec!["--recording", r], "usage:"),
+        (
+            vec!["--recording", r, "--policy", p, "--bogus", "x"],
+            "usage:",
+        ),
+        (
+            vec!["--recording", r, "--policy", p, "--top", "many"],
+            "--top: \"many\" is not a number",
+        ),
+        (
+            vec!["--recording", "/nonexistent-rec", "--policy", p],
+            "/nonexistent-rec",
+        ),
+        (
+            vec!["--recording", r, "--policy", "/nonexistent.toml"],
+            "cannot read /nonexistent.toml",
+        ),
+        (
+            vec![
+                "--recording",
+                r,
+                "--policy",
+                p,
+                "--json",
+                "/nonexistent-dir/r.json",
+            ],
+            "cannot write",
+        ),
+    ] {
+        let (code, out) = ctl_replay(&args);
+        assert_eq!(code, 2, "{args:?}: {out}");
+        assert!(out.contains(want), "{args:?}: {out}");
+    }
+    std::fs::write(
+        &policy,
+        "[[http_limits]]\nname = \"api\"\nrate = \"nope\"\n",
+    )
+    .unwrap();
+    let (code, out) = ctl_replay(&["--recording", r, "--policy", p]);
+    assert_eq!(code, 2);
+    assert!(out.contains("http_limits[0].rate"), "{out}");
+    std::fs::write(&policy, "[[http_limits]\n").unwrap();
+    assert_eq!(ctl_replay(&["--recording", r, "--policy", p]).0, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
