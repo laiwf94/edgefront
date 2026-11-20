@@ -1,5 +1,14 @@
 //! Building client responses from stored objects: Age, conditional
 //! requests (RFC 9110 section 13) and byte ranges.
+//!
+//! Preconditions are evaluated in RFC 9110 section 13.2.2's order against
+//! the stored representation: If-Match (strong comparison), then
+//! If-Unmodified-Since when there is no If-Match, either failing with 412;
+//! then If-None-Match, or If-Modified-Since without it, giving 304; then
+//! Range, only when the answer would otherwise be 200, and only if any
+//! If-Range holds. Several ranges are sent as `multipart/byteranges`
+//! (section 14.6), each part with the representation's Content-Type and
+//! its own Content-Range.
 
 use std::time::SystemTime;
 
@@ -34,6 +43,14 @@ pub fn from_cache(
     let age = HeaderValue::from(obj.freshness.current_age(now).as_secs());
     // Conditionals and ranges only make sense for a 200 representation.
     if obj.status == StatusCode::OK {
+        if precondition_failed(obj, req) {
+            let mut resp = Response::new(empty());
+            *resp.status_mut() = StatusCode::PRECONDITION_FAILED;
+            resp.headers_mut().insert(header::AGE, age);
+            resp.headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(0));
+            return resp;
+        }
         if not_modified(obj, req) {
             let mut resp = Response::new(empty());
             *resp.status_mut() = StatusCode::NOT_MODIFIED;
@@ -67,6 +84,36 @@ pub fn from_cache(
     *resp.status_mut() = obj.status;
     *resp.headers_mut() = headers;
     resp
+}
+
+/// Whether If-Match, or If-Unmodified-Since without it, fails against the
+/// stored representation (RFC 9110 sections 13.1.1, 13.1.4 and 13.2.2).
+/// If-Match uses the strong comparison, so a weak stored tag never
+/// matches a listed one, and `*` matches the stored representation. An
+/// If-Match that does not parse is ignored. If-Unmodified-Since is ignored
+/// when If-Match is present, when it is not one valid HTTP date, or when
+/// the representation has no Last-Modified.
+fn precondition_failed(obj: &CachedObject, req: &HeaderMap) -> bool {
+    if req.contains_key(header::IF_MATCH) {
+        return match EtagMatch::from_headers(req, &header::IF_MATCH) {
+            Some(EtagMatch::Any) => false,
+            Some(EtagMatch::Tags(tags)) => !obj
+                .etag
+                .as_ref()
+                .is_some_and(|e| tags.iter().any(|t| t.strong_eq(e))),
+            None => false,
+        };
+    }
+    if req.get_all(header::IF_UNMODIFIED_SINCE).iter().count() != 1 {
+        return false;
+    }
+    match (
+        date_header(req, &header::IF_UNMODIFIED_SINCE),
+        date_header(&obj.headers, &header::LAST_MODIFIED),
+    ) {
+        (Some(since), Some(modified)) => modified > since,
+        _ => false,
+    }
 }
 
 /// If-None-Match takes precedence; If-Modified-Since applies only without
@@ -130,11 +177,69 @@ fn ranged(obj: &CachedObject, req: &HeaderMap, age: &HeaderValue) -> Option<Resp
             headers.insert(header::CONTENT_LENGTH, HeaderValue::from(slice.len()));
             (StatusCode::PARTIAL_CONTENT, slice)
         }
+        ByteRange::Multiple(ranges) => {
+            let boundary = boundary(obj, &ranges);
+            let content_type = headers.remove(header::CONTENT_TYPE);
+            let body = multipart(&obj.body, &ranges, &boundary, content_type.as_ref());
+            let value =
+                HeaderValue::from_str(&format!("multipart/byteranges; boundary={boundary}"))
+                    .expect("ASCII");
+            headers.insert(header::CONTENT_TYPE, value);
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+            (StatusCode::PARTIAL_CONTENT, body)
+        }
     };
     let mut resp = Response::new(full(body));
     *resp.status_mut() = status;
     *resp.headers_mut() = headers;
     Some(resp)
+}
+
+/// A boundary that cannot occur in the parts: 32 hex digits of a hash of
+/// the body's bytes at the ranges and a process-wide counter, so two
+/// responses never share one. RFC 2046 allows up to 70 characters.
+fn boundary(obj: &CachedObject, ranges: &[(u64, u64)]) -> String {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (n, obj.body.len(), ranges).hash(&mut h);
+    let a = h.finish();
+    obj.body.hash(&mut h);
+    let b = h.finish();
+    format!("edgefront-{a:016x}{b:016x}")
+}
+
+/// The `multipart/byteranges` body: each part's headers, its bytes, CRLF,
+/// then the closing delimiter.
+fn multipart(
+    body: &Bytes,
+    ranges: &[(u64, u64)],
+    boundary: &str,
+    content_type: Option<&HeaderValue>,
+) -> Bytes {
+    let len = body.len();
+    let mut out = Vec::new();
+    for &(start, end) in ranges {
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        if let Some(ct) = content_type {
+            out.extend_from_slice(b"Content-Type: ");
+            out.extend_from_slice(ct.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(
+            format!("Content-Range: bytes {start}-{end}/{len}\r\n\r\n").as_bytes(),
+        );
+        out.extend_from_slice(&body[start as usize..=end as usize]);
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    Bytes::from(out)
 }
 
 #[cfg(test)]
@@ -276,7 +381,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(resp.headers()["content-range"], "bytes */10");
         assert!(body_of(resp).await.is_empty());
-        let resp = get(&o, &[("range", "bytes=0-1,4-5")]);
+        // Seventeen ranges: ignored, the whole object.
+        let many = format!("bytes={}", vec!["0-0"; 17].join(","));
+        let resp = get(&o, &[("range", many.as_str())]);
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_of(resp).await, "0123456789");
         // HEAD ignores Range.
@@ -335,5 +442,193 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(resp.headers()["cache-control"], "no-store");
         assert_eq!(body_of(resp).await, "origin unreachable\n");
+    }
+
+    fn big(resp: &[(&str, &str)]) -> CachedObject {
+        let f = Freshness {
+            lifetime: Duration::from_secs(60),
+            corrected_initial_age: Duration::ZERO,
+            response_time: t(0),
+        };
+        let body: Vec<u8> = (0..4000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        CachedObject::new(
+            StatusCode::OK,
+            map(resp),
+            Bytes::from(body),
+            f,
+            &HeaderMap::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn several_ranges_are_multipart() {
+        let o = big(&[("content-type", "text/plain"), ("etag", "\"v1\"")]);
+        let resp = get(&o, &[("range", "bytes=900-901,0-2")]);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(resp.headers().get("content-range").is_none());
+        let ct = resp.headers()["content-type"].to_str().unwrap().to_owned();
+        let boundary = ct
+            .strip_prefix("multipart/byteranges; boundary=")
+            .unwrap()
+            .to_owned();
+        assert!(boundary.len() <= 70);
+        let length: usize = resp.headers()["content-length"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let body = body_of(resp).await;
+        assert_eq!(body.len(), length);
+        let expected = format!(
+            "--{boundary}\r\nContent-Type: text/plain\r\nContent-Range: bytes 900-901/4000\r\n\r\nqr\r\n--{boundary}\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-2/4000\r\n\r\nabc\r\n--{boundary}--\r\n"
+        );
+        assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+        // Two responses never share a boundary.
+        let again = get(&o, &[("range", "bytes=900-901,0-2")]);
+        assert_ne!(again.headers()["content-type"], ct.as_str());
+        // Without a Content-Type, parts carry only Content-Range.
+        let bare = big(&[]);
+        let resp = get(&bare, &[("range", "bytes=0-0,500-500")]);
+        let body = body_of(resp).await;
+        assert!(!std::str::from_utf8(&body).unwrap().contains("Content-Type"));
+    }
+
+    #[tokio::test]
+    async fn sixteen_ranges_are_served() {
+        let o = big(&[]);
+        let v: Vec<String> = (0..16)
+            .map(|i| format!("{}-{}", i * 200, i * 200))
+            .collect();
+        let v = format!("bytes={}", v.join(","));
+        let resp = get(&o, &[("range", v.as_str())]);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let body = body_of(resp).await;
+        assert_eq!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .matches("Content-Range:")
+                .count(),
+            16
+        );
+    }
+
+    #[test]
+    fn if_match_uses_the_strong_comparison() {
+        let o = obj(&[("etag", "\"v1\"")]);
+        assert_eq!(get(&o, &[("if-match", "\"v1\"")]).status(), StatusCode::OK);
+        assert_eq!(
+            get(&o, &[("if-match", "\"v0\", \"v1\"")]).status(),
+            StatusCode::OK
+        );
+        assert_eq!(get(&o, &[("if-match", "*")]).status(), StatusCode::OK);
+        let failed = get(&o, &[("if-match", "\"v2\"")]);
+        assert_eq!(failed.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(failed.headers()["content-length"], "0");
+        // A weak tag never matches strongly, either side.
+        assert_eq!(
+            get(&o, &[("if-match", "W/\"v1\"")]).status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let weak = obj(&[("etag", "W/\"v1\"")]);
+        assert_eq!(
+            get(&weak, &[("if-match", "\"v1\"")]).status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        // No stored tag: a listed tag cannot match; "*" still does.
+        let untagged = obj(&[]);
+        assert_eq!(
+            get(&untagged, &[("if-match", "\"v1\"")]).status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            get(&untagged, &[("if-match", "*")]).status(),
+            StatusCode::OK
+        );
+        // A malformed If-Match is ignored.
+        assert_eq!(get(&o, &[("if-match", "v1")]).status(), StatusCode::OK);
+        // HEAD too.
+        let head = from_cache(&o, &Method::HEAD, &map(&[("if-match", "\"v2\"")]), t(10));
+        assert_eq!(head.status(), StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[test]
+    fn if_unmodified_since() {
+        let lm = http_date(t(0));
+        let lm = lm.to_str().unwrap();
+        let o = obj(&[("last-modified", lm), ("etag", "\"v1\"")]);
+        let later = http_date(t(100));
+        let earlier = http_date(t(0) - Duration::from_secs(100));
+        let (later, earlier) = (later.to_str().unwrap(), earlier.to_str().unwrap());
+        assert_eq!(
+            get(&o, &[("if-unmodified-since", lm)]).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&o, &[("if-unmodified-since", later)]).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&o, &[("if-unmodified-since", earlier)]).status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        // Ignored beside If-Match, when invalid, when it is a list, and
+        // when the representation has no Last-Modified.
+        assert_eq!(
+            get(
+                &o,
+                &[("if-match", "\"v1\""), ("if-unmodified-since", earlier)]
+            )
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&o, &[("if-unmodified-since", "yesterday")]).status(),
+            StatusCode::OK
+        );
+        let list = format!("{earlier}, {earlier}");
+        assert_eq!(
+            get(&o, &[("if-unmodified-since", list.as_str())]).status(),
+            StatusCode::OK
+        );
+        let mut two = map(&[("if-unmodified-since", earlier)]);
+        two.append(
+            "if-unmodified-since",
+            HeaderValue::from_str(earlier).unwrap(),
+        );
+        assert_eq!(
+            from_cache(&o, &Method::GET, &two, t(10)).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&obj(&[]), &[("if-unmodified-since", earlier)]).status(),
+            StatusCode::OK
+        );
+    }
+
+    #[test]
+    fn preconditions_come_before_ranges_and_not_modified() {
+        let o = obj(&[("etag", "\"v1\"")]);
+        // A failed If-Match wins over If-None-Match and Range.
+        let resp = get(
+            &o,
+            &[
+                ("if-match", "\"v2\""),
+                ("if-none-match", "\"v1\""),
+                ("range", "bytes=0-1"),
+            ],
+        );
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        // A passing one goes on to 304, and Range is ignored when 304.
+        let resp = get(
+            &o,
+            &[
+                ("if-match", "\"v1\""),
+                ("if-none-match", "\"v1\""),
+                ("range", "bytes=0-1"),
+            ],
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        let resp = get(&o, &[("if-match", "\"v1\""), ("range", "bytes=0-1")]);
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     }
 }

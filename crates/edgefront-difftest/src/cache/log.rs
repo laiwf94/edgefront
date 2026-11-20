@@ -341,6 +341,10 @@ fn proxy(rng: &mut Rng, s: &Scenario, t: u64, k: usize) -> Entry {
         h.push(("accept-language".into(), rng.pick(&langs).into()));
     }
     if method == "GET" && family == "static" && rng.chance(0.08) {
+        // Single ranges only. cachet 0.1 answered several ranges with the
+        // whole object; since #90 the node serves them as one coalesced
+        // range or multipart/byteranges, a deliberate difference that the
+        // unit tests and the conformance suite check instead.
         let ranges = [
             "bytes=0-99",
             "bytes=100-",
@@ -348,7 +352,6 @@ fn proxy(rng: &mut Rng, s: &Scenario, t: u64, k: usize) -> Entry {
             "bytes=0-0",
             "bytes=999999-",
             "bytes=5-2",
-            "bytes=0-9,20-29",
             "items=0-1",
         ];
         h.push(("range".into(), rng.pick(&ranges).into()));

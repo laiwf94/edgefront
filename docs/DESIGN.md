@@ -517,7 +517,7 @@ Responses that can never be reused (no freshness, no validator, no stale allowan
 
 Qualified `no-cache="field"` and `private="field"` are treated as their unqualified forms. That is the conservative reading.
 
-Only single byte ranges are served. A request for several ranges gets the full object with 200, which RFC 9110 section 14.2 permits and which avoids multipart amplification. Partial responses (206) from the origin are never stored; the node always fetches the whole object and answers ranges from it.
+Ranges are answered from the stored copy, after the preconditions and only when the answer would otherwise be 200. A request may name up to 16 ranges. Ranges that overlap, or lie within 80 bytes of each other (about one part's headers), are sorted and merged, which RFC 9110 section 15.3.7.2 allows in any order. Otherwise the parts keep the order the client asked for. One remaining range is a plain 206 with Content-Range. Several are `multipart/byteranges`: each part carries the representation's Content-Type and its own Content-Range, under a boundary drawn per response. Ranges an object cannot satisfy are dropped, and 416 comes only when none is left. Two caps stop a Range header from costing more than the object. More than 16 ranges, or ranges adding up to more than twice the object's length before merging, are ignored, and the whole object is served with 200, as section 14.2 permits for many small or overlapping ranges. The `range` fuzz target holds the parser to this: parts inside the object, sorted out of any overlap, no more than 16, and no more bytes than the object has. Partial responses (206) from the origin are never stored; the node always fetches the whole object and answers ranges from it.
 
 HEAD misses pass through to the origin without being stored. HEAD hits are answered from the stored GET response.
 
@@ -605,7 +605,7 @@ Objects are buffered whole in memory up to the per-object limit before they are 
 
 Two concurrent stores of different variants of one URL can race, and one of them may be lost. The next request for it fetches again.
 
-Conditional requests from clients are answered for `If-None-Match` and `If-Modified-Since`; `If-Match` and `If-Unmodified-Since` are ignored on hits.
+Conditional requests are evaluated against the stored copy in RFC 9110 section 13.2.2's order. First comes `If-Match`, with the strong comparison, so a weak stored tag never matches. Then `If-Unmodified-Since`, which is ignored beside `If-Match`, when its value is not exactly one HTTP date, or when the copy has no `Last-Modified`. Either failing gives 412. Next come `If-None-Match`, or `If-Modified-Since` without it, which give 304. Then `If-Range` and `Range`. The cache answers these from what it holds; a copy that has gone stale on the origin can still pass a precondition until it is revalidated, as with any cached answer.
 
 Age depends on the origin's `Date`, so clock skew between origin and cache shifts apparent age, as the RFC acknowledges. A `Date` in the future counts as zero apparent age.
 
