@@ -51,5 +51,5 @@ fn the_http_limits_demo_passes() {
     ] {
         assert!(stdout.contains(want), "{want:?} in\n{stdout}");
     }
-    assert_eq!(stdout.matches("\n  ok    ").count(), 18, "{stdout}");
+    assert_eq!(stdout.matches("\n  ok    ").count(), 19, "{stdout}");
 }

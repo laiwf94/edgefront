@@ -124,12 +124,13 @@ check "k1 refused" "$limited" 5
 check "k2 admitted" "$(req GET /api/items -H 'x-api-key: k2')" 200
 check "no key: not limited" "$(req GET /api/items)" 200
 check "outside /api: not limited" "$(req GET /home -H 'x-api-key: k1')" 200
-echo "   waiting 300 ms for three tokens"
-sleep 0.3
-ok=$(burst 5 /api/other -H 'x-api-key: k1' | grep -cx 200 || true)
-# Three tokens in 300 ms, a fourth if the requests above took 100 ms.
-check "k1 admitted after 300 ms, 3 or 4" "$([ "$ok" -ge 3 ] && [ "$ok" -le 4 ] && echo "$ok")" "$ok"
-
+# A refusal says when the next token is due: one every 100 ms at 10/s.
+req GET /api/items -H 'x-api-key: k1' >/dev/null
+ms=$(head_of ratelimit | sed 's/.*edgefront-ms=//')
+check "next token due within 100 ms" "$([ "$ms" -ge 1 ] && [ "$ms" -le 100 ] && echo yes)" yes
+echo "   waiting ${ms} ms"
+sleep "$(awk "BEGIN { print $ms / 1000 }")"
+check "k1 admitted once it is due" "$(req GET /api/other -H 'x-api-key: k1')" 200
 echo
 echo "4. edgefront check"
 check "the demo's rules" "$("$EDGEFRONT_BIN" check examples/http_limits/limits.toml | tail -1)" \
