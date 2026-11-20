@@ -14,6 +14,7 @@
 //! Exit codes are pacerd's: 0 after a drain, 1 when the daemon cannot
 //! start, 2 for bad usage or a bad config.
 
+pub mod address;
 pub mod admin;
 mod conn;
 mod daemon;
@@ -41,14 +42,17 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
     if check {
-        return match daemon::load(&path) {
-            Ok(cfg) => {
+        return match daemon::load(&path).and_then(|c| Ok((c, address::load(&path)?))) {
+            Ok((cfg, policy)) => {
                 let n = cfg.listeners.len();
                 println!(
                     "edgefront: {} ok, {n} listener{}",
                     path.display(),
                     if n == 1 { "" } else { "s" }
                 );
+                if let Some((_, summary)) = policy {
+                    print!("{summary}");
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {

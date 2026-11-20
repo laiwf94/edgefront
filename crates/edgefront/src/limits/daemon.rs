@@ -10,14 +10,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use edgefront_limiter::cidr::Swap;
 use edgefront_limiter::config::ListenerConfig;
+use edgefront_limiter::policy::AddressPolicy;
 use edgefront_limiter::{Admission, Bandwidth, LimiterConfig, LogLevel, Refusal};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::Instant;
 
 use edgefront_core::l4::{ACCEPT_PAUSE, Accepted, Acceptor};
 
+use super::address::{self, Plan};
 use super::conn::{self, Context};
 use super::log::{Limit, Log};
 
@@ -116,6 +119,10 @@ pub struct Daemon {
     pub clock: Clock,
     pub log: Arc<Log>,
     config: Mutex<Arc<LimiterConfig>>,
+    /// The `[address_policy]` section, replaced whole on reload.
+    policy: Arc<Swap<Option<Arc<AddressPolicy>>>>,
+    /// Connections that may still wait for a request head.
+    heads: Arc<Semaphore>,
     pub listeners: Vec<Arc<Listener>>,
     draining: AtomicBool,
     /// Wakes the main loop to drain, with the reason.
@@ -176,9 +183,14 @@ pub fn reload_conflict(cur: &LimiterConfig, next: &LimiterConfig) -> Option<Stri
 }
 
 impl Daemon {
-    /// The daemon for `config`, read from `path`, with every listener's
-    /// tables allocated.
-    pub fn new(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> Result<Self, String> {
+    /// The daemon for `config` and its address `policy`, read from
+    /// `path`, with every listener's tables allocated.
+    pub fn new(
+        path: PathBuf,
+        config: LimiterConfig,
+        policy: Option<AddressPolicy>,
+        log: Arc<Log>,
+    ) -> Result<Self, String> {
         let listeners = config
             .listeners
             .iter()
@@ -189,6 +201,8 @@ impl Daemon {
             clock: Clock::new(),
             log,
             config: Mutex::new(Arc::new(config)),
+            policy: Arc::new(Swap::new(policy.map(Arc::new))),
+            heads: Arc::new(Semaphore::new(address::HEAD_WAITS)),
             listeners,
             draining: AtomicBool::new(false),
             drain_reason: Mutex::new(None),
@@ -251,8 +265,16 @@ impl Daemon {
         result
     }
 
+    /// The address policy as it is now.
+    pub fn policy(&self) -> Option<Arc<AddressPolicy>> {
+        self.policy.reader().get().clone()
+    }
+
     fn try_reload(&self) -> Result<(), String> {
         let next = load(&self.path)?;
+        // Built in full, list files and all, before anything changes; the
+        // running policy answers until the store below.
+        let policy = address::load(&self.path)?;
         let mut cur = self.config.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = reload_conflict(&cur, &next) {
             return Err(c);
@@ -275,6 +297,7 @@ impl Daemon {
         }
         self.log.set_level(next.log_level);
         *cur = Arc::new(next);
+        self.policy.store(policy.map(|(p, _)| Arc::new(p)));
         Ok(())
     }
 
@@ -293,6 +316,7 @@ impl Daemon {
     pub async fn accept_loop(self: Arc<Self>, listener: Arc<Listener>, socket: TcpListener) {
         let mut accepting = self.accepting_tx.subscribe();
         let mut acceptor = Acceptor::new(socket);
+        let mut policy = self.policy.reader();
         loop {
             let accepted = tokio::select! {
                 _ = accepting.wait_for(|on| !*on) => return,
@@ -300,7 +324,8 @@ impl Daemon {
             };
             let refusal = match accepted {
                 Ok(Accepted::Conn(stream, peer)) => {
-                    self.start(&listener, stream, peer);
+                    let p = policy.get().clone();
+                    self.start(&listener, stream, peer, p);
                     continue;
                 }
                 Ok(Accepted::Shed) => Refusal::FdExhausted,
@@ -320,17 +345,85 @@ impl Daemon {
         }
     }
 
-    fn start(&self, listener: &Arc<Listener>, stream: tokio::net::TcpStream, peer: SocketAddr) {
+    fn start(
+        &self,
+        listener: &Arc<Listener>,
+        stream: tokio::net::TcpStream,
+        peer: SocketAddr,
+        policy: Option<Arc<AddressPolicy>>,
+    ) {
         let ctx = self.context();
         let now = self.clock.now_ns();
-        let Ok(permit) = conn::admit(&ctx, listener, peer, now) else {
-            // Dropping the stream closes it with nothing read.
+        let Some(policy) = policy else {
+            let Ok(permit) = conn::admit(&ctx, listener, peer.ip(), peer, now) else {
+                // Dropping the stream closes it with nothing read.
+                return;
+            };
+            let guard = self.tasks.start();
+            let listener = Arc::clone(listener);
+            tokio::spawn(async move {
+                conn::serve(ctx, listener, stream, peer, permit, None, now).await;
+                drop(guard);
+            });
+            return;
+        };
+        let Ok(waiting) = Arc::clone(&self.heads).try_acquire_owned() else {
+            listener.admission.refuse(Refusal::ListenerFull);
+            conn::log_refusal(
+                &ctx,
+                listener,
+                &peer.to_string(),
+                Refusal::ListenerFull,
+                now,
+            );
             return;
         };
         let guard = self.tasks.start();
         let listener = Arc::clone(listener);
+        let clock = self.clock;
         tokio::spawn(async move {
-            conn::serve(ctx, listener, stream, peer, permit, now).await;
+            let wait = listener.config().connect_timeout;
+            let plan = address::decide(
+                &policy,
+                &stream,
+                peer.ip(),
+                wait,
+                || clock.now_ns(),
+                &ctx.log,
+            )
+            .await;
+            drop(waiting);
+            let now = clock.now_ns();
+            let (permit, class) = match plan {
+                // The peer closed before sending a head.
+                None => return,
+                Some(Plan::Listener(client)) => {
+                    match conn::admit(&ctx, &listener, client, peer, now) {
+                        Ok(p) => (p, None),
+                        Err(_) => return,
+                    }
+                }
+                Some(Plan::Slot(client, class)) => match listener.admission.admit_slot(client) {
+                    Ok(p) => (p, class),
+                    Err(r) => {
+                        conn::log_refusal(&ctx, &listener, &peer.to_string(), r, now);
+                        return;
+                    }
+                },
+                Some(Plan::Refuse(reason, class, client)) => {
+                    conn::log_class_refusal(
+                        &ctx,
+                        &listener,
+                        &peer.to_string(),
+                        reason,
+                        &class,
+                        &client.to_string(),
+                        now,
+                    );
+                    return;
+                }
+            };
+            conn::serve(ctx, listener, stream, peer, permit, class, now).await;
             drop(guard);
         });
     }
@@ -431,8 +524,9 @@ pub fn bind(
 /// pacerd's: 0 after a drain, 1 when it cannot start, 2 for a bad config.
 pub fn run(path: PathBuf) -> ExitCode {
     let log = Arc::new(Log::new(LogLevel::Info));
-    let config = match load(&path) {
-        Ok(c) => c,
+    let loaded = load(&path).and_then(|c| Ok((c, address::load(&path)?)));
+    let (config, policy) = match loaded {
+        Ok((c, p)) => (c, p.map(|(p, _)| p)),
         Err(e) => {
             drop(
                 log.line(LogLevel::Error, "bad config")
@@ -457,10 +551,15 @@ pub fn run(path: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(serve(path, config, log))
+    runtime.block_on(serve(path, config, policy, log))
 }
 
-async fn serve(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> ExitCode {
+async fn serve(
+    path: PathBuf,
+    config: LimiterConfig,
+    policy: Option<AddressPolicy>,
+    log: Arc<Log>,
+) -> ExitCode {
     let sockets = match bind(&config, config.workers) {
         Ok(s) => s,
         Err((addr, e)) => {
@@ -473,7 +572,7 @@ async fn serve(path: PathBuf, config: LimiterConfig, log: Arc<Log>) -> ExitCode 
         }
     };
     let admin_path = config.admin_socket.clone();
-    let daemon = match Daemon::new(path, config, Arc::clone(&log)) {
+    let daemon = match Daemon::new(path, config, policy, Arc::clone(&log)) {
         Ok(d) => Arc::new(d),
         Err(e) => {
             drop(log.line(LogLevel::Error, &e));

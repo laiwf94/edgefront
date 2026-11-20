@@ -1074,7 +1074,7 @@ fn fmt_rate(field: &str, r: &Rate) -> Result<String, String> {
 /// lowest terms (`2.5/10s` is 5 per 20 s), so the rate reads back from
 /// [`rate_text`] equal. A quota is refused: these fields are token
 /// buckets.
-fn spec_rate(field: &str, text: &str) -> Result<Rate, String> {
+pub(crate) fn spec_rate(field: &str, text: &str) -> Result<Rate, String> {
     let at = |m: String| format!("{field}: {m}");
     let spec = RateSpec::parse(text).map_err(|e| at(e.to_string()))?;
     if let Plan::Quota { .. } = spec.plan() {
@@ -1175,6 +1175,11 @@ struct RawConfig {
     log_level: Option<Value>,
     #[serde(default)]
     listeners: Vec<RawListener>,
+    /// Read on its own by [`AddressPolicyConfig::from_toml`]; skipped
+    /// here so a config with one still reads as a limiter config.
+    #[serde(default, skip_serializing)]
+    #[serde(rename = "address_policy")]
+    _address_policy: Option<de::IgnoredAny>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1331,6 +1336,7 @@ impl LimiterConfig {
             drain_timeout: text(fmt_duration("drain_timeout", self.drain_timeout)?),
             log_level: text(self.log_level.as_str().to_owned()),
             listeners: Vec::new(),
+            _address_policy: None,
         };
         for (i, l) in self.listeners.iter().enumerate() {
             let at = |m: String| format!("listeners[{i}].{m}");
@@ -1522,6 +1528,10 @@ impl<'de> Deserialize<'de> for LimiterConfig {
         LimiterConfig::try_from(RawConfig::deserialize(d)?).map_err(de::Error::custom)
     }
 }
+
+pub mod address_policy;
+
+pub use address_policy::AddressPolicyConfig;
 
 #[cfg(test)]
 mod tests;

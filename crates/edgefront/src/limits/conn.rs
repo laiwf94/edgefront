@@ -3,11 +3,12 @@
 //! parts of pacerd's `pd_conn_accept`, `pump`, `pd_conn_timer` and
 //! `pd_conn_close` (`proxy.c`) that edgefront_core::l4 does not cover.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use edgefront_core::l4::{self, CloseReason, Direction, Grant, Pace, RelayConfig};
 use edgefront_limiter::conn::Permit;
+use edgefront_limiter::policy::ClassPermit;
 use edgefront_limiter::shape::Dir;
 use edgefront_limiter::slowloris::Check;
 use edgefront_limiter::{LogLevel, Refusal, Shaper, SlowCheck, Stat};
@@ -124,16 +125,18 @@ pub struct Context {
     pub stop: Arc<super::stop::Stop>,
 }
 
-/// Admits `stream` from `peer` on `listener`, or refuses it with nothing
-/// read, logging the refusal at most as often as pacerd's refusal limit
-/// allows. Returns the permit for an admitted connection.
+/// Admits a connection from `peer` on `listener`, counted against
+/// `client` (the peer, or the client behind trusted proxies), or refuses
+/// it with nothing read, logging the refusal at most as often as pacerd's
+/// refusal limit allows. Returns the permit for an admitted connection.
 pub fn admit(
     ctx: &Context,
     listener: &Arc<Listener>,
+    client: IpAddr,
     peer: SocketAddr,
     now_ns: u64,
 ) -> Result<Permit, Refusal> {
-    match listener.admission.admit(peer.ip(), now_ns) {
+    match listener.admission.admit(client, now_ns) {
         Ok(p) => Ok(p),
         Err(r) => {
             log_refusal(ctx, listener, &peer.to_string(), r, now_ns);
@@ -160,9 +163,39 @@ pub fn log_refusal(ctx: &Context, listener: &Listener, peer: &str, r: Refusal, n
     drop(line);
 }
 
+/// `conn rejected` for a refusal by the client's address class, with the
+/// class and the client behind any trusted proxies; under the same log
+/// limit as pacerd's refusals.
+pub fn log_class_refusal(
+    ctx: &Context,
+    listener: &Listener,
+    peer: &str,
+    reason: &str,
+    class: &str,
+    client: &str,
+    now_ns: u64,
+) {
+    let Some(dropped) = listener.reject_log.allow(now_ns) else {
+        return;
+    };
+    let mut line = ctx
+        .log
+        .line(LogLevel::Info, "conn rejected")
+        .str("listener", listener.name())
+        .str("peer", peer)
+        .str("reason", reason)
+        .str("class", class)
+        .str("client", client);
+    if dropped > 0 {
+        line = line.u64("similar_dropped", dropped);
+    }
+    drop(line);
+}
+
 /// Runs one admitted connection to its end: connects to the listener's
 /// upstream as configured now, relays with the connection's pace, counts
-/// the close, gives back the permit and only then logs `conn closed`, so a
+/// the close, gives back the permit (and the class's hold, if any) and
+/// only then logs `conn closed`, so a
 /// client that reads the line and reconnects at once is admitted.
 pub async fn serve(
     ctx: Context,
@@ -170,6 +203,7 @@ pub async fn serve(
     stream: TcpStream,
     peer: SocketAddr,
     permit: Permit,
+    class: Option<ClassPermit>,
     now_ns: u64,
 ) {
     let id = ctx.log.next_conn_id();
@@ -202,6 +236,7 @@ pub async fn serve(
     .await;
     listener.admission.counters().count(out.reason.as_str());
     drop(permit);
+    drop(class);
     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     drop(
         ctx.log

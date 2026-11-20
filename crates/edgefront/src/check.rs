@@ -17,6 +17,19 @@
 //! ```
 //!
 //! then exits 1, or prints `FILE: ok` and exits 0 when nothing is found.
+//! A TOML config with an `[address_policy]` section also has the section
+//! built, list files and all, and reports its size before the verdict:
+//!
+//! ```text
+//! address_policy: 2 trusted proxies, 3 classes, 1000002 prefixes, 92517736 bytes
+//!   class blocked: deny, 1000000 prefixes
+//!   class office: allow, 1 prefixes
+//!   class partners: limit, 1 prefixes
+//!   list proxies.txt: 1 prefixes
+//!   list blocked.txt: 1000000 prefixes
+//! ```
+//!
+//! A section that does not build is a config that does not parse (exit 2).
 //! `--allow CLASS` drops the findings of one class, and may be repeated.
 //!
 //! `--print` writes the config instead, as the TOML limiter section that
@@ -153,6 +166,14 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    match crate::limits::address::load(std::path::Path::new(path)) {
+        Ok(Some((_, summary))) => print!("{summary}"),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("edgefront: {path}: {e}");
+            return ExitCode::from(2);
+        }
+    }
     let found: Vec<_> = lint(&cfg, &map)
         .into_iter()
         .filter(|l| !allowed.contains(&l.class))

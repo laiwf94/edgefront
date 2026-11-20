@@ -605,6 +605,26 @@ impl Admission {
         Err(refusal)
     }
 
+    /// Admits a connection from `peer` against the listener's own cap
+    /// only, with no per-client limit: for a client whose address class
+    /// sets its limits instead ([`crate::policy`]). Counted as `accepted`
+    /// or `listener_full` like [`Admission::admit`].
+    pub fn admit_slot(self: &Arc<Self>, peer: IpAddr) -> Result<Permit, Refusal> {
+        let (max_conns, _) = self.caps();
+        let key = ClientKey::new(peer, self.client.load(Ordering::Relaxed) & 0xff);
+        if self.open.fetch_add(1, Ordering::Relaxed) >= max_conns {
+            self.open.fetch_sub(1, Ordering::Relaxed);
+            self.counters.add(Refusal::ListenerFull.stat(), 1);
+            return Err(Refusal::ListenerFull);
+        }
+        self.counters.add(Stat::Accepted, 1);
+        Ok(Permit {
+            admission: Arc::clone(self),
+            key,
+            held: false,
+        })
+    }
+
     /// Count a refusal decided outside [`Admission::admit`], such as
     /// running out of file descriptors.
     pub fn refuse(&self, r: Refusal) {

@@ -15,6 +15,7 @@ pub mod conn;
 pub mod gcra;
 pub mod key;
 pub mod lint;
+pub mod policy;
 pub mod rate;
 pub mod shape;
 pub mod siphash;

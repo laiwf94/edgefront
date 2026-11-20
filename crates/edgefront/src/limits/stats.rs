@@ -2,7 +2,9 @@
 //! answer in pacerd's `pd_stats_render` text (a header line, then one line
 //! per listener), and the client listings pacerctl did not have. pacerd's
 //! per-worker `accepted` lines have no counterpart: connections are not
-//! tied to a worker thread here.
+//! tied to a worker thread here. A config with an `[address_policy]`
+//! adds one `address_policy` line after the listeners: its sizes, then
+//! how often each class verdict was given since the last (re)load.
 
 use std::fmt::Write;
 use std::net::IpAddr;
@@ -25,6 +27,20 @@ pub fn render(d: &Daemon) -> String {
     );
     for l in &d.listeners {
         let _ = writeln!(out, "{}", ListenerStats::of(&l.admission, &l.bandwidth));
+    }
+    if let Some(p) = d.policy() {
+        let _ = write!(
+            out,
+            "address_policy classes={} prefixes={} trusted_proxies={} memory_bytes={}",
+            p.classifier().classes().len(),
+            p.classifier().prefixes(),
+            p.trusted().len(),
+            p.memory()
+        );
+        for (name, n) in p.counts() {
+            let _ = write!(out, " {name}={n}");
+        }
+        out.push('\n');
     }
     out
 }
