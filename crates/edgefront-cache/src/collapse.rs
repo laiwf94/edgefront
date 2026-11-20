@@ -161,6 +161,27 @@ impl<T> Lead<T> {
     }
 }
 
+impl<T> Lead<T> {
+    /// Hands `value` to every follower and keeps the flight open while the
+    /// returned [`Held`] lives: callers arriving meanwhile follow and get
+    /// the same value, rather than starting a fetch of their own. A
+    /// streaming fill holds its flight until the body is in.
+    pub fn publish_held(self, value: T) -> Held<T> {
+        let Lead { cleanup, tx } = self;
+        tx.send_replace(Some(value));
+        Held {
+            _cleanup: cleanup,
+            _tx: tx,
+        }
+    }
+}
+
+/// A published flight kept open; dropping it ends the flight.
+pub struct Held<T> {
+    _cleanup: Cleanup<T>,
+    _tx: watch::Sender<Option<T>>,
+}
+
 /// A follower's side of a flight.
 pub struct Follow<T>(watch::Receiver<Option<T>>);
 
@@ -335,5 +356,23 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         gate.notify_one();
         assert_eq!(waiter.await.unwrap(), (Ok(1), Role::Follower));
+    }
+
+    #[tokio::test]
+    async fn a_held_flight_hands_its_value_to_late_followers() {
+        let c = Arc::new(Collapser::<u32>::default());
+        let Flight::Lead(lead) = c.lead_or_follow("k".into()) else {
+            panic!("the first caller leads");
+        };
+        let held = lead.publish_held(5);
+        // Still in flight: a newcomer follows and gets the value at once.
+        let Flight::Follow(follow) = c.lead_or_follow("k".into()) else {
+            panic!("a held flight is followed");
+        };
+        assert_eq!(follow.wait().await, Ok(5));
+        assert_eq!(c.in_flight(), 1);
+        drop(held);
+        assert_eq!(c.in_flight(), 0);
+        assert!(matches!(c.lead_or_follow("k".into()), Flight::Lead(_)));
     }
 }

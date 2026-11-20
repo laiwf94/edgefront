@@ -60,6 +60,7 @@ use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use crate::cache_control::{CacheControl, is_tchar};
 use crate::collapse::{Collapser, Flight, Lead};
 use crate::config::{RoutePolicies, RoutePolicy};
+use crate::fill::{End, Filling};
 use crate::headers::strip_hop_by_hop;
 use crate::object::{CachedObject, Key, SURROGATE_KEY, primary_key};
 use crate::policy::{self, Exchange as Exchanged, Freshness, NotStorable, Use};
@@ -91,6 +92,30 @@ pub const CLIENT_CONDITIONALS: [HeaderName; 6] = [
     header::IF_RANGE,
     header::RANGE,
 ];
+
+/// A fill streams to its clients while it arrives when the origin declares
+/// a body longer than this. Smaller bodies are read whole first, which costs
+/// a client almost nothing and keeps one code path for them.
+pub const STREAM_ABOVE: u64 = 64 << 10;
+
+/// Whether a client request carries conditionals or a range: such a
+/// request is answered from the complete object, never a stream.
+fn needs_whole(headers: &HeaderMap) -> bool {
+    CLIENT_CONDITIONALS
+        .iter()
+        .any(|name| headers.contains_key(name))
+}
+
+/// The client response for a stream of `head`'s body: the headers a hit
+/// would carry, the declared length, and the growing body.
+fn streamed(head: &CachedObject, fill: &Arc<Filling>, len: u64, now: SystemTime) -> Response<Body> {
+    let (mut parts, _) =
+        respond::from_cache(head, &Method::GET, &HeaderMap::new(), now).into_parts();
+    parts
+        .headers
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    Response::from_parts(parts, fill.reader().boxed())
+}
 
 /// The `Cache-Status` response field (RFC 9211).
 pub const CACHE_STATUS: HeaderName = HeaderName::from_static("cache-status");
@@ -223,6 +248,12 @@ enum Fetched {
         stored: bool,
         /// Refreshed by a `304` rather than a full response.
         revalidated: bool,
+    },
+    /// A response every follower may read while it arrives: the head of
+    /// the object being filled, and its growing body.
+    Streaming {
+        head: Arc<CachedObject>,
+        fill: Arc<Filling>,
     },
     /// A response only the leader could use: not storable, or too large.
     Single(StatusCode),
@@ -445,7 +476,7 @@ impl Shared {
                 stored: stored.as_ref(),
                 fwd,
             };
-            return match follower.answer(fetched) {
+            return match follower.answer(fetched).await {
                 Some(resp) => Decision::Respond(resp),
                 // Go upstream alone; nobody waits on this fetch.
                 None => Decision::Forward(Some(fill(None))),
@@ -525,7 +556,40 @@ struct Follower<'a> {
 impl Follower<'_> {
     /// This request's answer from the leader's result, or `None` when it
     /// has to go upstream itself.
-    fn answer(&self, fetched: Fetched) -> Option<Response<Body>> {
+    async fn answer(&self, fetched: Fetched) -> Option<Response<Body>> {
+        let fetched = match fetched {
+            Fetched::Streaming { head, fill } => {
+                if !needs_whole(self.client_headers) && head.matches(self.client_headers) {
+                    let now = self.shared.clock.now();
+                    let len = fill.expected().unwrap_or(0);
+                    let mut resp = streamed(&head, &fill, len, now);
+                    let status = format!(
+                        "{}; fwd-status={}; stored; collapsed; ttl={}",
+                        self.fwd,
+                        head.status.as_u16(),
+                        head.freshness.ttl_secs(now)
+                    );
+                    self.shared.mark(&mut resp, &status, Outcome::Miss);
+                    return Some(resp);
+                }
+                // Conditionals, a range or another variant: answered from
+                // the whole object once it is in.
+                match fill.ended().await {
+                    End::Complete(Some(obj)) => Fetched::Object {
+                        obj,
+                        stored: true,
+                        revalidated: false,
+                    },
+                    End::Complete(None) => return None,
+                    End::Aborted(detail) => Fetched::Failed {
+                        status: StatusCode::BAD_GATEWAY,
+                        message: "origin response invalid\n",
+                        detail: detail.to_string(),
+                    },
+                }
+            }
+            other => other,
+        };
         let failure = match &fetched {
             Fetched::Failed { detail, .. } => Some(format!("detail-origin={detail}")),
             Fetched::Object { obj, .. } if is_error_status(obj.status) => {
@@ -572,7 +636,7 @@ impl Follower<'_> {
                 format!("{fwd}; collapsed; detail={detail}"),
                 Outcome::Error,
             ),
-            Fetched::Object { .. } | Fetched::Single(_) => return None,
+            Fetched::Object { .. } | Fetched::Single(_) | Fetched::Streaming { .. } => return None,
         };
         self.shared.mark(&mut resp, &status, outcome);
         Some(resp)
@@ -808,6 +872,12 @@ impl Fill {
             self.shared.observer.streamed_uncached();
             return self.through(parts, body);
         }
+        if let Some(len) = declared
+            && len > STREAM_ABOVE
+            && !needs_whole(&self.client_headers)
+        {
+            return self.stream(parts, body, len, &resp_cc);
+        }
         let read = tokio::time::timeout(self.shared.body_timeout, read_limited(body, limit)).await;
         let bytes = match read {
             Ok(Ok(Read::Complete(bytes))) => bytes,
@@ -842,6 +912,95 @@ impl Fill {
             &self.client_headers,
         ));
         self.stored_object(obj, false)
+    }
+}
+
+impl Fill {
+    /// Answers the client with the body as it arrives, hands the same
+    /// growing body to every follower, and stores the object once it is
+    /// complete. The origin failing partway, sending more or fewer bytes
+    /// than it declared, or taking longer than the body timeout aborts
+    /// every reader, and nothing is stored.
+    fn stream(
+        &mut self,
+        mut parts: http::response::Parts,
+        body: Body,
+        len: u64,
+        resp_cc: &CacheControl,
+    ) -> Upstream {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let freshness = self.freshness(parts.status, &parts.headers, resp_cc);
+        let head = Arc::new(CachedObject::new(
+            parts.status,
+            parts.headers,
+            Bytes::new(),
+            freshness,
+            &self.client_headers,
+        ));
+        let fill = Filling::new(Some(len));
+        let now = self.shared.clock.now();
+        self.status = format!(
+            "{}; fwd-status={}; stored; ttl={}",
+            self.fwd,
+            head.status.as_u16(),
+            head.freshness.ttl_secs(now)
+        );
+        self.outcome = Outcome::Miss;
+        let resp = streamed(&head, &fill, len, now);
+        // The flight stays open until the body is in, so a client that
+        // arrives meanwhile joins this fill instead of starting another.
+        let held = self.lead.take().map(|lead| {
+            lead.publish_held(Fetched::Streaming {
+                head: head.clone(),
+                fill: fill.clone(),
+            })
+        });
+        let shared = self.shared.clone();
+        let key = self.key.clone();
+        let client_headers = self.client_headers.clone();
+        let (epoch, max_variants) = (self.epoch, self.policy.max_variants);
+        tokio::spawn(async move {
+            let feed = async {
+                let mut body = body;
+                let mut got = 0u64;
+                while let Some(frame) = body.frame().await {
+                    let Ok(frame) = frame else {
+                        return Err("protocol");
+                    };
+                    if let Ok(data) = frame.into_data() {
+                        got += data.len() as u64;
+                        if got > len {
+                            return Err("protocol");
+                        }
+                        fill.push(data);
+                    }
+                }
+                if got == len { Ok(()) } else { Err("protocol") }
+            };
+            match tokio::time::timeout(shared.body_timeout, feed).await {
+                Ok(Ok(())) => {
+                    let obj = Arc::new(CachedObject::with_vary(
+                        head.status,
+                        head.headers.clone(),
+                        fill.collect(),
+                        head.freshness,
+                        head.vary().clone(),
+                    ));
+                    let kept = shared.cache.store_limited(
+                        key,
+                        obj.clone(),
+                        &client_headers,
+                        epoch,
+                        max_variants,
+                    );
+                    fill.finish(kept.then_some(obj));
+                }
+                Ok(Err(why)) => fill.abort(why),
+                Err(_) => fill.abort("timeout"),
+            }
+            drop(held);
+        });
+        Upstream::Respond(resp)
     }
 }
 
