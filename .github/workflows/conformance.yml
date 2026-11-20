@@ -49,8 +49,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Node 26: the suite's interim-response tests pass a dispatcher from
-      # its pinned undici 8 to the built-in fetch, which on Node 22 and 24
-      # never answers (they time out even against the suite's own server).
+      # its pinned undici 8 to the built-in fetch. On Node 22 those requests
+      # time out even against the suite's own server, and on Node 24 the
+      # command line exits before they finish.
       - uses: actions/setup-node@v4
         with:
           node-version: "26.13.1"
