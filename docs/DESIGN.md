@@ -153,6 +153,33 @@ A refused handshake is a connect error, which steer's retry rules always retry. 
 
 `crates/edgefront/tests/e2e_port_failover.rs` runs the resilient failover drill a second time over HTTPS with mutual TLS. The three upstreams terminate TLS for `api.example.com` and require client certificates from the fixture CA, and the cluster's `tls` block pins the CA, names the server and presents the client certificate, for requests and health checks alike. Every phase must keep 100.00%, as over cleartext.
 
+### ACME
+
+`edgefront_core::acme` gets certificates from an ACME CA (RFC 8555) with what the workspace already has: rustls and tokio-rustls for HTTPS to the CA, hyper for HTTP/1.1, ring for the P-256 keys and signatures, serde_json for the messages, and `tls::der` for the CSR.
+
+**The protocol** (`acme::client`).
+- `Client::connect` reads the directory over HTTPS, trusting only a given CA bundle (`client::trust`).
+- Every later request is a flattened JWS, signed ES256 with the account key: `newAccount` carries the key as a JWK (`Key::jwk`, thumbprint per RFC 7638), and later requests carry the account URL as `kid`.
+- Nonces come from the previous answer's `Replay-Nonce`, or from `newNonce`. A `badNonce` problem is retried with its fresh nonce, up to three times.
+- Reads are POST-as-GET. Problem documents (RFC 7807) become `AcmeError::Problem`. Each exchange is capped at 1 MiB and 30 s.
+- `client::issue` runs a whole order:
+  1. `newOrder` for the names;
+  2. for each pending authorization, a `Solver` prepares the challenge, the CA is told it is ready, and the authorization is polled until valid (honouring `Retry-After`), with the challenge taken down whatever happened;
+  3. the order is polled until ready;
+  4. it is finalized with a PKCS#10 CSR for a fresh P-256 key (the first name as the common name, every name as a DNS SAN);
+  5. it is polled until valid;
+  6. the chain is downloaded.
+- `AccountStore` keeps the account key (`account.key`, PKCS#8 PEM) and the account URL per directory (`account.json`) in the state directory, so a restart reuses the account, and the issued `cert.pem` and `key.pem` beside them. The directory is mode 0700, and each file is written at 0600 through a temporary file renamed into place.
+
+The first solver is `acme::challenges::Http01`, a handler that answers `/.well-known/acme-challenge/<token>` with the key authorization and anything else with 404.
+
+`crates/edgefront-core/tests/acme.rs` runs Pebble, Let's Encrypt's test CA, in Docker, and never a real CA. `tests/common/pebble.rs` starts pinned `pebble` and `pebble-challtestsrv` images on a private network. challtestsrv answers every name with the host's address as containers see it, so Pebble validates against listeners the test opens. Pebble runs with no validation sleep and no random `badNonce`. The tests check:
+- an HTTP-01 order for two names, verified by a TLS client that trusts only Pebble's root;
+- a second client finding the same account through the state directory, and a new key making a new account;
+- a failed challenge, a refused name and an untrusted directory, each reported with what failed.
+
+The tests need Docker.
+
 ### The failover drill
 
 steer's README publishes one table as the measure of its resilience: its failover drill, in which two priority-0 upstreams and a priority-1 backup take 200 requests per second while one fault lands per 10-second phase (a primary killed with SIGKILL, the other failing half its requests, then that one blackholed), and every phase keeps 100.00% of requests with health checks, outlier detection and retries on. The port is held to the same table. `examples/failover.sh` is steer's script with the proxy swapped, and the configurations in `examples/failover/` are steer's, byte for byte, so the comparison is between the two binaries and nothing else.

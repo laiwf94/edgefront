@@ -3,6 +3,7 @@
 //!
 //! It holds what is not specific to any one product:
 //!
+//! - [`acme`]: certificates issued and renewed over ACME;
 //! - [`config`]: the proxy configuration (steer's schema, in JSON or
 //!   TOML), and in [`config::loader`] the TOML loading, validation and
 //!   environment secrets the cache's config builds on;
@@ -28,6 +29,7 @@
 //!   listeners, reloads on SIGHUP and the drain on SIGTERM;
 //! - [`tls`]: TLS termination on rustls, with certificates chosen by SNI.
 
+pub mod acme;
 pub mod admin;
 pub mod body;
 pub mod clock;
