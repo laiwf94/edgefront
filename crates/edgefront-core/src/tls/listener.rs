@@ -33,8 +33,9 @@
 //! the four AES-CBC suites of the `compatible` policy are not offered (a
 //! snapshot lists the ones it dropped in [`Snapshot::warnings`], and a
 //! `cipher_suites` list of only CBC suites is refused), and a client
-//! whose ALPN list has no `http/1.1` is refused with
-//! `no_application_protocol` where Go would carry on without ALPN.
+//! whose ALPN list has no `http/1.1` (nor `h2`, when the listener offers
+//! HTTP/2) is refused with `no_application_protocol` where Go would carry
+//! on without ALPN.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -246,6 +247,8 @@ pub struct Shared {
     /// TLS-ALPN-01 challenge certificates, served to `acme-tls/1`
     /// handshakes; `None` does not offer that protocol at all.
     pub alpn_challenges: Option<Arc<AlpnChallenges>>,
+    /// Offer `h2` over ALPN, ahead of `http/1.1`.
+    pub http2: bool,
 }
 
 /// One loaded `tls` block. Immutable; a reload builds a new one.
@@ -356,6 +359,9 @@ impl Snapshot {
                 shared.alpn_challenges.clone(),
             )));
         config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+        if shared.http2 {
+            config.alpn_protocols.insert(0, crate::h2::ALPN_H2.to_vec());
+        }
         if shared.alpn_challenges.is_some() {
             config.alpn_protocols.push(ACME_TLS_ALPN.to_vec());
         }

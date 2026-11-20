@@ -1427,8 +1427,11 @@ impl Handler for Proxy {
     type Body = Body;
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+        let h2 = req.version() == Version::HTTP_2;
         let mut resp = self.handle(req, peer).await;
-        if self.draining() {
+        // HTTP/2 has no `Connection` header; the listener's GOAWAY ends
+        // such a connection when the drain stops it.
+        if self.draining() && !h2 {
             resp.headers_mut()
                 .insert(header::CONNECTION, HeaderValue::from_static("close"));
         }
@@ -1507,6 +1510,12 @@ fn request_host<'a>(
         return Err(None); // "too many Host headers", answered as a plain 400
     }
     let Some(value) = first else {
+        // HTTP/2 names the host in `:authority` (RFC 9113 section 8.3.1).
+        if version == Version::HTTP_2
+            && let Some(a) = uri.authority()
+        {
+            return Ok(a.as_str());
+        }
         if version >= Version::HTTP_11 {
             return Err(Some("missing required Host header"));
         }

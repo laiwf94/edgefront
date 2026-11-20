@@ -13,7 +13,8 @@ edgefront-limiter.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-# HTTP/2 for the h2 client; the edge binary itself does not take it.
+# HTTP/2 for the h2 client (the workspace pin turns it on for the edge
+# listener too).
 hyper = { workspace = true, features = ["http2"] }
 hyper-util.workspace = true
 rustls.workspace = true

@@ -205,6 +205,7 @@ async fn tls_alpn01_issues_through_the_tls_listener() {
         tickets: None,
         staples: None,
         alpn_challenges: Some(Arc::clone(&challenges)),
+        http2: false,
     };
     let store = Store::new(Arc::new(Snapshot::load_with(&tls, &shared).unwrap()));
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

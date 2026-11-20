@@ -1211,3 +1211,69 @@ fn messages_quote_values_the_way_go_does() {
          routes[2].cluster: unknown cluster \"é\\u00a0\\x00\""
     );
 }
+
+#[test]
+fn parses_http2() {
+    let with = |h2: &str| {
+        format!(
+            r#"{{"listen":":80","http2":{h2},"routes":[{{"cluster":"a"}}],"clusters":[{{"name":"a","endpoints":[{{"address":"h:1"}}]}}]}}"#
+        )
+    };
+    assert_eq!(parse(MINIMAL).unwrap().http2, None);
+    let d = parse(&with("{}")).unwrap().http2.unwrap();
+    assert_eq!(d, edgefront_core::config::Http2::default());
+    assert_eq!(
+        d.max_concurrent_streams,
+        defaults::H2_MAX_CONCURRENT_STREAMS
+    );
+    assert!(!d.cleartext);
+    let set = parse(&with(
+        r#"{"max_concurrent_streams":1000,"initial_stream_window":65535,"initial_connection_window":2147483647,
+            "max_frame_size":16777215,"max_header_list_size":1024,"cleartext":true}"#,
+    ))
+    .unwrap()
+    .http2
+    .unwrap();
+    assert_eq!(set.max_concurrent_streams, 1000);
+    assert_eq!(set.initial_stream_window, 65_535);
+    assert_eq!(set.initial_connection_window, (1 << 31) - 1);
+    assert_eq!(set.max_frame_size, (1 << 24) - 1);
+    assert_eq!(set.max_header_list_size, 1024);
+    assert!(set.cleartext);
+    for (h2, want) in [
+        (
+            r#"{"max_concurrent_streams":0}"#,
+            "http2.max_concurrent_streams: must be between 1 and 10000",
+        ),
+        (
+            r#"{"max_concurrent_streams":10001}"#,
+            "http2.max_concurrent_streams",
+        ),
+        (
+            r#"{"initial_stream_window":65534}"#,
+            "http2.initial_stream_window: must be between 65535 and 2147483647",
+        ),
+        (
+            r#"{"initial_connection_window":2147483648}"#,
+            "http2.initial_connection_window",
+        ),
+        (
+            r#"{"max_frame_size":16383}"#,
+            "http2.max_frame_size: must be between 16384 and 16777215",
+        ),
+        (r#"{"max_frame_size":16777216}"#, "http2.max_frame_size"),
+        (
+            r#"{"max_header_list_size":1023}"#,
+            "http2.max_header_list_size",
+        ),
+        (
+            r#"{"initial_stream_window":2000000,"initial_connection_window":1000000}"#,
+            "http2.initial_connection_window: must be at least initial_stream_window",
+        ),
+        (r#"{"window":1}"#, "unknown field"),
+        (r#"{"cleartext":"yes"}"#, "http2.cleartext"),
+    ] {
+        let err = parse(&with(h2)).unwrap_err().to_string();
+        assert!(err.contains(want), "{h2}: {err}");
+    }
+}

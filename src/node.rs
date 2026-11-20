@@ -174,6 +174,7 @@ pub fn listener_limits(config: &Config) -> ServerLimits {
         max_header_bytes: config.limits.max_header_bytes,
         max_headers: ServerLimits::default().max_headers,
         drain_timeout: Duration::from_millis(t.shutdown_ms),
+        http2: None,
     }
 }
 

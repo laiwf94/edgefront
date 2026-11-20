@@ -41,8 +41,8 @@ hmac = "=0.13.0"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"
-hyper = { version = "=1.12.0", features = ["http1", "server", "client"] }
-hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "=1.12.0", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "http2", "tokio"] }
 # TLS with ring as the one crypto provider: aws-lc-rs, rustls's default,
 # needs a C toolchain and CMake, and nothing here needs FIPS.
 # ring directly, for what rustls does not expose: key generation and JWS

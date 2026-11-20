@@ -19,6 +19,18 @@
 //! lets each busy connection finish its current request (answered with
 //! `Connection: close`), and after the drain timeout closes whatever is
 //! left.
+//!
+//! # HTTP/2
+//!
+//! With [`ServerLimits::http2`] set, a TLS connection that negotiated `h2`
+//! over ALPN, and, when the settings allow cleartext, a plain connection
+//! whose first 24 bytes are the HTTP/2 preface, is served as HTTP/2 with
+//! those settings ([`crate::h2`]). Each stream is a request for the same
+//! handler. The header read timeout then bounds the preface, and the idle
+//! timeout runs whenever no stream is open; frames on an idle connection
+//! (`PING`, `SETTINGS`) do not start a header timer. Shutdown sends
+//! `GOAWAY`, lets open streams finish within the drain timeout, and
+//! refuses new ones.
 
 use std::convert::Infallible;
 use std::future::{Future, pending};
@@ -41,6 +53,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
+use crate::h2::server::{Rewind, sniff_preface};
 use crate::http1::{BoxError, HoldBody, server_builder};
 use crate::tls::{Acceptor, Slot, TlsInfo};
 
@@ -58,6 +71,8 @@ pub struct ServerLimits {
     pub max_headers: usize,
     /// How long shutdown waits for in-flight requests.
     pub drain_timeout: Duration,
+    /// HTTP/2 for clients that negotiate it; `None` serves HTTP/1.1 only.
+    pub http2: Option<crate::h2::Settings>,
 }
 
 impl Default for ServerLimits {
@@ -71,6 +86,7 @@ impl Default for ServerLimits {
             max_header_bytes: 64 << 10,
             max_headers: 100,
             drain_timeout: Duration::from_secs(30),
+            http2: None,
         }
     }
 }
@@ -165,7 +181,7 @@ async fn run<H: Handler>(
                             conns.spawn(handshake_then_serve(a.clone(), slot, stream, peer, handler, limits, stop));
                         }
                         _ => {
-                            conns.spawn(connection(stream, peer, None, handler, limits, stop));
+                            conns.spawn(plain_then_serve(stream, peer, handler, limits, stop));
                         }
                     }
                 }
@@ -218,8 +234,92 @@ async fn handshake_then_serve<H: Handler>(
         if info.alpn.as_deref() == Some(crate::acme::challenges::ACME_TLS_ALPN) {
             return;
         }
-        connection(tls, peer, Some(info), handler, limits, stop).await;
+        match limits.http2 {
+            Some(settings) if info.alpn.as_deref() == Some(crate::h2::ALPN_H2) => {
+                h2_over_tls(tls, peer, info, handler, limits, settings, stop).await;
+            }
+            _ => connection(tls, peer, Some(info), handler, limits, Proto::Http1, stop).await,
+        }
     }
+}
+
+/// Serves a TLS connection that negotiated `h2`, once its preface has
+/// arrived within the header read timeout. A client that sends anything
+/// else gets `GOAWAY` with `PROTOCOL_ERROR` and a TLS close (RFC 9113
+/// section 3.4), rather than a connection cut without `close_notify`.
+async fn h2_over_tls<S, H: Handler>(
+    mut tls: S,
+    peer: SocketAddr,
+    info: Arc<TlsInfo>,
+    handler: Arc<H>,
+    limits: ServerLimits,
+    settings: crate::h2::Settings,
+    mut stop: watch::Receiver<bool>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let sniffed = tokio::select! {
+        r = tokio::time::timeout(limits.header_read_timeout, sniff_preface(&mut tls)) => r,
+        _ = stop.wait_for(|s| *s) => return,
+    };
+    match sniffed {
+        Ok(Ok((true, seen))) => {
+            let stream = Rewind::new(seen, tls);
+            connection(
+                stream,
+                peer,
+                Some(info),
+                handler,
+                limits,
+                Proto::Http2(settings),
+                stop,
+            )
+            .await;
+        }
+        Ok(Ok((false, _))) => {
+            tracing::debug!(peer = %peer, "invalid http/2 connection preface");
+            let _ = crate::h2::server::refuse_preface(&mut tls).await;
+        }
+        _ => tracing::debug!(peer = %peer, "connection closed or timed out before the preface"),
+    }
+}
+
+/// Serves a cleartext connection: as HTTP/2 when cleartext HTTP/2 is on
+/// and the client opens with the preface (read within the header read
+/// timeout), otherwise as HTTP/1.1.
+async fn plain_then_serve<H: Handler>(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    handler: Arc<H>,
+    limits: ServerLimits,
+    mut stop: watch::Receiver<bool>,
+) {
+    let Some(settings) = limits.http2.filter(|s| s.cleartext) else {
+        connection(stream, peer, None, handler, limits, Proto::Http1, stop).await;
+        return;
+    };
+    let sniffed = tokio::select! {
+        r = tokio::time::timeout(limits.header_read_timeout, sniff_preface(&mut stream)) => r,
+        _ = stop.wait_for(|s| *s) => return,
+    };
+    let Ok(Ok((h2, seen))) = sniffed else {
+        tracing::debug!(peer = %peer, "connection closed or timed out before a request");
+        return;
+    };
+    let proto = if h2 {
+        Proto::Http2(settings)
+    } else {
+        Proto::Http1
+    };
+    let stream = Rewind::new(seen, stream);
+    connection(stream, peer, None, handler, limits, proto, stop).await;
+}
+
+/// The protocol a connection is served with.
+#[derive(Clone, Copy)]
+enum Proto {
+    Http1,
+    Http2(crate::h2::Settings),
 }
 
 /// The state a connection's watchdog reads. Times are nanoseconds since
@@ -227,6 +327,8 @@ async fn handshake_then_serve<H: Handler>(
 /// head started since the connection went idle".
 struct Watch {
     start: Instant,
+    /// HTTP/2: reads on an idle connection are frames, not request heads.
+    h2: bool,
     busy: AtomicU32,
     idle_since: AtomicU64,
     head_since: AtomicU64,
@@ -234,9 +336,15 @@ struct Watch {
 }
 
 impl Watch {
+    #[cfg(test)]
     fn new() -> Self {
+        Watch::with_h2(false)
+    }
+
+    fn with_h2(h2: bool) -> Self {
         Watch {
             start: Instant::now(),
+            h2,
             busy: AtomicU32::new(0),
             idle_since: AtomicU64::new(0),
             // The first request's head timer runs from the accept.
@@ -255,10 +363,19 @@ impl Watch {
 
     /// Called for every successful read of `n` bytes.
     fn on_read(&self, n: usize) {
-        if n > 0
-            && self.busy.load(Ordering::Relaxed) == 0
-            && self.head_since.load(Ordering::Relaxed) == 0
-        {
+        if n == 0 || self.busy.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if self.h2 {
+            // The preface (or any frame) ends the first head timer; from
+            // then on only the idle timeout applies between streams.
+            if self.head_since.swap(0, Ordering::Relaxed) > 0 {
+                self.idle_since.store(self.now(), Ordering::Relaxed);
+                self.wake.notify_one();
+            }
+            return;
+        }
+        if self.head_since.load(Ordering::Relaxed) == 0 {
             self.head_since.store(self.now() + 1, Ordering::Relaxed);
             self.wake.notify_one();
         }
@@ -361,11 +478,12 @@ async fn connection<S, H: Handler>(
     tls: Option<Arc<TlsInfo>>,
     handler: Arc<H>,
     limits: ServerLimits,
+    proto: Proto,
     mut stop: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let watch = Arc::new(Watch::new());
+    let watch = Arc::new(Watch::with_h2(matches!(proto, Proto::Http2(_))));
     let service = {
         let watch = watch.clone();
         service_fn(move |mut req: Request<Incoming>| {
@@ -384,14 +502,66 @@ async fn connection<S, H: Handler>(
         stream,
         watch: watch.clone(),
     });
-    let mut conn = pin!(
-        server_builder(limits.max_header_bytes, limits.max_headers).serve_connection(io, service)
-    );
+    match proto {
+        Proto::Http1 => {
+            let conn = server_builder(limits.max_header_bytes, limits.max_headers)
+                .serve_connection(io, service);
+            drive(conn, peer, &watch, &limits, &mut stop).await;
+        }
+        Proto::Http2(settings) => {
+            let conn = settings.builder().serve_connection(io, service);
+            drive(conn, peer, &watch, &limits, &mut stop).await;
+        }
+    }
+}
+
+/// A served connection of either protocol: it ends, or is asked to finish
+/// what it has and stop.
+trait Served: Future<Output = Result<(), hyper::Error>> {
+    fn finish(self: Pin<&mut Self>);
+}
+
+impl<I, S> Served for hyper::server::conn::http1::Connection<I, S>
+where
+    S: hyper::service::HttpService<Incoming>,
+    S::Error: Into<BoxError>,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin,
+    S::ResBody: Body + 'static,
+    <S::ResBody as Body>::Error: Into<BoxError>,
+{
+    fn finish(self: Pin<&mut Self>) {
+        self.graceful_shutdown();
+    }
+}
+
+impl<I, S, E> Served for hyper::server::conn::http2::Connection<I, S, E>
+where
+    S: hyper::service::HttpService<Incoming>,
+    S::Error: Into<BoxError>,
+    I: hyper::rt::Read + hyper::rt::Write + Unpin,
+    S::ResBody: Body + 'static,
+    <S::ResBody as Body>::Error: Into<BoxError>,
+    E: hyper::rt::bounds::Http2ServerConnExec<S::Future, S::ResBody>,
+{
+    fn finish(self: Pin<&mut Self>) {
+        self.graceful_shutdown();
+    }
+}
+
+/// Runs a connection under its watchdog until it ends.
+async fn drive<C: Served>(
+    conn: C,
+    peer: SocketAddr,
+    watch: &Watch,
+    limits: &ServerLimits,
+    stop: &mut watch::Receiver<bool>,
+) {
+    let mut conn = pin!(conn);
     // The receiver was cloned before any stop was sent, so a stop that
     // came before this task first ran still shows up as a change.
     let mut stopping = false;
     loop {
-        let deadline = watch.deadline(&limits);
+        let deadline = watch.deadline(limits);
         let timer = async {
             match deadline {
                 Some(at) => tokio::time::sleep_until(at).await,
@@ -407,11 +577,11 @@ async fn connection<S, H: Handler>(
             }
             _ = stop.changed(), if !stopping => {
                 stopping = true;
-                conn.as_mut().graceful_shutdown();
+                conn.as_mut().finish();
             }
             () = watch.wake.notified() => {}
             () = timer => {
-                if watch.deadline(&limits).is_some_and(|at| at <= Instant::now()) {
+                if watch.deadline(limits).is_some_and(|at| at <= Instant::now()) {
                     tracing::debug!(peer = %peer, "connection timed out");
                     return;
                 }
@@ -482,6 +652,37 @@ mod tests {
         assert_eq!(
             w.deadline(&limits()),
             Some(w.start + Duration::from_secs(6))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http2_frames_on_an_idle_connection_are_not_heads() {
+        let w = Arc::new(Watch::with_h2(true));
+        assert_eq!(
+            w.deadline(&limits()),
+            Some(w.start + Duration::from_secs(1))
+        );
+        tokio::time::advance(Duration::from_millis(200)).await;
+        // The preface ends the first head timer; idle runs from here.
+        w.on_read(24);
+        let idle_at = w.start + Duration::from_millis(200);
+        assert_eq!(
+            w.deadline(&limits()),
+            Some(idle_at + Duration::from_secs(5))
+        );
+        // A PING later does not start a header timer.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        w.on_read(17);
+        assert_eq!(
+            w.deadline(&limits()),
+            Some(idle_at + Duration::from_secs(5))
+        );
+        let busy = Busy::new(w.clone());
+        assert_eq!(w.deadline(&limits()), None);
+        drop(busy);
+        assert_eq!(
+            w.deadline(&limits()),
+            Some(w.start + Duration::from_millis(2200) + Duration::from_secs(5))
         );
     }
 

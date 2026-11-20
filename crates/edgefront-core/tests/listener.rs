@@ -145,6 +145,7 @@ fn limits() -> ServerLimits {
         max_header_bytes: 4096,
         max_headers: 32,
         drain_timeout: Duration::from_secs(5),
+        http2: None,
     }
 }
 

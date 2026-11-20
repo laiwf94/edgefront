@@ -62,6 +62,7 @@ const LIMITS: ServerLimits = ServerLimits {
     max_header_bytes: 8192,
     max_headers: 100,
     drain_timeout: Duration::from_secs(2),
+    http2: None,
 };
 
 struct Server {

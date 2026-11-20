@@ -713,6 +713,7 @@ async fn resumption_survives_three_rotations_across_reloads() {
         tickets: Some(Arc::clone(&keys)),
         staples: None,
         alpn_challenges: None,
+        http2: false,
     };
     let snapshot = |certs| Arc::new(Snapshot::load_with(&tls_config(certs), &shared).unwrap());
     let server = Server::start(Acceptor::new(

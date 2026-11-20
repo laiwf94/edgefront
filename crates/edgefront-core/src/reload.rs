@@ -138,10 +138,12 @@ pub fn load(path: &str, settings: &Settings, prefix: &str) -> Result<Loaded, Str
         .and_then(|c| c.tls)
         .and_then(|t| t.acme)
         .is_some_and(|a| a.challenge == crate::config::AcmeChallenge::TlsAlpn01);
+    let http2 = Config::load(path).ok().is_some_and(|c| c.http2.is_some());
     let shared = Shared {
         tickets: Some(tickets),
         staples: Some(Arc::new(Staples::default())),
         alpn_challenges: alpn.then(AlpnChallenges::new),
+        http2,
     };
     load_with(path, settings, prefix, shared)
 }
@@ -225,6 +227,8 @@ pub struct Lifecycle<S> {
     base: Arc<std::sync::Mutex<crate::config::Tls>>,
     /// The ACME renewer's status, for `/metrics`.
     acme: Option<Arc<std::sync::Mutex<renew::Status>>>,
+    /// The `http2` block the listener was started with.
+    http2: Option<crate::config::Http2>,
     /// One reload at a time, from the admin API or SIGHUP.
     reloading: tokio::sync::Mutex<()>,
 }
@@ -272,6 +276,9 @@ impl<S: Service> Lifecycle<S> {
             .clone();
         if config.tls.as_ref().and_then(|t| t.acme.clone()) != running {
             return Err("tls.acme cannot change on a reload; restart edgefront".to_owned());
+        }
+        if config.http2 != self.http2 {
+            return Err("http2 cannot change on a reload; restart edgefront".to_owned());
         }
         drop(config);
         let next = load_with(
@@ -544,6 +551,7 @@ pub async fn run<S: Service>(
         shared: loaded.shared,
         base,
         acme: renewer.as_ref().map(renew::Renewer::status),
+        http2: config.http2,
         reloading: tokio::sync::Mutex::new(()),
     });
     let api = Arc::new(
@@ -575,6 +583,7 @@ pub async fn run<S: Service>(
     };
     let limits = ServerLimits {
         drain_timeout: settings.shutdown_timeout,
+        http2: config.http2.as_ref().map(crate::h2::Settings::from),
         ..ServerLimits::default()
     };
     let proxy_server = match store {

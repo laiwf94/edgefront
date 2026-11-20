@@ -11,6 +11,8 @@
 //!   clock for deterministic tests;
 //! - [`ids`]: request identifiers, and in [`reqid`] steer's rules for
 //!   `X-Request-Id`;
+//! - [`h2`]: HTTP/2 towards clients, offered over ALPN and, with prior
+//!   knowledge, on cleartext listeners;
 //! - [`listener`] and [`http1`]: the HTTP/1.1 listener with its connection
 //!   limits and graceful drain, which the proxy and the cache both serve
 //!   on, and the pooled HTTP/1.1 client;
@@ -35,6 +37,7 @@ pub mod body;
 pub mod clock;
 pub mod config;
 pub mod filter;
+pub mod h2;
 pub mod http1;
 pub mod ids;
 pub mod l4;

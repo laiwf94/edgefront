@@ -236,6 +236,7 @@ raw_struct!(RawConfig, "an object" {
     admin_listen: String,
     trusted_proxies: Option<Vec<String>>,
     tls: Option<RawTls>,
+    http2: Option<RawHttp2>,
     routes: Option<Vec<RawRoute>>,
     clusters: Option<Vec<RawCluster>>,
 });
@@ -252,6 +253,15 @@ raw_struct!(RawTls, "an object" {
     ocsp_responder: String,
     client_auth: Option<RawClientAuth>,
     acme: Option<RawAcme>,
+});
+
+raw_struct!(RawHttp2, "an object" {
+    max_concurrent_streams: Option<i64>,
+    initial_stream_window: Option<i64>,
+    initial_connection_window: Option<i64>,
+    max_frame_size: Option<i64>,
+    max_header_list_size: Option<i64>,
+    cleartext: bool,
 });
 
 raw_struct!(RawAcme, "an object" {

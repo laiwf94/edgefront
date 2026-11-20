@@ -53,6 +53,15 @@ pub mod limits {
     pub const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
     pub const MIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(100);
     pub const MAX_CONCURRENT_HANDSHAKE_CAP: u32 = 100_000;
+    pub const H2_MAX_CONCURRENT_STREAMS: i64 = 10_000;
+    /// The largest flow-control window, 2^31 - 1 (RFC 9113 section 6.9.1).
+    pub const H2_MAX_WINDOW: i64 = (1 << 31) - 1;
+    /// The protocol's default window, the least a setting may be.
+    pub const H2_MIN_WINDOW: i64 = 65_535;
+    pub const H2_MAX_FRAME_SIZE: i64 = (1 << 24) - 1;
+    pub const H2_MIN_FRAME_SIZE: i64 = 16_384;
+    pub const H2_MAX_HEADER_LIST_SIZE: i64 = 1 << 20;
+    pub const H2_MIN_HEADER_LIST_SIZE: i64 = 1024;
 }
 
 /// Values applied when a field is absent.
@@ -90,6 +99,16 @@ pub mod defaults {
 
     pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
     pub const MAX_CONCURRENT_HANDSHAKES: u32 = 1024;
+
+    /// HTTP/2: 100 streams, as RFC 9113 recommends as the least a server
+    /// should allow, 1 MiB stream and 4 MiB connection windows, the
+    /// protocol's smallest frames, and 64 KiB of headers, the HTTP/1.1
+    /// listener's head limit.
+    pub const H2_MAX_CONCURRENT_STREAMS: u32 = 100;
+    pub const H2_STREAM_WINDOW: u32 = 1 << 20;
+    pub const H2_CONNECTION_WINDOW: u32 = 4 << 20;
+    pub const H2_MAX_FRAME_SIZE: u32 = 16_384;
+    pub const H2_MAX_HEADER_LIST_SIZE: u32 = 64 << 10;
 }
 
 /// A validated configuration with defaults applied.
@@ -101,8 +120,45 @@ pub struct Config {
     /// `None` serves plain HTTP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<Tls>,
+    /// HTTP/2 towards clients: offered over ALPN on a TLS listener, and
+    /// with prior knowledge on a cleartext one when `cleartext` is set.
+    /// `None` serves HTTP/1.1 only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http2: Option<Http2>,
     pub routes: Vec<Route>,
     pub clusters: Vec<Cluster>,
+}
+
+/// The HTTP/2 settings a listener advertises (RFC 9113 section 6.5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Http2 {
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS`: streams a client may open at once.
+    pub max_concurrent_streams: u32,
+    /// `SETTINGS_INITIAL_WINDOW_SIZE`: each stream's receive window.
+    pub initial_stream_window: u32,
+    /// The connection's receive window, raised with a `WINDOW_UPDATE` on
+    /// stream 0 after the preface.
+    pub initial_connection_window: u32,
+    /// `SETTINGS_MAX_FRAME_SIZE`.
+    pub max_frame_size: u32,
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE`: the largest decoded header list.
+    pub max_header_list_size: u32,
+    /// Also accept HTTP/2 with prior knowledge (h2c, RFC 9113 section
+    /// 3.3) on a cleartext listener.
+    pub cleartext: bool,
+}
+
+impl Default for Http2 {
+    fn default() -> Self {
+        Http2 {
+            max_concurrent_streams: defaults::H2_MAX_CONCURRENT_STREAMS,
+            initial_stream_window: defaults::H2_STREAM_WINDOW,
+            initial_connection_window: defaults::H2_CONNECTION_WINDOW,
+            max_frame_size: defaults::H2_MAX_FRAME_SIZE,
+            max_header_list_size: defaults::H2_MAX_HEADER_LIST_SIZE,
+            cleartext: false,
+        }
+    }
 }
 
 /// An IP network, such as `10.0.0.0/8`. The address has no bits set past

@@ -6,11 +6,11 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use super::raw::{self, RawCluster, RawConfig, RawTls};
+use super::raw::{self, RawCluster, RawConfig, RawHttp2, RawTls};
 use super::{
     Acme, AcmeChallenge, Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config,
-    ConfigError, Endpoint, FieldError, HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy,
-    Retry, Route, Tls, TlsVersion, UpstreamTls, defaults, go, limits,
+    ConfigError, Endpoint, FieldError, HealthCheck, Http2, IpPrefix, Ocsp, OutlierDetection,
+    Policy, Retry, Route, Tls, TlsVersion, UpstreamTls, defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -145,6 +145,7 @@ impl Validator {
             admin_listen: raw.admin_listen.clone(),
             trusted_proxies: Vec::new(),
             tls: None,
+            http2: None,
             routes: Vec::new(),
             clusters: Vec::new(),
         };
@@ -177,6 +178,9 @@ impl Validator {
         }
         if let Some(t) = &raw.tls {
             cfg.tls = Some(self.tls("tls", t));
+        }
+        if let Some(h) = &raw.http2 {
+            cfg.http2 = Some(self.http2("http2", h));
         }
 
         let clusters = raw.clusters.as_deref().unwrap_or_default();
@@ -396,6 +400,58 @@ impl Validator {
                 }
             }),
         }
+    }
+
+    fn http2(&mut self, path: &str, raw: &RawHttp2) -> Http2 {
+        let d = Http2::default();
+        let mut int = |name: &str, v: Option<i64>, def: u32, lo: i64, hi: i64| {
+            narrow::<u32>(self.int_in(&format!("{path}.{name}"), v, def.into(), lo, hi))
+        };
+        let h = Http2 {
+            max_concurrent_streams: int(
+                "max_concurrent_streams",
+                raw.max_concurrent_streams,
+                d.max_concurrent_streams,
+                1,
+                limits::H2_MAX_CONCURRENT_STREAMS,
+            ),
+            initial_stream_window: int(
+                "initial_stream_window",
+                raw.initial_stream_window,
+                d.initial_stream_window,
+                limits::H2_MIN_WINDOW,
+                limits::H2_MAX_WINDOW,
+            ),
+            initial_connection_window: int(
+                "initial_connection_window",
+                raw.initial_connection_window,
+                d.initial_connection_window,
+                limits::H2_MIN_WINDOW,
+                limits::H2_MAX_WINDOW,
+            ),
+            max_frame_size: int(
+                "max_frame_size",
+                raw.max_frame_size,
+                d.max_frame_size,
+                limits::H2_MIN_FRAME_SIZE,
+                limits::H2_MAX_FRAME_SIZE,
+            ),
+            max_header_list_size: int(
+                "max_header_list_size",
+                raw.max_header_list_size,
+                d.max_header_list_size,
+                limits::H2_MIN_HEADER_LIST_SIZE,
+                limits::H2_MAX_HEADER_LIST_SIZE,
+            ),
+            cleartext: raw.cleartext,
+        };
+        if h.initial_connection_window < h.initial_stream_window {
+            self.add(
+                format!("{path}.initial_connection_window"),
+                "must be at least initial_stream_window",
+            );
+        }
+        h
     }
 
     fn cipher_suites(&mut self, path: &str, names: &[String]) -> Vec<CipherSuite> {
