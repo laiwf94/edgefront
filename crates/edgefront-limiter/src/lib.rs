@@ -30,6 +30,10 @@ pub mod overload;
 pub mod penalty;
 pub mod policy;
 pub mod rate;
+pub mod record;
+#[cfg(feature = "http")]
+pub mod replay;
+pub mod shadow;
 pub mod shape;
 pub mod siphash;
 pub mod slowloris;

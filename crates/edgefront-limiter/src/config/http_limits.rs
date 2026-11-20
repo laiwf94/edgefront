@@ -40,6 +40,7 @@
 //! | `http-key-host-header` | a `header:host` selector or match: HTTP/2 requests carry `:authority`, not `Host`, so those requests get no key; the `host` selector reads both |
 //! | `http-count-own-status` | `count` includes the refusal's own status, which the rule's refusals never reach (they are answered before any upstream), so the code counts only upstream answers |
 //! | `http-delay-unused` | `max_delay` is set on a rule whose action is not `delay` |
+//! | `http-shadow-shadowed` | a shadow rule follows an enforcing rule at least as strict on the same requests and keys, so it never sees the requests that one refuses |
 
 use std::time::Duration;
 
@@ -134,6 +135,9 @@ pub struct HttpLimitConfig {
     pub cost_missing: Option<u64>,
     #[serde(default)]
     pub penalty: Option<PenaltyToml>,
+    /// `enforce` (default), `shadow` or `off`.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// A rule's `[http_limits.penalty]` as written.
@@ -381,7 +385,13 @@ impl HttpLimitConfig {
                 })
             }
         };
+        let mode = match self.mode.as_deref() {
+            None => crate::shadow::Mode::Enforce,
+            Some(m) => crate::shadow::Mode::parse(m)
+                .ok_or_else(|| format!("mode: {m:?} is not enforce, shadow or off"))?,
+        };
         Ok(HttpRule {
+            mode,
             penalty,
             cost,
             name: self.name.clone(),
@@ -446,6 +456,30 @@ pub fn lint(rules: &[HttpRule]) -> Vec<HttpLint> {
     use crate::http::key::under_prefix;
     let mut out = Vec::new();
     for (i, r) in rules.iter().enumerate() {
+        // A shadow rule after an enforcing one that is at least as strict
+        // on the same requests and keys never sees what that one refuses,
+        // so it undercounts what it would block.
+        if r.mode == crate::shadow::Mode::Shadow
+            && let Some(e) = rules[..i].iter().find(|e| {
+                e.mode == crate::shadow::Mode::Enforce
+                    && (e.routes.is_none() || e.routes == r.routes)
+                    && (e.matches == Match::default() || e.matches == r.matches)
+                    && e.key == r.key
+                    && u128::from(e.rate.tokens) * u128::from(r.rate.period_ns)
+                        <= u128::from(r.rate.tokens) * u128::from(e.rate.period_ns)
+                    && e.rate.burst <= r.rate.burst
+            })
+        {
+            out.push(HttpLint {
+                rule: i,
+                name: r.name.clone(),
+                class: Class::HttpShadowShadowed,
+                message: format!(
+                    "shadow limit {} comes after {}, which enforces at least as tight a limit on the same requests and keys, so it never sees what {} refuses and its would-block count is low",
+                    r.name, e.name, e.name
+                ),
+            });
+        }
         let mut warn = |class, message: String| {
             out.push(HttpLint {
                 rule: i,

@@ -49,6 +49,8 @@ use crate::clock::Clock;
 use crate::cost::{Cost, graphql_cost, header_cost};
 use crate::gcra::{Error, Rate};
 use crate::penalty::{PenaltyBox, PenaltyConfig};
+use crate::record::{Outcome, Record, Recorder};
+use crate::shadow::{Mode, Shadow};
 use crate::table::{FullPolicy, Table, TableConfig};
 
 /// The most rules one route may carry.
@@ -156,6 +158,15 @@ pub struct HttpRule {
     pub cost: Cost,
     /// The penalty box for keys that keep hitting this rule, if any.
     pub penalty: Option<Penalty>,
+    /// Enforce, shadow (count, never refuse) or off ([`crate::shadow`]).
+    pub mode: Mode,
+}
+
+impl HttpRule {
+    /// Whether the rule refuses what it decides against.
+    pub fn mode_enforces(&self) -> bool {
+        self.mode == Mode::Enforce
+    }
 }
 
 /// A rule's penalty box: [`PenaltyConfig`] for boxing, and a ban for a
@@ -216,6 +227,7 @@ pub struct RuleStats {
 
 struct Rule {
     spec: HttpRule,
+    shadow: Shadow,
     penalty: Option<PenaltyBox>,
     table: Arc<Table>,
     policy_item: String,
@@ -230,6 +242,8 @@ pub struct HttpLimiter {
     /// Bans by rule and key, set by penalty boxes and by hand; kept across
     /// limiter rebuilds by handing the same list to the next one.
     bans: Arc<BanList>,
+    /// Every decision, when recording.
+    recorder: Option<Arc<Recorder>>,
 }
 
 impl fmt::Debug for HttpLimiter {
@@ -249,6 +263,7 @@ impl HttpLimiter {
             cfg.full_policy = spec.table_full;
             let table = Table::new(&cfg).map_err(|e| format!("http limit {}: {e}", spec.name))?;
             built.push(Rule {
+                shadow: Shadow::new(spec.mode, 64),
                 penalty: spec.penalty.map(|p| PenaltyBox::new(p.boxing)),
                 policy_item: headers::policy_item(&spec.name, &spec.rate),
                 spec,
@@ -260,7 +275,82 @@ impl HttpLimiter {
             rules: built,
             clock,
             bans: Arc::new(BanList::new(10_000_000, 1 << 20)),
+            recorder: None,
         })
+    }
+
+    /// Records every decision of every rule into `recorder`, whose rule
+    /// names must be [`HttpLimiter::rule_names`].
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<Recorder>) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    pub fn recorder(&self) -> Option<&Arc<Recorder>> {
+        self.recorder.as_ref()
+    }
+
+    /// The rules' names, in order: a recording's rule index.
+    pub fn rule_names(&self) -> Vec<String> {
+        self.rules.iter().map(|r| r.spec.name.clone()).collect()
+    }
+
+    /// Applies `next`, the same rules with only their modes changed, in
+    /// place: every table, counter and key keeps its state, so promoting
+    /// a shadow rule to enforce starts refusing with what it has already
+    /// counted. Any other change is refused, naming the first rule that
+    /// differs, since it needs new tables. Returns the rules whose mode
+    /// changed.
+    pub fn apply_modes(&self, next: &[HttpRule]) -> Result<Vec<(String, Mode)>, String> {
+        if next.len() != self.rules.len() {
+            return Err(format!(
+                "the rules changed from {} to {}: only modes change in place; restart for the rest",
+                self.rules.len(),
+                next.len()
+            ));
+        }
+        for (r, n) in self.rules.iter().zip(next) {
+            let mut same = n.clone();
+            same.mode = r.spec.mode;
+            if same != r.spec {
+                return Err(format!(
+                    "http limit {} changed more than its mode; restart to apply it",
+                    n.name
+                ));
+            }
+        }
+        let mut changed = Vec::new();
+        for (r, n) in self.rules.iter().zip(next) {
+            if r.shadow.mode() != n.mode {
+                r.shadow.set_mode(n.mode);
+                changed.push((n.name.clone(), n.mode));
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Each rule's mode now and its would-block count.
+    pub fn shadow_stats(&self) -> Vec<(String, Mode, u64)> {
+        self.rules
+            .iter()
+            .map(|r| {
+                (
+                    r.spec.name.clone(),
+                    r.shadow.mode(),
+                    r.shadow.would_blocked(),
+                )
+            })
+            .collect()
+    }
+
+    /// One rule's kept would-be refusals.
+    pub fn shadow_examples(&self, rule: &str) -> Vec<crate::shadow::Example> {
+        self.rules
+            .iter()
+            .find(|r| r.spec.name == rule)
+            .map(|r| r.shadow.examples())
+            .unwrap_or_default()
     }
 
     /// The same limiter keeping `bans`, such as the previous limiter's,
@@ -462,7 +552,8 @@ async fn decide(
     let mut wait_ns = 0u64;
     for &ri in rules {
         let rule = &limiter.rules[ri];
-        if !rule.spec.matches.matches(&view) {
+        let mode = rule.shadow.mode();
+        if mode == Mode::Off || !rule.spec.matches.matches(&view) {
             continue;
         }
         let Some(key) = rule.spec.key.key(&view) else {
@@ -500,6 +591,15 @@ async fn decide(
         {
             Ok((d, reset_ns)) if d.allowed => {
                 bump(&rule.counters.allowed);
+                if let Some(rec) = &limiter.recorder {
+                    rec.record(Record::new(
+                        now,
+                        ri as u16,
+                        rec.hash(key.as_bytes()),
+                        cost.unwrap_or(1),
+                        Outcome::Allowed,
+                    ));
+                }
                 let taken = match cost {
                     Some(c) => c,
                     None => {
@@ -541,6 +641,34 @@ async fn decide(
                 continue;
             }
         };
+        if mode == Mode::Shadow {
+            // Counted as the enforcing copy would refuse it, and let
+            // through as if the rule were not there.
+            rule.shadow.would_block(
+                now,
+                crate::siphash::siphash13(&[0; 16], key.as_bytes()),
+                retry_ns,
+            );
+            if let Some(rec) = &limiter.recorder {
+                rec.record(Record::new(
+                    now,
+                    ri as u16,
+                    rec.hash(key.as_bytes()),
+                    cost.unwrap_or(1),
+                    Outcome::WouldRefuse,
+                ));
+            }
+            continue;
+        }
+        if let Some(rec) = &limiter.recorder {
+            rec.record(Record::new(
+                now,
+                ri as u16,
+                rec.hash(key.as_bytes()),
+                cost.unwrap_or(1),
+                Outcome::Refused,
+            ));
+        }
         match rule.spec.action {
             Action::Log => {
                 bump(&rule.counters.logged);

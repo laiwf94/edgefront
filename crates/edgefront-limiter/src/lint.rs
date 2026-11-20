@@ -27,6 +27,7 @@
 //! | `http-key-host-header` | an HTTP rule keys on `header:host`, which HTTP/2 requests do not carry |
 //! | `http-count-own-status` | an HTTP rule counts its own refusal status, which only upstream answers can have |
 //! | `http-delay-unused` | an HTTP rule sets `max_delay` without the delay action |
+//! | `http-shadow-shadowed` | a shadow HTTP rule follows an enforcing one at least as strict on the same requests and keys |
 //!
 //! The `http-*` classes come from `config::http_limits::lint`.
 
@@ -72,11 +73,12 @@ pub enum Class {
     HttpKeyHostHeader,
     HttpCountOwnStatus,
     HttpDelayUnused,
+    HttpShadowShadowed,
 }
 
 impl Class {
     /// Every class, in the order of the table in the module docs.
-    pub const ALL: [Class; 15] = [
+    pub const ALL: [Class; 16] = [
         Class::BurstBelowRead,
         Class::ListenOverlap,
         Class::TableBelowMaxConns,
@@ -92,6 +94,7 @@ impl Class {
         Class::HttpKeyHostHeader,
         Class::HttpCountOwnStatus,
         Class::HttpDelayUnused,
+        Class::HttpShadowShadowed,
     ];
 
     /// The class's name, as `edgefront check` prints it and `--allow`
@@ -113,6 +116,7 @@ impl Class {
             Class::HttpKeyHostHeader => "http-key-host-header",
             Class::HttpCountOwnStatus => "http-count-own-status",
             Class::HttpDelayUnused => "http-delay-unused",
+            Class::HttpShadowShadowed => "http-shadow-shadowed",
         }
     }
 
