@@ -48,9 +48,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Node 26: the suite's interim-response tests pass a dispatcher from
+      # its pinned undici 8 to the built-in fetch, which on Node 22 and 24
+      # never answers (they time out even against the suite's own server).
       - uses: actions/setup-node@v4
         with:
-          node-version: "26"
+          node-version: "26.13.1"
       - name: Check out the suite at the pinned commit
         run: |
           mkdir -p target/conformance/cache-tests
@@ -63,22 +66,6 @@ jobs:
       # is installed; node finds it from the suite's directory upwards.
       - name: Install undici
         run: npm install --prefix target/conformance --no-save --no-package-lock --ignore-scripts "undici@$UNDICI_VERSION"
-      - name: Diagnose interim (throwaway)
-        run: |
-          cargo build --locked --bin cachet
-          cd target/conformance/cache-tests
-          export npm_config_protocol=http npm_config_port=8000 npm_config_pidfile=/tmp/p.pid
-          node test-engine/server/server.mjs & sleep 2
-          printf 'node_id = "d"\nlisten = "127.0.0.1:8080"\nadmin_listen = "127.0.0.1:8081"\n[[origins]]\nname = "o"\nurl = "http://127.0.0.1:8000"\n[health]\npath = "/index.html"\n' > /tmp/d.toml
-          ../../debug/cachet --config /tmp/d.toml > /tmp/cachet.log 2>&1 & sleep 2
-          node --version; node -p process.versions.undici
-          echo "== direct to the suite server"
-          npm_config_base=http://127.0.0.1:8000 npm_config_id=interim-103 npm_package_config_id=x timeout 60 node --no-warnings test-engine/cli.mjs || echo "exit $?"
-          echo "== through cachet"
-          npm_config_base=http://127.0.0.1:8080 npm_config_id=interim-103 npm_package_config_id=x timeout 60 node --no-warnings test-engine/cli.mjs || echo "exit $?"
-          echo "== raw curl through cachet"
-          curl -sv -m 10 http://127.0.0.1:8080/index.html -o /dev/null 2>&1 | grep "^< HTTP" || true
-          tail -5 /tmp/cachet.log
       - name: Build the binary and the test
         run: cargo test --locked --test conformance --no-run
       - name: Run the suite
