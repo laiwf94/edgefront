@@ -78,6 +78,7 @@ async fn listeners(admin: Reserved) -> Listeners {
     Listeners {
         proxy: TcpListener::bind("127.0.0.1:0").await.unwrap(),
         admin: admin.socket.listen(1024).unwrap(),
+        gossip: None,
     }
 }
 

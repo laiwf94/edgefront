@@ -65,6 +65,50 @@ impl crate::layer::Observer for Metrics {
     }
 }
 
+/// The tier families, for a node in a cluster.
+pub fn render_tier(tier: &edgefront_cache::tier::Tier) -> String {
+    use edgefront_cache::tier::TierStats;
+    let mut out = String::new();
+    let s = &tier.stats;
+    let view = tier.view();
+    for (name, help, value) in [
+        (
+            "cachet_tier_owner_fetches_total",
+            "Misses sent to the key's owner among the edge nodes.",
+            TierStats::get(&s.owner_fetches),
+        ),
+        (
+            "cachet_tier_shield_fetches_total",
+            "Misses sent to a shield.",
+            TierStats::get(&s.shield_fetches),
+        ),
+        (
+            "cachet_tier_fallbacks_total",
+            "Owner or shield fetches that failed and went to the origin.",
+            TierStats::get(&s.fallbacks),
+        ),
+        (
+            "cachet_tier_hot_promoted_total",
+            "Keys that became hot on this node.",
+            TierStats::get(&s.hot_promoted),
+        ),
+        (
+            "cachet_tier_hot_demoted_total",
+            "Hot keys that cooled down on this node.",
+            TierStats::get(&s.hot_demoted),
+        ),
+    ] {
+        counter(&mut out, name, help, value);
+    }
+    gauge(
+        &mut out,
+        "cachet_tier_members",
+        "Live members this node sees, itself included.",
+        view.http.len() as u64,
+    );
+    out
+}
+
 impl Metrics {
     pub fn request(&self, outcome: Outcome, elapsed: Duration) {
         let i = Outcome::ALL

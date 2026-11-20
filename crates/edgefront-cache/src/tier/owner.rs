@@ -43,6 +43,12 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+impl<T> Default for Owners<T> {
+    fn default() -> Self {
+        Owners::new([])
+    }
+}
+
 impl<T> Owners<T> {
     /// Nodes with a weight that is not positive and finite own nothing and
     /// are left out.

@@ -18,7 +18,7 @@ stderr:
   |
 2 | bogus = 1
   | ^^^^^
-unknown field `bogus`, expected one of `node_id`, `listen`, `admin_listen`, `origins`, `cache`, `health`, `timeouts`, `limits`, `peers`, `gossip`
+unknown field `bogus`, expected one of `node_id`, `listen`, `admin_listen`, `origins`, `cache`, `health`, `timeouts`, `limits`, `peers`, `gossip`, `tier`
 
 
 $ {program} --check-config {dir}/syntax.toml

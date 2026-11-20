@@ -67,6 +67,74 @@ pub struct Config {
     pub peers: Vec<PeerConfig>,
     #[serde(default)]
     pub gossip: GossipConfig,
+    /// Tiered caching: SWIM membership, peer fetch, shields and hot keys.
+    /// Off unless present.
+    #[serde(default)]
+    pub tier: Option<TierConfig>,
+}
+
+/// `[tier]`: this node's part in a cluster of caches.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TierConfig {
+    /// The UDP address SWIM listens on.
+    pub gossip_listen: SocketAddr,
+    /// Other members' SWIM addresses to join through; one live one is
+    /// enough.
+    #[serde(default)]
+    pub seeds: Vec<SocketAddr>,
+    /// The HTTP address other nodes reach this one on, when `listen` is not
+    /// it (a wildcard listen address, say).
+    #[serde(default)]
+    pub advertise: Option<SocketAddr>,
+    /// This node's share of keys, relative to the others'.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+    /// A key requested this often a second on this node is kept here too.
+    #[serde(default = "default_hot_rate")]
+    pub hot_rate: f64,
+    /// SWIM's protocol period.
+    #[serde(default = "default_period_ms")]
+    pub period_ms: u64,
+    /// How long a suspect has to refute before it is dead.
+    #[serde(default = "default_suspicion_ms")]
+    pub suspicion_ms: u64,
+    /// Per route, the shield nodes misses go to.
+    #[serde(default)]
+    pub shields: Vec<ShieldConfig>,
+}
+
+/// One `[[tier.shields]]` route.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShieldConfig {
+    /// The request host, or empty for any.
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_prefix")]
+    pub path_prefix: String,
+    /// Node ids of the shields.
+    pub nodes: Vec<String>,
+}
+
+fn default_weight() -> f64 {
+    1.0
+}
+
+fn default_hot_rate() -> f64 {
+    50.0
+}
+
+fn default_period_ms() -> u64 {
+    250
+}
+
+fn default_suspicion_ms() -> u64 {
+    1000
+}
+
+fn default_prefix() -> String {
+    "/".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -591,6 +659,31 @@ impl Config {
                     .into(),
             );
         }
+        if let Some(t) = &self.tier {
+            if !(t.weight.is_finite() && t.weight > 0.0) {
+                return Err("tier.weight must be a positive number".into());
+            }
+            if !(t.hot_rate.is_finite() && t.hot_rate > 0.0) {
+                return Err("tier.hot_rate must be a positive number".into());
+            }
+            if t.period_ms < 10 || t.suspicion_ms < t.period_ms {
+                return Err(
+                    "tier.period_ms must be at least 10 and suspicion_ms at least one period"
+                        .into(),
+                );
+            }
+            for s in &t.shields {
+                if s.nodes.is_empty() || !s.nodes.iter().all(|n| valid_name(n)) {
+                    return Err("each [[tier.shields]] needs nodes, as node ids".into());
+                }
+                if !s.path_prefix.starts_with('/') {
+                    return Err(format!(
+                        "tier.shields path_prefix {:?} must start with /",
+                        s.path_prefix
+                    ));
+                }
+            }
+        }
         let l = &self.limits;
         if l.max_uri_bytes < 64 || l.max_header_bytes < 8192 {
             return Err(
@@ -606,6 +699,9 @@ impl Config {
         match &secrets.cluster_secret {
             None if !self.peers.is_empty() => {
                 Err("CACHET_CLUSTER_SECRET is required when peers are configured".into())
+            }
+            None if self.tier.is_some() => {
+                Err("CACHET_CLUSTER_SECRET is required when [tier] is configured".into())
             }
             Some(s) if s.len() < MIN_SECRET_BYTES => Err(format!(
                 "CACHET_CLUSTER_SECRET must be at least {MIN_SECRET_BYTES} bytes"
@@ -1019,5 +1115,56 @@ mod tests {
         assert!(err.contains("unknown field `ttl`"), "{err}");
         let err = with("[cache]\nmax_ttl_secs = 0").unwrap_err();
         assert!(err.starts_with("cache.max_ttl_secs:"), "{err}");
+    }
+
+    #[test]
+    fn a_tier_section_is_parsed_validated_and_needs_the_cluster_secret() {
+        let text = format!(
+            "{MINIMAL}\n[tier]\ngossip_listen = \"127.0.0.1:7946\"\nseeds = [\"10.0.0.2:7946\"]\n\
+             [[tier.shields]]\npath_prefix = \"/video/\"\nnodes = [\"shield-1\"]\n"
+        );
+        let c = Config::parse(&text).unwrap();
+        let t = c.tier.as_ref().unwrap();
+        assert_eq!(
+            (t.weight, t.hot_rate, t.period_ms, t.suspicion_ms),
+            (1.0, 50.0, 250, 1000)
+        );
+        assert_eq!(t.seeds.len(), 1);
+        assert_eq!(t.advertise, None);
+        assert_eq!(t.shields[0].host, "");
+        assert_eq!(t.shields[0].nodes, ["shield-1"]);
+        let no_secret = Secrets {
+            admin_token: None,
+            cluster_secret: None,
+        };
+        assert!(
+            c.validate_secrets(&no_secret)
+                .unwrap_err()
+                .contains("[tier]")
+        );
+        assert!(Config::parse(MINIMAL).unwrap().tier.is_none());
+        for (bad, why) in [
+            ("weight = 0", "tier.weight"),
+            ("weight = -1.5", "tier.weight"),
+            ("hot_rate = 0", "tier.hot_rate"),
+            ("period_ms = 5", "tier.period_ms"),
+            ("period_ms = 500\nsuspicion_ms = 100", "tier.period_ms"),
+        ] {
+            let text = format!("{MINIMAL}\n[tier]\ngossip_listen = \"127.0.0.1:7946\"\n{bad}\n");
+            let err = Config::parse(&text).unwrap_err();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        for (bad, why) in [
+            ("nodes = []", "needs nodes"),
+            ("nodes = [\"a b\"]", "needs nodes"),
+            ("path_prefix = \"video\"\nnodes = [\"s\"]", "start with /"),
+        ] {
+            let text = format!(
+                "{MINIMAL}\n[tier]\ngossip_listen = \"127.0.0.1:7946\"\n[[tier.shields]]\n{bad}\n"
+            );
+            let err = Config::parse(&text).unwrap_err();
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        assert!(Config::parse(&format!("{MINIMAL}\n[tier]\nseeds = []\n")).is_err());
     }
 }

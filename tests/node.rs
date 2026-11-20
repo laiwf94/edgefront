@@ -397,6 +397,7 @@ async fn starts_on_listeners_it_is_given() {
     let listeners = node::Listeners {
         proxy: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
         admin: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        gossip: None,
     };
     let (proxy, admin) = (
         listeners.proxy.local_addr().unwrap(),
@@ -420,6 +421,7 @@ async fn starts_on_listeners_it_is_given() {
     let listeners = node::Listeners {
         proxy: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
         admin: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        gossip: None,
     };
     let peers = "[[peers]]\nname = \"edge-b\"\nurl = \"http://127.0.0.1:1\"\n";
     let err = node::start_with(

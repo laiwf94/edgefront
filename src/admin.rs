@@ -63,7 +63,10 @@ impl Admin {
 
     fn metrics(&self) -> Response<Body> {
         let p = &self.proxy;
-        let body = p.metrics.render(&p.cache, &p.pool, p.in_flight());
+        let mut body = p.metrics.render(&p.cache, &p.pool, p.in_flight());
+        if let Some(tier) = p.tier() {
+            body.push_str(&crate::metrics::render_tier(tier));
+        }
         let mut resp = Response::new(full(body));
         resp.headers_mut().insert(
             header::CONTENT_TYPE,

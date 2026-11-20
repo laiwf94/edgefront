@@ -12,6 +12,12 @@
 //! and go to the origin pool; an origin that fails is reported to the
 //! layer by name (`connect`, `timeout`, `protocol`, `body-too-large`), so
 //! `stale-if-error` and `Cache-Status` work as for the proxy's errors.
+//!
+//! With `[tier]`, a miss goes to its owner among the edge nodes, or the
+//! route's shield, before the origin ([`edgefront_cache::tier`]): a node
+//! that does not own a key passes the owner's response on without storing
+//! it, unless the key is hot here, and goes to the origin itself when the
+//! owner cannot be reached.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -37,6 +43,14 @@ use crate::metrics::Metrics;
 use crate::object::primary_key;
 use crate::origin::{OriginError, OriginPool, OutBody, Outbound};
 
+use crate::purge::PurgeTarget;
+use crate::respond::{Body, BoxError, text};
+use crate::store::Cache;
+use edgefront_cache::tier::peer::{self, HOP};
+use edgefront_cache::tier::{Next, Tier, Transient};
+
+pub use crate::layer::{Clock, SystemClock};
+
 /// The largest request body (by Content-Length) held whole so that an
 /// idempotent request can be sent again.
 const REPLAY_BODY_MAX: u64 = 64 * 1024;
@@ -52,11 +66,6 @@ async fn read_replayable(body: Body) -> Result<Bytes, ()> {
     }
     Ok(Bytes::from(out))
 }
-use crate::purge::PurgeTarget;
-use crate::respond::{Body, BoxError, text};
-use crate::store::Cache;
-
-pub use crate::layer::{Clock, SystemClock};
 
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
@@ -94,6 +103,15 @@ pub struct Proxy {
     settings: ProxySettings,
     via: HeaderValue,
     cache_name: String,
+    tier: std::sync::OnceLock<TierLink>,
+}
+
+/// A node's link to the tiers: the membership view and hot keys, and the
+/// client it fetches from other nodes on.
+pub struct TierLink {
+    pub tier: Arc<Tier>,
+    pub client: crate::origin::Client,
+    pub timeout: Duration,
 }
 
 fn is_token(s: &str) -> bool {
@@ -147,7 +165,19 @@ impl Proxy {
             settings,
             via,
             cache_name,
+            tier: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Joins the tiers: misses go to owners and shields from now on.
+    /// Returns false if already joined.
+    pub fn enable_tier(&self, link: TierLink) -> bool {
+        self.tier.set(link).is_ok()
+    }
+
+    /// The tiers, when this node is in a cluster.
+    pub fn tier(&self) -> Option<&Arc<Tier>> {
+        self.tier.get().map(|l| &l.tier)
     }
 
     /// Origin fetches currently shared through collapsing, background
@@ -241,6 +271,10 @@ impl Proxy {
                 "detail=body-too-large",
             );
         }
+        let mut req = req;
+        if let Some(link) = self.tier.get() {
+            self.tier_observe(link, &mut req).await;
+        }
         let proxy = self.clone();
         let (id, client) = (id.clone(), client);
         filter::run(Some(&*self.layer), 0, req, move |req| {
@@ -249,6 +283,106 @@ impl Proxy {
             async move { proxy.send(req, &id, client).await }
         })
         .await
+    }
+
+    /// Before the cache: drops a hop header that is not validly signed, and
+    /// counts the request for the hot-key sketch, dropping this node's copies
+    /// of keys it demoted that another node owns.
+    async fn tier_observe(&self, link: &TierLink, req: &mut Request<Body>) {
+        let key_bytes = &link.tier.settings.key;
+        if let Some(v) = req.headers().get(HOP) {
+            let target = req.uri().path_and_query().map_or("/", |p| p.as_str());
+            if peer::verify(key_bytes, v, req.method().as_str(), target).is_none() {
+                req.headers_mut().remove(HOP);
+            }
+        }
+        if !matches!(*req.method(), Method::GET | Method::HEAD) {
+            return;
+        }
+        let Some(key) = primary_key(req.uri(), req.headers()) else {
+            return;
+        };
+        let (_, demoted) = link.tier.observe(&key);
+        let gone: Vec<PurgeTarget> = demoted
+            .into_iter()
+            .filter(|k| !link.tier.owns(k))
+            .map(|k| PurgeTarget::Key(k.into()))
+            .collect();
+        if !gone.is_empty() {
+            self.cache.purge(&gone).await;
+        }
+    }
+
+    /// Sends a miss to another node, if the tiers say so. `None` when it goes
+    /// to the origin: by the tiers' choice, or because the node could not be
+    /// reached in time.
+    async fn send_to_tier(
+        &self,
+        parts: &http::request::Parts,
+        id: &HeaderValue,
+        client: SocketAddr,
+    ) -> Option<Response<Body>> {
+        let link = self.tier.get()?;
+        if !matches!(parts.method, Method::GET | Method::HEAD) {
+            return None;
+        }
+        let target = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+        let key_bytes = &link.tier.settings.key;
+        let hop = parts
+            .headers
+            .get(HOP)
+            .and_then(|v| peer::verify(key_bytes, v, parts.method.as_str(), target));
+        let key = primary_key(&parts.uri, &parts.headers)?;
+        let host = parts
+            .headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        let Next::Node { addr, tier, .. } =
+            link.tier.next(&key, host, parts.uri.path(), hop.as_ref())
+        else {
+            return None;
+        };
+        let stats = &link.tier.stats;
+        match tier {
+            peer::Tier::Owner => stats.owner_fetches.fetch_add(1, Ordering::Relaxed),
+            peer::Tier::Shield => stats.shield_fetches.fetch_add(1, Ordering::Relaxed),
+        };
+        let mut headers = self.outbound_headers(parts.headers.clone(), id, client);
+        headers.insert(
+            HOP,
+            peer::sign(
+                key_bytes,
+                &link.tier.settings.me,
+                tier,
+                parts.method.as_str(),
+                target,
+            ),
+        );
+        let uri: Uri = format!("http://{addr}{target}").parse().ok()?;
+        let mut req = Request::new(crate::respond::empty());
+        *req.method_mut() = parts.method.clone();
+        *req.uri_mut() = uri;
+        *req.headers_mut() = headers;
+        match tokio::time::timeout(link.timeout, link.client.request(req)).await {
+            Ok(Ok(resp)) => {
+                let (mut parts, body) = resp.into_parts();
+                strip_hop_by_hop(&mut parts.headers);
+                parts.headers.remove(HOP);
+                if tier == peer::Tier::Owner && !link.tier.is_hot(&key) {
+                    parts.extensions.insert(Transient);
+                }
+                Some(Response::from_parts(
+                    parts,
+                    body.map_err(Into::into).boxed(),
+                ))
+            }
+            _ => {
+                stats.fallbacks.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(%addr, "tier fetch failed; going to the origin");
+                None
+            }
+        }
     }
 
     fn looped(&self, headers: &HeaderMap) -> bool {
@@ -268,6 +402,9 @@ impl Proxy {
         client: SocketAddr,
     ) -> (Response<Body>, Delivery) {
         let (parts, body) = req.into_parts();
+        if let Some(resp) = self.send_to_tier(&parts, id, client).await {
+            return (resp, Delivery::Upstream);
+        }
         let declared = declared_length(&parts.headers);
         let has_body = !(parts.method == Method::GET || parts.method == Method::HEAD)
             || declared.is_some_and(|n| n > 0)
@@ -330,6 +467,7 @@ impl Proxy {
         client: SocketAddr,
     ) -> HeaderMap {
         strip_hop_by_hop(&mut out);
+        out.remove(HOP);
         out.append(header::VIA, self.via.clone());
         let ip = client.ip().to_string();
         let forwarded = match out.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {

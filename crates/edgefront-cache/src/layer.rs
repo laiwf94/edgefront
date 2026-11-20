@@ -1069,6 +1069,11 @@ impl Fill {
         if is_error_status(parts.status) {
             self.failure = Some(format!("fwd-status={}", parts.status.as_u16()));
         }
+        // Fetched from the key's owner, which keeps it: passed on, not
+        // stored here (tier::Transient).
+        if parts.extensions.get::<crate::tier::Transient>().is_some() {
+            return self.through(parts, body);
+        }
         let resp_cc = CacheControl::for_response(&parts.headers);
         let exchange = Exchanged {
             method: &Method::GET,
