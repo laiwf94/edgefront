@@ -1407,8 +1407,8 @@ impl Fill {
                         fill.push(part);
                         if !done.is_empty() {
                             fill.finish(None);
-                            store_slice(index, done);
-                            progress.stored(index);
+                            store_slice(index, done.clone());
+                            progress.stored(index, done);
                             index += 1;
                             if layout.start_of(index) <= last_byte {
                                 fill = Filling::new(Some(layout.len_of(index)));
@@ -1422,8 +1422,8 @@ impl Fill {
                 }
                 if let Some(rest) = slicer.finish() {
                     fill.finish(None);
-                    store_slice(index, rest);
-                    progress.stored(index);
+                    store_slice(index, rest.clone());
+                    progress.stored(index, rest);
                 }
                 Ok(())
             };

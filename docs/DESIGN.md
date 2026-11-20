@@ -579,9 +579,18 @@ A hit on a manifest is answered from the slices: the whole object, or a single r
 
 **Validators.** A `206` for missing slices is checked against the manifest: the same total length and the same strong entity tag. If either differs, the object changed at the origin. The old manifest and every old slice are purged before the new slices are stored, and a new manifest is stored after them. Every slice read is checked against the manifest's strong entity tag too, so a response never mixes bytes of two versions.
 
-**While filling.** Every client of a slice fill, the one that started it included, reads through the fill's `Progress`. Slices already stored come from the cache, and the slice still arriving is read from its own `fill::Filling`, which holds at most one slice. The flight is held open until the last slice is in, so a client that arrives during a fill of any size gets its first byte at once. If the origin fails partway, or sends more or fewer bytes than it declared, every reader fails; the slices already stored stay, but no manifest is written.
+**While filling.** Every client of a slice fill, the one that started it included, reads through the fill's `Progress`. Slices already stored come from the cache, and the slice still arriving is read from its own `fill::Filling`, which holds at most one slice. The flight is held open until the last slice is in, so a client that arrives during a fill of any size gets its first byte at once. A reader slower than the origin can fall behind the memory tier, which may already have evicted a slice whose disk write is still queued. So the fill also keeps its last 64 completed slices for such readers, and a reader that still misses waits for the disk queue and looks again. If the origin fails partway, or sends more or fewer bytes than it declared, every reader fails; the slices already stored stay, but no manifest is written.
 
 `crates/edgefront-cache/tests/slices.rs` runs it over real TCP: a 5 MiB object on a route that stores at most 1 MiB, in 256 KiB slices. All 20 slices are stored, and whole, ranged, suffix and conditional requests are answered from them without the origin. Removing one slice makes a range over it fetch `bytes=1310720-1572863` and nothing else. Changing the object at the origin makes the next missing slice's fetch replace the old slices, so no old byte is served. A client joining a fill paced over 1.6 s gets its first byte within 50 ms. A purge by URL removes the slices.
+
+`tests/e2e_large_objects.rs` runs it on the real binary, with the segment store and a 2 GiB object:
+
+1. A whole fetch, checked byte by byte, is cut off by SIGKILL after 600 MiB, once the first slices are on disk.
+2. After a restart, there is no manifest, since the fill never finished. A range at 100 MB fetches the object once and is answered as soon as its slice arrives.
+3. Ranges at the start, across a slice boundary, across 3 MiB at 1 GiB, at a third and at the last byte are then hits, with every byte checked and no further origin request.
+4. All 2,048 slices and the manifest reach the segment store.
+
+It takes about a minute in a debug build.
 
 ## Surviving a restart: the disk tier
 

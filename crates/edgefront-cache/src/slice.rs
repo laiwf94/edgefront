@@ -133,8 +133,15 @@ pub fn slice_headers(headers: &HeaderMap, key: &str) -> HeaderMap {
     out
 }
 
+/// How many completed slices a fill keeps for readers that lag behind it,
+/// so that one whose slice has already left the memory tier (and is still
+/// queued for disk) is not cut off.
+pub const RECENT: usize = 64;
+
 #[derive(Default)]
 struct State {
+    /// The last [`RECENT`] completed slices.
+    recent: std::collections::VecDeque<(u64, Bytes)>,
     /// Slices stored so far, from the first.
     stored: u64,
     /// The slice arriving now and its index.
@@ -184,10 +191,14 @@ impl Progress {
         self.bump();
     }
 
-    /// Slice `index` is complete and stored (or could not be).
-    pub fn stored(&self, index: u64) {
+    /// Slice `index`, `bytes`, is complete and stored (or could not be).
+    pub fn stored(&self, index: u64, bytes: Bytes) {
         let mut state = self.lock();
         state.stored = index + 1;
+        if state.recent.len() == RECENT {
+            state.recent.pop_front();
+        }
+        state.recent.push_back((index, bytes));
         if state.current.as_ref().is_some_and(|(i, _)| *i == index) {
             state.current = None;
         }
@@ -358,10 +369,35 @@ async fn feed(
                 }
             }
             None => {
-                let slice = cache
-                    .lookup(&slice_key(key, index), &HeaderMap::new())
-                    .await
-                    .ok_or("a slice of the object is no longer cached")?;
+                let recent = progress.and_then(|p| {
+                    p.lock()
+                        .recent
+                        .iter()
+                        .find(|(i, _)| *i == index)
+                        .map(|(_, b)| b.clone())
+                });
+                if let Some(bytes) = recent {
+                    if (bytes.len() as u64) < hi + 1 {
+                        return Err("a slice is shorter than its place".into());
+                    }
+                    if tx
+                        .send(Ok(bytes.slice(lo as usize..=hi as usize)))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                let slice_key = slice_key(key, index);
+                let mut slice = cache.lookup(&slice_key, &HeaderMap::new()).await;
+                if slice.is_none() {
+                    // Out of memory but perhaps still queued for disk: wait
+                    // for the queue, then look again.
+                    cache.flush().await;
+                    slice = cache.lookup(&slice_key, &HeaderMap::new()).await;
+                }
+                let slice = slice.ok_or("a slice of the object is no longer cached")?;
                 // Every slice must be of the same representation as the
                 // manifest: an object that changed at the origin never
                 // mixes old and new bytes.
