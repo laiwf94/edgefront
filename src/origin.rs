@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{Method, Request, Response, Uri};
@@ -19,7 +20,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use tokio::task::JoinHandle;
 
-use crate::respond::{Body, empty};
+use crate::respond::{Body, empty, full};
 
 pub type Client = HyperClient<HttpConnector, Body>;
 
@@ -145,8 +146,20 @@ pub struct Outbound {
     pub method: Method,
     pub path: PathAndQuery,
     pub headers: HeaderMap,
-    /// `None` for requests without a body, which may be retried elsewhere.
-    pub body: Option<Body>,
+    /// The body. A request without one, or with a [`OutBody::Replayable`]
+    /// one, may be sent again: on a fresh connection when a pooled one
+    /// turns out closed, and to the next origin.
+    pub body: OutBody,
+}
+
+/// What an outbound request carries.
+pub enum OutBody {
+    None,
+    /// A small body of an idempotent request, held whole so that it can be
+    /// sent again.
+    Replayable(Bytes),
+    /// A body streamed from the client: sent once.
+    Stream(Body),
 }
 
 pub struct OriginPool {
@@ -201,7 +214,7 @@ impl OriginPool {
         &self,
         mut out: Outbound,
     ) -> Result<(Response<Incoming>, Arc<Origin>), OriginError> {
-        let retryable = out.body.is_none();
+        let retryable = !matches!(out.body, OutBody::Stream(_));
         let mut last = OriginError::Connect;
         let mut candidates = self.candidates();
         let mut retried = false;
@@ -209,7 +222,15 @@ impl OriginPool {
         while i < candidates.len() {
             let origin = candidates[i].clone();
             i += 1;
-            let mut req = Request::new(out.body.take().unwrap_or_else(empty));
+            let body = match std::mem::replace(&mut out.body, OutBody::None) {
+                OutBody::None => empty(),
+                OutBody::Replayable(bytes) => {
+                    out.body = OutBody::Replayable(bytes.clone());
+                    full(bytes)
+                }
+                OutBody::Stream(body) => body,
+            };
+            let mut req = Request::new(body);
             *req.method_mut() = out.method.clone();
             *req.uri_mut() = Self::uri(&origin, &out.path);
             *req.headers_mut() = out.headers.clone();

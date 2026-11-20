@@ -35,7 +35,23 @@ use crate::ids::{REQUEST_ID, request_id};
 use crate::layer::{CACHE_STATUS, CacheLayer, LayerSettings, Outcome};
 use crate::metrics::Metrics;
 use crate::object::primary_key;
-use crate::origin::{OriginError, OriginPool, Outbound};
+use crate::origin::{OriginError, OriginPool, OutBody, Outbound};
+
+/// The largest request body (by Content-Length) held whole so that an
+/// idempotent request can be sent again.
+const REPLAY_BODY_MAX: u64 = 64 * 1024;
+
+/// Reads a request body of at most [`REPLAY_BODY_MAX`] bytes whole.
+async fn read_replayable(body: Body) -> Result<Bytes, ()> {
+    let mut body = Limited::new(body, REPLAY_BODY_MAX as usize);
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.map_err(|_| ())?.into_data() {
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(out))
+}
 use crate::purge::PurgeTarget;
 use crate::respond::{Body, BoxError, text};
 use crate::store::Cache;
@@ -257,11 +273,33 @@ impl Proxy {
             || declared.is_some_and(|n| n > 0)
             || parts.headers.contains_key(header::TRANSFER_ENCODING);
         let limit = usize::try_from(self.settings.max_request_body).unwrap_or(usize::MAX);
+        // A small body of an idempotent request is read whole first, so the
+        // request can be sent again when a pooled connection to the origin
+        // was closed under it (an origin's keep-alive timeout can end one
+        // just as it is reused). Others stream, and are sent once.
+        let replayable = declared.is_some_and(|n| n <= REPLAY_BODY_MAX)
+            && !parts.headers.contains_key(header::TRANSFER_ENCODING)
+            && parts.method.is_idempotent();
+        let body = if !has_body {
+            OutBody::None
+        } else if replayable {
+            match read_replayable(body).await {
+                Ok(bytes) => OutBody::Replayable(bytes),
+                Err(_) => {
+                    return (
+                        text(StatusCode::BAD_REQUEST, "request body incomplete\n"),
+                        Delivery::Generated("client-body"),
+                    );
+                }
+            }
+        } else {
+            OutBody::Stream(Limited::new(body, limit).boxed())
+        };
         let out = Outbound {
             method: parts.method,
             path: path_of(&parts.uri),
             headers: self.outbound_headers(parts.headers, id, client),
-            body: has_body.then(|| Limited::new(body, limit).boxed()),
+            body,
         };
         match self.pool.send(out).await {
             Ok((resp, _origin)) => {
