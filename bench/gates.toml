@@ -62,7 +62,12 @@ committed_models = []
 # (p = 0.020, passed), so the proof still needs a plant that costs a
 # measured 10% (docs/DESIGN.md). Ten a side from 20 Nov 2026 (the owner's
 # choice of "10+10 runs" in #87): p < 0.01 then needs 81 of 100 pairs, so
-# up to 19 may go the wrong way, at about a minute more per job.
+# up to 19 may go the wrong way, at about a minute more per job. Proof at
+# ten (bench runs 89-107, 20 Nov 2026): a plant spinning a fixed share of
+# the process's own CPU per hit (an eighth, then a twelfth) failed six of
+# six, measured 7.6 to 15.7% worse in requests per CPU second at p of
+# 0.0002 or less; six unchanged branches passed both metrics. The job took
+# 9.4 to 11.5 minutes, 10.5 on average (docs/DESIGN.md).
 
 # Response-time p99 at a fixed 2,000 requests per second.
 [metrics.p99_ms]
