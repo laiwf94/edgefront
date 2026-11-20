@@ -1,0 +1,24 @@
+name: size-probe
+# Throwaway (#257): the x86_64 release binary's size at the commits that
+# grew it, and a per-crate breakdown at main. Never merged.
+on:
+  push:
+    branches: ["size-probe-*"]
+permissions:
+  contents: read
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: [3069b36, 282d224, fc553a1, c22e00a, 31a19a9, 8a9963f, 82e9f07, 8a5e6aa, 7c3e335, 4864614, f2af81c]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git checkout ${{ matrix.commit }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --bin edgefront
+      - run: echo "${{ matrix.commit }} $(git rev-parse HEAD) $(stat -c %s target/release/edgefront)" | tee -a "$GITHUB_STEP_SUMMARY"

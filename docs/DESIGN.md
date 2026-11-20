@@ -579,9 +579,11 @@ Every response carries `Cache-Status` (RFC 9211), for example `edge-a; fwd=stale
 
 ## Which HTTP caching rules apply, and where cachet is stricter
 
-`policy.rs` implements the shared-cache parts of RFC 9111. A response is stored only if the method is GET, the status is one the cache understands, neither side sent `no-store` (unless `must-understand` applies), it is not `private`, `Vary` is not `*`, and it has explicit freshness, `public`, or a heuristically cacheable status. A request with `Authorization` is stored only with `public`, `s-maxage` or `must-revalidate` (section 3.5).
+`policy.rs` implements the shared-cache parts of RFC 9111. A response is stored only if the method is GET, the status is final (any code from 200 to 599 but 206, which is stored only as slices, and 304), neither side sent `no-store` (unless `must-understand` applies, which also needs a status the cache understands), it is not `private`, `Vary` is not `*`, and it has explicit freshness, `public`, or a heuristically cacheable status. A request with `Authorization` is stored only with `public`, `s-maxage` or `must-revalidate` (section 3.5).
 
-Freshness comes from `s-maxage`, then `max-age`, then `Expires` minus `Date`, then ten percent of the time since `Last-Modified`, capped at a day by default (sections 4.2.1 and 4.2.2). Age follows section 4.2.3 exactly, including the response delay correction, and time running backwards is clamped rather than underflowing. Cache-Control parsing accepts quoted arguments, takes the first of duplicated directives, clamps overflowing delta-seconds to 2^31 (section 1.2.2), and treats an unparseable `max-age` as zero, which makes the response stale rather than fresh forever.
+A 5xx stored this way never replaces a good stored copy, so `stale-if-error` can still answer with that copy. The directives come from `CDN-Cache-Control` (RFC 9213) when the response has it and it parses as a Structured Fields dictionary; then `Cache-Control` and `Expires` are ignored for this cache's own decisions and still passed on. A targeted field that does not parse is ignored as a whole, and a directive in it with the wrong type (a string `max-age`, say) on its own.
+
+Freshness comes from `s-maxage`, then `max-age`, then `Expires` minus `Date`, then ten percent of the time since `Last-Modified`, capped at a day by default (sections 4.2.1 and 4.2.2). Age follows section 4.2.3 exactly, including the response delay correction, and time running backwards is clamped rather than underflowing. Cache-Control parsing accepts quoted arguments, takes the first of duplicated directives, clamps overflowing delta-seconds to 2^32 - 1, the greatest integer it conveniently represents (section 1.2.2 asks for at least 2^31), so an `Age` just under 2^31 with `max-age=4294967295` is still fresh, and treats an unparseable `max-age` as zero, which makes the response stale rather than fresh forever.
 
 Some choices go beyond or narrow the RFC, on purpose:
 
@@ -595,7 +597,25 @@ Ranges are answered from the stored copy, after the preconditions and only when 
 
 HEAD misses pass through to the origin without being stored. HEAD hits are answered from the stored GET response.
 
+HTTP dates are accepted in all three formats with day names, month names and `GMT` in any case, and an rfc850-date's two-digit year is read as the nearest year with those digits no more than 50 years ahead (RFC 9110 section 5.6.7). An `Age` field line holding a list is read by its first member. `If-Modified-Since` on a hit compares with `Last-Modified`, or without it the stored `Date`, or without that the time the response arrived (RFC 9111 section 4.3.2).
+
 Unsafe methods that succeed invalidate the target URL and same-host `Location` and `Content-Location` URLs (section 4.4). Only the local node is invalidated; each node sees its own writes.
+
+### Conformance: the http-cache-tests suite
+
+`tests/conformance.rs` runs the open http-cache-tests suite (github.com/http-tests/cache-tests, the suite behind cache-tests.fyi) against the binary as a shared cache: the suite's server is the origin, the binary is in front of it with its defaults, and the suite's command line sends every test that is not browser-only through it, 475 in all. Each result is classified by the suite's own rules (`tests/conformance/classify.mjs` calls its `determineTestResult`), and the run must match `tests/conformance/allowlist.toml` exactly: a required or optimal test that does not pass must be listed with the result it gives and a reason, and a listed test that starts passing, or fails another way, fails the run until the list is updated. Behaviour checks (yes or no about an optional behaviour) are shown but not judged.
+
+The suite is third-party Node code, so it runs only in the `conformance` workflow on GitHub's runner, checked out at a pinned commit with its one runtime dependency (undici, at the version its package.json pins) and Node 26. The test is ignored in ordinary `cargo test` runs. The job writes the suite's raw results, the classification and a summary as the `http-cache-tests` artifact, and the summary into the job page.
+
+The first run, on Node 22, found 45 required or optimal tests not passing. Four of them were the interim-response tests timing out inside the suite's own client, even against its own server, which is why the job runs Node 26. These were bugs, now fixed and covered by unit tests:
+
+- `CDN-Cache-Control` was ignored (13 tests, 6 of them required).
+- An `Age` of `7200, 0` was read as invalid, so 0, and a stale response was served as fresh.
+- Final statuses outside a fixed list (299, 400, 500, 502 to 504, 599) were never stored, even with explicit freshness or `public`.
+- `max-age` was clamped to 2^31, so an `Age` just under 2^31 made a response with `max-age=4294967295` stale.
+- `Expires` with a day, month or `GMT` in the wrong case was refused, and an rfc850 `Expires` 44 or 48 years ahead was read as the 1970s.
+
+What is left is listed, by design or for later: responses with `Set-Cookie` are not stored (2 tests); a 206 is stored only as slices, never on its own (5); `Accept-Language` is not normalised for `Vary` (3); POST responses are not reused (1); a 1xx from the origin is not forwarded, because hyper's server cannot send one (4, one of them required; 103 Early Hints are week 7, #96); and `If-Modified-Since` without `Last-Modified` is judged against the stored `Date`, as RFC 9111 section 4.3.2 says, where the suite expects a 304 (1). That leaves 177 of 179 required tests passing and 137 of 151 optimal ones.
 
 ## Many clients, one origin request
 
