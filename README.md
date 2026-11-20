@@ -295,6 +295,14 @@ Week 7 adds the pieces a real policy needs, all in edgefront-limiter:
 
 `examples/penalty_box.sh` runs a boxed client, its ban, a connection quota, a ban through `edgefront limits` that survives a reload and expires on time, and overload mode. CI runs it.
 
+### Shadow mode and policy replay
+
+- **Shadow mode** (`shadow`): `mode = "shadow"` on an HTTP rule decides every request as it would if it enforced, counts the ones it would refuse and keeps sampled examples, but refuses none. `mode = "off"` skips the rule. The proxy watches its `--limits` file, and a change that only moves rules between `enforce`, `shadow` and `off` applies in place within a second, keeping every table and counter. Promotion is one word, and a key that spent its bucket while shadowed is refused the moment the rule enforces. `edgefront check` warns (`http-shadow-shadowed`) about a shadow rule that a stricter enforcing rule before it hides.
+- **Recording** (`record`): `[recording] dir = "rec"` writes every decision as a 32-byte record: the time, the rule, the cost, the outcome and a keyed 128-bit hash of the key, so a recording holds no key. Records go into a bounded ring flushed every second, then into rotating files.
+- **Replay** (`replay`, `edgefront ctl limits replay --recording rec --policy candidate.toml [--json report.json]`) runs a recording through candidate rules on a virtual clock. It reports, per rule, the refusals before and after and how many flipped, then every key whose outcome changed. An hour of traffic, 10,000,000 requests, replays in under 1.1 s; recording costs at most 68 ns a request ([docs/benchmarks/shadow-replay.md](docs/benchmarks/shadow-replay.md)).
+
+`examples/shadow_replay.sh` records traffic under a shadow limit, replays it against the same and a tighter policy, and promotes the limit. CI runs it.
+
 ### Migrating from pacer
 
 pacer is fully ported, and `legacy/pacer` is deleted (commit 54a2d6f). Its history stays reachable: `git log -- legacy/pacer` lists every commit that touched it in this repository, and `git log ff1d5f6^2` lists its own 36 commits from before the merge; `git checkout 54a2d6f^ -- legacy/pacer` brings the C back to build it. To move a pacerd deployment to `edgefront limits`:

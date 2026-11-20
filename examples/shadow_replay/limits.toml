@@ -1,0 +1,10 @@
+# The demo's limit, in shadow mode: five a minute per API key, counted
+# and recorded, never enforced, until the demo promotes it.
+[[http_limits]]
+name = "api"
+rate = "5/min burst 5"
+key = ["header:x-api-key"]
+mode = "shadow"
+
+[recording]
+dir = "rec"

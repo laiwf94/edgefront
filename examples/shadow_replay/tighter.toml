@@ -1,0 +1,5 @@
+# A candidate: two a minute per API key.
+[[http_limits]]
+name = "api"
+rate = "2/min burst 2"
+key = ["header:x-api-key"]

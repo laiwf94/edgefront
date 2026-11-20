@@ -18,6 +18,11 @@
 //! the added time is reported as the p99 with the limiter less the p99
 //! without, and as the p99 of the per-request differences of each pair.
 //!
+//! A third route has the same limit with every decision recorded
+//! ([`edgefront_limiter::record`], flushed to files every 65,536
+//! requests inside the timed loop), for week 9's recording cost: its
+//! time less the plain limiter's is what recording adds per request.
+//!
 //! Run with `cargo bench -p edgefront-limiter --bench http_layer`.
 
 use std::hint::black_box;
@@ -29,6 +34,7 @@ use edgefront_core::filter::{Delivery, RouteFilters, run};
 use edgefront_limiter::clock::MonotonicClock;
 use edgefront_limiter::config::http_limits::{HttpLimitsSection, build};
 use edgefront_limiter::http::HttpLimiter;
+use edgefront_limiter::record::{RecordConfig, Recorder};
 use http::{Request, Response};
 
 const REQUESTS: usize = 1_000_000;
@@ -70,16 +76,47 @@ fn main() {
         .unwrap(),
     );
     let limited: RouteFilters = limiter.route_filters(1).unwrap();
+    let dir = std::env::temp_dir().join(format!("http-layer-rec-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let rec = Arc::new(
+        Recorder::new(
+            RecordConfig {
+                dir: dir.clone(),
+                ring: 1 << 17,
+                file_bytes: 64 << 20,
+                files: 4,
+            },
+            vec!["api".into()],
+        )
+        .unwrap(),
+    );
+    let recording = Arc::new(
+        HttpLimiter::new(
+            build(&section.http_limits).unwrap(),
+            Arc::new(MonotonicClock::new()),
+        )
+        .unwrap()
+        .with_recorder(Arc::clone(&rec)),
+    );
+    let recorded: RouteFilters = recording.route_filters(1).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let (with, without, diffs) = rt.block_on(async {
+    let (with, without, diffs, rec_ns) = rt.block_on(async {
         let mut with = Vec::with_capacity(REQUESTS);
         let mut without = Vec::with_capacity(REQUESTS);
         let mut diffs = Vec::with_capacity(REQUESTS);
+        let mut rec_ns = Vec::with_capacity(REQUESTS);
         for i in 0..WARMUP + REQUESTS {
-            let (a, b) = (request(i), request(i));
+            let (a, b, c) = (request(i), request(i), request(i));
+            let t4 = Instant::now();
+            let r = run(recorded.get(0), 0, c, upstream).await;
+            if i % 65_536 == 0 {
+                rec.flush().unwrap();
+            }
+            let t5 = Instant::now();
+            black_box(r);
             let t0 = Instant::now();
             let r = run(limited.get(0), 0, a, upstream).await;
             let t1 = Instant::now();
@@ -94,10 +131,12 @@ fn main() {
                 with.push(w);
                 without.push(o);
                 diffs.push(w.saturating_sub(o));
+                rec_ns.push((t5 - t4).as_nanos() as u64);
             }
         }
-        (with, without, diffs)
+        (with, without, diffs, rec_ns)
     });
+    let _ = std::fs::remove_dir_all(&dir);
     let mut with = with;
     let mut without = without;
     let mut diffs = diffs;
@@ -127,5 +166,18 @@ fn main() {
     println!(
         "added at p99: {} ns (p99 with less p99 without)",
         pct(&with, 0.99).saturating_sub(pct(&without, 0.99))
+    );
+    let mean = |v: &[u64]| v.iter().sum::<u64>() as f64 / v.len() as f64;
+    let mut rec_sorted = rec_ns.clone();
+    rec_sorted.sort_unstable();
+    println!(
+        "recording: mean {:.0} ns per request against {:.0} without it, so it adds {:.0} ns; p99 {} against {}; {} recorded, {} dropped",
+        mean(&rec_ns),
+        mean(&with),
+        mean(&rec_ns) - mean(&with),
+        pct(&rec_sorted, 0.99),
+        pct(&with, 0.99),
+        rec.recorded(),
+        rec.dropped()
     );
 }
