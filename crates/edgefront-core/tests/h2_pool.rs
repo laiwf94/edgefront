@@ -26,6 +26,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
+/// The default limits with a connect timeout that a test under
+/// ThreadSanitizer cannot hit: these tests are about streams, not
+/// timeouts.
+fn pool_limits() -> PoolLimits {
+    PoolLimits {
+        connect_timeout: Duration::from_secs(30),
+        ..PoolLimits::default()
+    }
+}
+
 /// Counts connections (by peer) and the most requests in flight at once,
 /// holding each request for `hold`.
 struct Counting {
@@ -123,7 +133,7 @@ async fn text(resp: Response<edgefront_core::h2::PoolBody>) -> String {
 async fn one_connection_carries_100_concurrent_streams() {
     let handler = Counting::new(Duration::from_millis(200));
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 1000).await;
-    let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
+    let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     let mut tasks = Vec::new();
     for i in 0..100 {
         let pool = pool.clone();
@@ -147,7 +157,7 @@ async fn ten_thousand_streams_use_under_four_connections() {
     // 300 that three connections of 100 streams hold before overflowing.
     let handler = Counting::gated(Duration::from_millis(1), 1000);
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 1000).await;
-    let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
+    let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     let mut tasks = Vec::new();
     for i in 0..10_000 {
         let pool = pool.clone();
@@ -182,7 +192,7 @@ async fn the_stream_cap_opens_more_connections_up_to_the_limit() {
     let limits = PoolLimits {
         max_connections: 3,
         max_streams_per_connection: 10,
-        ..PoolLimits::default()
+        ..pool_limits()
     };
     let pool: Pool<Full<Bytes>> = Pool::new(limits, Settings::default());
     let mut tasks = Vec::new();
@@ -209,7 +219,7 @@ async fn idle_connections_are_reaped() {
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 100).await;
     let limits = PoolLimits {
         idle_timeout: Duration::from_millis(200),
-        ..PoolLimits::default()
+        ..pool_limits()
     };
     let pool: Pool<Full<Bytes>> = Pool::new(limits, Settings::default());
     let resp = pool.send(get(addr, "/a")).await.unwrap();
@@ -299,7 +309,7 @@ async fn raw_conn(mut tcp: TcpStream, goaway_first: bool) {
 #[tokio::test]
 async fn goaway_mid_request_refuses_the_unprocessed_stream_and_it_is_sent_again() {
     let (addr, conns) = goaway_origin().await;
-    let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
+    let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     let first = {
         let pool = pool.clone();
         tokio::spawn(async move { pool.send(get(addr, "/first")).await.map(|r| r.status()) })
@@ -323,7 +333,7 @@ async fn goaway_mid_request_refuses_the_unprocessed_stream_and_it_is_sent_again(
 #[tokio::test]
 async fn a_refused_stream_is_reported_as_safe_to_resend() {
     let (addr, _conns) = goaway_origin().await;
-    let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
+    let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     let first = {
         let pool = pool.clone();
         tokio::spawn(async move { pool.send(get(addr, "/first")).await.map(|r| r.status()) })
@@ -339,7 +349,7 @@ async fn a_graceful_goaway_lets_open_streams_finish_and_new_ones_move() {
     // The edge listener's own shutdown: GOAWAY, open streams finish.
     let handler = Counting::new(Duration::from_millis(300));
     let (addr, stop) = h2c_server(Arc::clone(&handler), 100).await;
-    let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
+    let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     let open = {
         let pool = pool.clone();
         tokio::spawn(async move {
@@ -387,7 +397,7 @@ async fn tls_upstreams_negotiate_h2_over_alpn() {
         key_file: None,
     })
     .unwrap();
-    let pool: Pool<Full<Bytes>> = Pool::with_tls(PoolLimits::default(), Settings::default(), tls);
+    let pool: Pool<Full<Bytes>> = Pool::with_tls(pool_limits(), Settings::default(), tls);
     for i in 0..5 {
         let resp = pool.send(get(addr, &format!("/{i}"))).await.unwrap();
         assert_eq!(resp.version(), Version::HTTP_2);
@@ -418,7 +428,7 @@ async fn unreachable_origins_fail_to_connect() {
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
     drop(socket);
-    let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
+    let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     assert_eq!(
         pool.send(get(addr, "/")).await.map(|r| r.status()),
         Err(PoolError::Connect)
@@ -456,8 +466,7 @@ async fn unreachable_origins_fail_to_connect() {
         key_file: None,
     })
     .unwrap();
-    let auto: Pool<Full<Bytes>> =
-        Pool::with_tls_auto(PoolLimits::default(), Settings::default(), tls);
+    let auto: Pool<Full<Bytes>> = Pool::with_tls_auto(pool_limits(), Settings::default(), tls);
     let r = auto.send(get(h1s, "/")).await.map(|r| r.status());
     assert_eq!(r, Err(PoolError::NotHttp2));
 }

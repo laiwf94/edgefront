@@ -23,6 +23,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant as TokioInstant;
 
+/// The default limits with a connect timeout that a test under
+/// ThreadSanitizer cannot hit: these tests are about streams, not
+/// timeouts.
+fn pool_limits() -> PoolLimits {
+    PoolLimits {
+        connect_timeout: Duration::from_secs(30),
+        ..PoolLimits::default()
+    }
+}
+
 const RATE: u64 = 25_000_000;
 const ONE_WAY: Duration = Duration::from_millis(50);
 const RTT: Duration = Duration::from_millis(100);
@@ -197,7 +207,7 @@ async fn adaptive_windows_fill_a_long_fat_link() {
     let link_speed = tcp_speed(SIZE).await;
     let via = link(origin().await).await;
     let adaptive = Pool::new(
-        PoolLimits::default(),
+        pool_limits(),
         Settings {
             adaptive_window: true,
             ..Settings::default()
@@ -222,7 +232,7 @@ async fn fixed_windows_cap_a_long_fat_link() {
     let via = link(origin().await).await;
     // The protocol's default window: at most 655 KB/s over 100 ms.
     let fixed = Pool::new(
-        PoolLimits::default(),
+        pool_limits(),
         Settings {
             initial_stream_window: 65_535,
             initial_connection_window: 65_535,
