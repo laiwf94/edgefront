@@ -12,11 +12,13 @@ pub mod client_addr;
 pub mod clock;
 pub mod config;
 pub mod conn;
+pub mod descriptor;
 pub mod gcra;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod key;
 pub mod lint;
+pub mod multi;
 pub mod policy;
 pub mod rate;
 pub mod shape;
