@@ -9,8 +9,8 @@ use std::time::Duration;
 use super::raw::{self, RawCluster, RawConfig, RawHttp2, RawTls};
 use super::{
     Acme, AcmeChallenge, Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config,
-    ConfigError, Discovery, DiscoverySource, Endpoint, FieldError, HealthCheck, Http2, IpPrefix,
-    KubernetesSource, Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion,
+    ConfigError, DeltaSource, Discovery, DiscoverySource, Endpoint, FieldError, HealthCheck, Http2,
+    IpPrefix, KubernetesSource, Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion,
     UpstreamProtocol, UpstreamTls, defaults, go, limits,
 };
 
@@ -670,12 +670,16 @@ impl Validator {
                 !rs.srv.is_empty(),
                 !rs.file.is_empty(),
                 rs.kubernetes.is_some(),
+                rs.delta.is_some(),
             ]
             .iter()
             .filter(|s| **s)
             .count();
             if set != 1 {
-                self.add(at, "must name exactly one of dns, srv, file or kubernetes");
+                self.add(
+                    at,
+                    "must name exactly one of dns, srv, file, kubernetes or delta",
+                );
                 continue;
             }
             let source = if !rs.dns.is_empty() {
@@ -696,6 +700,29 @@ impl Validator {
                 DiscoverySource::Srv(rs.srv.clone())
             } else if !rs.file.is_empty() {
                 DiscoverySource::File(rs.file.clone())
+            } else if let Some(d) = &rs.delta {
+                let https = d.url.starts_with("https://");
+                if let Err(e) = check_feed_url(&d.url) {
+                    self.add(format!("{at}.delta.url"), e);
+                }
+                if https && d.ca_file.is_empty() {
+                    self.add(
+                        format!("{at}.delta.ca_file"),
+                        "is required with an https:// url",
+                    );
+                }
+                if !https && !d.token_file.is_empty() {
+                    self.add(
+                        format!("{at}.delta.url"),
+                        "must be https:// to send a token",
+                    );
+                }
+                let opt = |s: &String| (!s.is_empty()).then(|| s.clone());
+                DiscoverySource::Delta(DeltaSource {
+                    url: d.url.clone(),
+                    ca_file: opt(&d.ca_file),
+                    token_file: opt(&d.token_file),
+                })
             } else {
                 let k = rs.kubernetes.as_ref().expect("counted above");
                 for (field, value) in [("namespace", &k.namespace), ("service", &k.service)] {
@@ -1249,6 +1276,25 @@ fn check_server_url(u: &str) -> Result<(), String> {
     let rest = rest.trim_end_matches('/');
     if rest.contains(['/', '@', '?', '#']) || check_endpoint_address(rest).is_err() {
         return Err(format!("{} must be scheme://host:port", go::quote(u)));
+    }
+    Ok(())
+}
+
+/// A delta feed's URL: `http://` or `https://`, `host:port`, and a path.
+fn check_feed_url(u: &str) -> Result<(), String> {
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .ok_or_else(|| format!("{} must be an http:// or https:// URL", go::quote(u)))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') || check_endpoint_address(authority).is_err() {
+        return Err(format!("{} must name host:port and no user", go::quote(u)));
+    }
+    if u.len() > 2048
+        || u.chars()
+            .any(|c| c.is_ascii_control() || c == ' ' || c == '#')
+    {
+        return Err(format!("{} is not a valid URL", go::quote(u)));
     }
     Ok(())
 }

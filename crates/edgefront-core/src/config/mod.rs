@@ -449,6 +449,21 @@ pub enum DiscoverySource {
     File(String),
     /// A Kubernetes Service's EndpointSlices.
     Kubernetes(KubernetesSource),
+    /// A delta feed streamed over HTTP/2.
+    Delta(DeltaSource),
+}
+
+/// A delta feed (see `edgefront_proxy::discovery::delta`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeltaSource {
+    /// `http://host:port/path` or `https://host:port/path`.
+    pub url: String,
+    /// The CA the feed's certificate must chain to; required for https.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    /// A bearer token file, read for each connection; https only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<String>,
 }
 
 /// The EndpointSlices of one Kubernetes Service.

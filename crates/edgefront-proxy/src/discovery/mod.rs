@@ -32,6 +32,7 @@
 //!    [`UpdateKind::Remove`] changes one source's set; one for a source
 //!    that has not yet sent a full set starts it from empty.
 
+pub mod delta;
 pub mod dns;
 pub mod file;
 pub mod k8s;
@@ -88,6 +89,12 @@ pub fn from_config(
             Box::new(dns::DnsSource::new(query).servers(dns_servers.to_vec()))
         }
         Config::File(path) => Box::new(file::FileSource::new(path)),
+        Config::Delta(d) => {
+            let mut source = delta::DeltaSource::new(&d.url);
+            source.ca_file = d.ca_file.as_ref().map(std::path::PathBuf::from);
+            source.token_file = d.token_file.as_ref().map(std::path::PathBuf::from);
+            Box::new(source)
+        }
         Config::Kubernetes(k) => {
             let source = k8s::KubernetesSource::new(&k.namespace, &k.service, k.port.as_deref());
             Box::new(match &k.api_server {

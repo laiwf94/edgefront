@@ -328,6 +328,13 @@ raw_struct!(RawDiscoverySource, "an object" {
     srv: String,
     file: String,
     kubernetes: Option<RawKubernetes>,
+    delta: Option<RawDelta>,
+});
+
+raw_struct!(RawDelta, "an object" {
+    url: String,
+    ca_file: String,
+    token_file: String,
 });
 
 raw_struct!(RawKubernetes, "an object" {

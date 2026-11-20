@@ -1280,7 +1280,7 @@ fn parses_http2() {
 
 #[test]
 fn parses_discovery() {
-    use edgefront_core::config::{Discovery, DiscoverySource, KubernetesSource};
+    use edgefront_core::config::{DeltaSource, Discovery, DiscoverySource, KubernetesSource};
     let with = |cluster: &str| {
         format!(
             r#"{{"listen":":80","routes":[{{"cluster":"a"}}],"clusters":[{{"name":"a"{cluster}}}]}}"#
@@ -1292,7 +1292,9 @@ fn parses_discovery() {
             {"file":"/etc/edgefront/a.json"},
             {"kubernetes":{"namespace":"prod","service":"api","port":"http"}},
             {"kubernetes":{"namespace":"prod","service":"web","api_server":"https://10.0.0.1:6443",
-              "ca_file":"/etc/k8s/ca.crt","token_file":"/etc/k8s/token"}}],
+              "ca_file":"/etc/k8s/ca.crt","token_file":"/etc/k8s/token"}},
+            {"delta":{"url":"http://feed.internal:9000/v1/clusters/a"}},
+            {"delta":{"url":"https://feed.internal:9443/v1","ca_file":"/ca.pem","token_file":"/t"}}],
             "dns_servers":["10.0.0.53:53","[fd00::53]:5353"]}"#,
     ))
     .unwrap();
@@ -1325,6 +1327,16 @@ fn parses_discovery() {
                     cert_file: None,
                     key_file: None,
                 }),
+                DiscoverySource::Delta(DeltaSource {
+                    url: "http://feed.internal:9000/v1/clusters/a".into(),
+                    ca_file: None,
+                    token_file: None,
+                }),
+                DiscoverySource::Delta(DeltaSource {
+                    url: "https://feed.internal:9443/v1".into(),
+                    ca_file: Some("/ca.pem".into()),
+                    token_file: Some("/t".into()),
+                }),
             ],
             dns_servers: vec![
                 "10.0.0.53:53".parse().unwrap(),
@@ -1353,7 +1365,7 @@ fn parses_discovery() {
         ),
         (
             r#","discovery":{"sources":[{}]}"#,
-            "clusters[0].discovery.sources[0]: must name exactly one of dns, srv, file or kubernetes",
+            "clusters[0].discovery.sources[0]: must name exactly one of dns, srv, file, kubernetes or delta",
         ),
         (
             r#","discovery":{"sources":[{"dns":"a:1","file":"/x"}]}"#,
@@ -1402,6 +1414,26 @@ fn parses_discovery() {
         (
             r#","discovery":{"sources":[{"kubernetes":{"namespace":"a","service":"b","api_server":"https://k:6443","ca_file":"/c","cert_file":"/x"}}]}"#,
             "cert_file and key_file go together",
+        ),
+        (
+            r#","discovery":{"sources":[{"delta":{"url":"ftp://feed:1/"}}]}"#,
+            "clusters[0].discovery.sources[0].delta.url: \"ftp://feed:1/\" must be an http:// or https:// URL",
+        ),
+        (
+            r#","discovery":{"sources":[{"delta":{"url":"http://user@feed:1/"}}]}"#,
+            "must name host:port and no user",
+        ),
+        (
+            r#","discovery":{"sources":[{"delta":{"url":"http://feed/"}}]}"#,
+            "must name host:port and no user",
+        ),
+        (
+            r#","discovery":{"sources":[{"delta":{"url":"https://feed:1/"}}]}"#,
+            "clusters[0].discovery.sources[0].delta.ca_file: is required with an https:// url",
+        ),
+        (
+            r#","discovery":{"sources":[{"delta":{"url":"http://feed:1/","token_file":"/t"}}]}"#,
+            "clusters[0].discovery.sources[0].delta.url: must be https:// to send a token",
         ),
         (
             r#","discovery":{"sources":[{"file":"/x"},{"file":"/x"}]}"#,

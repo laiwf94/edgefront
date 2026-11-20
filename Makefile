@@ -61,7 +61,7 @@ TSAN_CRATES := cachet edgefront-cache edgefront-core edgefront-limiter edgefront
 TSAN_TESTS_cachet := proxy revalidation failure cluster
 TSAN_TESTS_edgefront-core := listener admin client l4 tls ocsp client_auth h2 h2_pool
 TSAN_TESTS_edgefront-cache := layer proxy_layer
-TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier filters retry resilience operate lifecycle upstream_tls protocol grpc discovery_file discovery_dns discovery_proxy discovery_k8s
+TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier filters retry resilience operate lifecycle upstream_tls protocol grpc discovery_file discovery_dns discovery_proxy discovery_k8s discovery_delta
 
 define tsan_crate
 .PHONY: tsan-$(1)
