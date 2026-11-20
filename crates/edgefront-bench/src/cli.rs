@@ -12,9 +12,10 @@
 //!     --machine TEXT      how the report names the machine
 //!     --harness-image IMG default edgefront-bench/harness:local
 //!     --rebuild           rebuild the images built from this repository
-//! edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE]
+//! edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE] [--limiter DIR]
 //!     Renders every result under the DIRs into one Markdown report, repeated
-//!     runs as their medians.
+//!     runs as their medians. --limiter DIR adds the limiter track's
+//!     C-against-Rust section from DIR/pacer-port-*.json.
 //! edgefront-bench gate --config bench/gates.toml --results DIR --machine CPU
 //!                      [--binary FILE] [--baseline FILE] [--verdict FILE] [--summary FILE]
 //!     Judges repeated gate runs against the committed baseline for the
@@ -60,7 +61,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench gate --config bench/gates.toml --results DIR --machine CPU [--baseline FILE] [--binary FILE] [--verdict FILE] [--summary FILE]
        edgefront-bench gate --config bench/gates.toml --machine CPU --plan
        edgefront-bench baseline --config bench/gates.toml --results DIR... --machine CPU --commit SHA [--target NAME] [--out FILE]
-       edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE]
+       edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE] [--limiter DIR]
        edgefront-bench validate FILE...
        edgefront-bench origin [--listen ADDR]
        edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
@@ -385,7 +386,7 @@ pub fn summary(result: &BenchResult) -> String {
 }
 
 fn render_report(args: &[String]) -> Result<(), Failure> {
-    let flags = Flags::parse(args, &["results", "out", "title", "intro"], &[])?;
+    let flags = Flags::parse(args, &["results", "out", "title", "intro", "limiter"], &[])?;
     flags.no_positional()?;
     let dirs = flags.all("results");
     if dirs.is_empty() {
@@ -404,7 +405,11 @@ fn render_report(args: &[String]) -> Result<(), Failure> {
         None => String::new(),
     };
     let title = flags.one("title")?.unwrap_or("Benchmark report");
-    std::fs::write(out, report::render(title, &intro, &results))
+    let sections = match flags.one("limiter")? {
+        Some(dir) => report::limiter_section(Path::new(dir)).map_err(failed)?,
+        None => String::new(),
+    };
+    std::fs::write(out, report::render_with(title, &intro, &results, &sections))
         .map_err(|e| failed(format!("{out}: {e}")))?;
     Ok(())
 }
@@ -807,6 +812,31 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, Failure::Failed(_)));
+        // The limiter track's section, from the committed results.
+        let data = env!("CARGO_MANIFEST_DIR").to_owned() + "/../../docs/benchmarks/data";
+        run(&strings(&[
+            "report",
+            "--results",
+            &dir.join("results").display().to_string(),
+            "--out",
+            &out.display().to_string(),
+            "--limiter",
+            &data,
+        ]))
+        .unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("## Limiter") && text.contains("| shared-gcra | Rust / C |"));
+        let err = run(&strings(&[
+            "report",
+            "--results",
+            &dir.join("results").display().to_string(),
+            "--out",
+            "x",
+            "--limiter",
+            "/no/such",
+        ]))
+        .unwrap_err();
+        assert!(matches!(&err, Failure::Failed(m) if m.contains("pacer-port-decisions.json")));
         assert!(summary(&result).contains("varnish: 1,000 req/s"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

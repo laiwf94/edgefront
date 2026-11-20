@@ -73,7 +73,7 @@ impl Target {
 }
 
 /// One target's numbers.
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Point {
     pub target: String,
     pub bulk_mib_s: f64,

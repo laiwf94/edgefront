@@ -14,6 +14,12 @@
 //! [`render`] turns a set of results into `docs/benchmarks/<run>.md`: one
 //! section per track, one table per scenario, a row per target, with the
 //! machine and the command that reproduces it.
+//!
+//! The limiter track's C-against-Rust results are not load runs: they are
+//! decision rates, round trips through an L4 proxy and resident bytes per
+//! client, written by `edgefront-bench limiter`, `l4` and `memory` in their
+//! own JSON. [`limiter_section`] renders them as the report's limiter
+//! section with those commands' own tables.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -509,6 +515,13 @@ pub fn merge_repeats(results: &[BenchResult]) -> Vec<BenchResult> {
 /// limiter, then any other, in that order), a table per scenario in the
 /// order the scenarios first appear, a row per target.
 pub fn render(title: &str, intro: &str, results: &[BenchResult]) -> String {
+    render_with(title, intro, results, "")
+}
+
+/// [`render`], with `sections` (whole Markdown sections, such as
+/// [`limiter_section`]'s) after the result tables and before the notes on
+/// how they were measured.
+pub fn render_with(title: &str, intro: &str, results: &[BenchResult], sections: &str) -> String {
     let merged = merge_repeats(results);
     let results = merged.as_slice();
     let mut out = String::new();
@@ -646,10 +659,110 @@ pub fn render(title: &str, intro: &str, results: &[BenchResult]) -> String {
             );
         }
     }
+    out.push_str(sections);
     out.push_str(
         "Latency is response time from each request's scheduled send time, so queueing behind a stall counts (no coordinated omission). Hit ratio is the share of measured requests the origin never saw. Peak RSS is the highest resident set (anon plus mapped file pages) summed over the target's containers, sampled every 100 ms; peak memory is the cgroup's `memory.peak`, page cache and tmpfs included. CPU is the target's CPU time over the measured phase. Image is the uncompressed size of the target's images.\n",
     );
     out
+}
+
+/// The files [`limiter_section`] reads, as the limiter track wrote them.
+pub const LIMITER_FILES: [&str; 3] = [
+    "pacer-port-decisions.json",
+    "pacer-port-l4.json",
+    "pacer-port-memory.json",
+];
+
+/// The last commit with legacy/pacer, which the C side of
+/// [`limiter_section`]'s results needs.
+pub const LIMITER_C_COMMIT: &str = "2965963a1d200e09c3dac5da49510087e660642e";
+
+/// `pacer-port-l4.json`: whole sessions of `edgefront-bench l4`, each one
+/// point per target (the median of its runs).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct L4Sessions {
+    scenario: String,
+    runs_per_session: usize,
+    sessions: Vec<Vec<crate::l4proxy::Point>>,
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The limiter section from the C-against-Rust results in `dir`
+/// ([`LIMITER_FILES`]): decisions per second from `edgefront-bench
+/// limiter`, the L4 proxy from `edgefront-bench l4` as the median of its
+/// sessions, and memory per tracked client from `edgefront-bench memory`,
+/// each with the command that reproduces it.
+pub fn limiter_section(dir: &Path) -> Result<String, String> {
+    let [decisions_file, l4_file, memory_file] = LIMITER_FILES.map(|f| dir.join(f));
+    let decisions: crate::limiter::Report = read_json(&decisions_file)?;
+    let l4: L4Sessions = read_json(&l4_file)?;
+    let memory: Vec<crate::memory::Measure> = read_json(&memory_file)?;
+    let Some(first) = l4.sessions.first() else {
+        return Err(format!("{}: no sessions", l4_file.display()));
+    };
+    let mut points = Vec::new();
+    for (i, p) in first.iter().enumerate() {
+        let same: Vec<&crate::l4proxy::Point> = l4
+            .sessions
+            .iter()
+            .map(|s| {
+                s.get(i).filter(|q| q.target == p.target).ok_or_else(|| {
+                    format!(
+                        "{}: every session must list the same targets in the same order",
+                        l4_file.display()
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let med = |f: &dyn Fn(&crate::l4proxy::Point) -> f64| {
+            crate::gate::median(&same.iter().map(|q| f(q)).collect::<Vec<_>>())
+        };
+        points.push(crate::l4proxy::Point {
+            target: p.target.clone(),
+            bulk_mib_s: med(&|q| q.bulk_mib_s),
+            p50_us: med(&|q| q.p50_us),
+            p99_us: med(&|q| q.p99_us),
+            trips_per_s: med(&|q| q.trips_per_s),
+            cpu_us_per_trip: same
+                .iter()
+                .map(|q| q.cpu_us_per_trip)
+                .collect::<Option<Vec<f64>>>()
+                .map(|v| crate::gate::median(&v)),
+        });
+    }
+    let mut out = String::from("## Limiter\n\n");
+    out.push_str(
+        "libpacer and pacerd (C) against edgefront-limiter and `edgefront limits` (Rust), from the limiter track's week 4 runs (#88). They are not load runs against a target, so they have tables of their own rather than rows like the ones above; [pacer-port.md](pacer-port.md) gives the machine, the method and what each number means.\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "### {}\n\nMillions of decisions per second.\n\n{}",
+        decisions.scenario,
+        decisions.markdown()
+    );
+    let _ = writeln!(
+        out,
+        "### {}\n\nThe median of {} sessions of {} runs each.\n\n{}",
+        l4.scenario,
+        l4.sessions.len(),
+        l4.runs_per_session,
+        crate::l4proxy::markdown(&points)
+    );
+    let _ = writeln!(
+        out,
+        "### Memory per tracked client\n\n{}",
+        crate::memory::markdown(&memory)
+    );
+    let _ = writeln!(
+        out,
+        "Reproduce with `scripts/bench-pacer-port.sh`, which runs all three. The C side needs legacy/pacer, so run it from {LIMITER_C_COMMIT}, the commit before legacy/pacer was deleted; the Rust side runs from any commit.\n"
+    );
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -872,5 +985,109 @@ pub(crate) mod tests {
         h.record(2_000_000);
         let l = Latency::of(&h);
         assert!((l.p99_ms - 2.0).abs() < 0.01 && (l.mean_ms - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_limiter_section_renders_the_limiter_tracks_results() {
+        let dir = std::env::temp_dir().join(format!("limiter-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pacer-port-decisions.json"),
+            r#"{"scenario": "limiter-decisions", "threads": [1, 2], "series": [
+                {"implementation": "rust", "rows": [["shared-gcra", [4.0, 2.0]]]},
+                {"implementation": "c", "rows": [["shared-gcra", [2.0, 1.0]]]}]}"#,
+        )
+        .unwrap();
+        let point = |t: &str, p99: f64, cpu: &str| {
+            format!(
+                r#"{{"target": "{t}", "bulk_mib_s": 100.0, "p50_us": 10.0, "p99_us": {p99}, "trips_per_s": 1000.0, "cpu_us_per_trip": {cpu}}}"#
+            )
+        };
+        let session = |p99: f64| {
+            format!(
+                "[{}, {}]",
+                point("pacerd", p99, "2.0"),
+                point("edgefront", p99 + 1.0, "null")
+            )
+        };
+        std::fs::write(
+            dir.join("pacer-port-l4.json"),
+            format!(
+                r#"{{"scenario": "l4-proxy", "runs_per_session": 5, "sessions": [{}, {}, {}]}}"#,
+                session(30.0),
+                session(10.0),
+                session(20.0)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pacer-port-memory.json"),
+            r#"[{"implementation": "libpacer (C)", "keys": 1024, "rss_start_kib": 0, "rss_made_kib": 1, "rss_filled_kib": 128}]"#,
+        )
+        .unwrap();
+        let text = limiter_section(&dir).unwrap();
+        assert!(text.starts_with("## Limiter\n\n"), "{text}");
+        assert!(text.contains("### limiter-decisions\n"), "{text}");
+        assert!(
+            text.contains("| shared-gcra | Rust / C | 2.00 | 2.00 |\n"),
+            "{text}"
+        );
+        // The median session's p99, and no CPU figure where a session has none.
+        assert!(
+            text.contains("The median of 3 sessions of 5 runs each."),
+            "{text}"
+        );
+        assert!(
+            text.contains("| 64-byte round trip, p99 (µs) | 20.0 | 21.0 |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| proxy CPU per round trip (µs) | 2.0 | - |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| libpacer (C) | 1024 | 0 | 1 | 128 | 128.0 |"),
+            "{text}"
+        );
+        assert!(text.contains(LIMITER_C_COMMIT));
+        let page = render_with("T", "", &[sample("varnish", "cache", "cache-hit")], &text);
+        let (cache, limiter) = (
+            page.find("## Cache").unwrap(),
+            page.find("## Limiter").unwrap(),
+        );
+        assert!(cache < limiter && limiter < page.find("Latency is response time").unwrap());
+
+        // Sessions that disagree on their targets, a missing file and a
+        // file that is not the format are refused, naming the file.
+        std::fs::write(
+            dir.join("pacer-port-l4.json"),
+            format!(
+                r#"{{"scenario": "l4-proxy", "runs_per_session": 5, "sessions": [{}, [{}]]}}"#,
+                session(1.0),
+                point("edgefront", 1.0, "null")
+            ),
+        )
+        .unwrap();
+        let err = limiter_section(&dir).unwrap_err();
+        assert!(err.contains("same targets"), "{err}");
+        std::fs::write(
+            dir.join("pacer-port-l4.json"),
+            r#"{"scenario": "l4-proxy", "runs_per_session": 5, "sessions": []}"#,
+        )
+        .unwrap();
+        assert!(limiter_section(&dir).unwrap_err().contains("no sessions"));
+        std::fs::write(dir.join("pacer-port-memory.json"), "{}").unwrap();
+        assert!(
+            limiter_section(&dir)
+                .unwrap_err()
+                .contains("pacer-port-memory.json")
+        );
+        std::fs::remove_file(dir.join("pacer-port-decisions.json")).unwrap();
+        assert!(
+            limiter_section(&dir)
+                .unwrap_err()
+                .contains("pacer-port-decisions.json")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

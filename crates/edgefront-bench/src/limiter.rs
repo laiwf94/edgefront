@@ -85,7 +85,7 @@ impl Scenario {
 
 /// Decisions per second, in millions, for each workload and thread count,
 /// for one implementation.
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Series {
     /// `implementation` is `rust` or `c`.
     pub implementation: String,
@@ -95,7 +95,7 @@ pub struct Series {
 }
 
 /// Both implementations' series for one scenario.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Report {
     pub scenario: String,
     pub threads: Vec<usize>,

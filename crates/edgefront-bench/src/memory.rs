@@ -19,10 +19,10 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One implementation's figures.
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Measure {
     pub implementation: String,
     /// Clients the table held once filled.

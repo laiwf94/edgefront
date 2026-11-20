@@ -11,7 +11,7 @@ What the numbers say:
 - **Hit ratios.** Every target is below the 50% target in `miss-heavy` (40.6 to 47.5%), because once-only objects compete for the same space. In `large-objects`, edgefront reached 86.7% against NGINX's 93.8%.
 - **Varnish** failed 53 requests in `web-mix` (out of 600,000) and peaked at 4.4 GiB.
 
-The proxy section is the proxy track's week 4 Go-against-Rust runs (#86): steer and `edgefront proxy`, over HTTP/1.1 and TLS, three repetitions each, read from [data/steer-go-vs-rust/](data/steer-go-vs-rust/). Each row is the median of the three (the `runs` column), errors summed; [steer-go-vs-rust.md](steer-go-vs-rust.md) has the full write-up. The limiter track's C-against-Rust results (#88) are in [pacer-port.md](pacer-port.md); they are decision rates and per-client memory in that track's own JSON format, not the harness's result schema, so they are not tabulated here.
+The proxy section is the proxy track's week 4 Go-against-Rust runs (#86): steer and `edgefront proxy`, over HTTP/1.1 and TLS, three repetitions each, read from [data/steer-go-vs-rust/](data/steer-go-vs-rust/). Each row is the median of the three (the `runs` column), errors summed; [steer-go-vs-rust.md](steer-go-vs-rust.md) has the full write-up. The limiter section is the limiter track's week 4 C-against-Rust runs (#88): libpacer and pacerd against edgefront-limiter and `edgefront limits`, read from `data/pacer-port-*.json`, the files `edgefront-bench limiter`, `l4` and `memory` wrote. They are decision rates, round trips and resident memory rather than load runs against a target, so they keep their own tables; [pacer-port.md](pacer-port.md) has the full write-up.
 
 Machine: 16-core arm64, Docker 28, with 16 CPUs and 7.7 GiB for the container runtime (docker 28.0.4, kernel 6.10.14-linuxkit, aarch64). The target ran on CPUs 0-3, the origin on 4-9 and the load generator on 10-15.
 
@@ -232,5 +232,49 @@ Reproduce with:
 ```sh
 edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)
 ```
+
+## Limiter
+
+libpacer and pacerd (C) against edgefront-limiter and `edgefront limits` (Rust), from the limiter track's week 4 runs (#88). They are not load runs against a target, so they have tables of their own rather than rows like the ones above; [pacer-port.md](pacer-port.md) gives the machine, the method and what each number means.
+
+### limiter-decisions
+
+Millions of decisions per second.
+
+| workload | implementation | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads |
+|---|---|---:|---:|---:|---:|---:|
+| shared-gcra | Rust | 439.8 | 238.9 | 135.1 | 108.4 | 187.6 |
+| shared-gcra | C | 336.3 | 90.0 | 93.8 | 101.5 | 111.5 |
+| shared-gcra | Rust / C | 1.31 | 2.65 | 1.44 | 1.07 | 1.68 |
+| mutex-gcra | Rust | 557.7 | 128.4 | 93.0 | 72.1 | 84.2 |
+| mutex-gcra | C | 192.4 | 58.1 | 49.5 | 34.1 | 36.5 |
+| mutex-gcra | Rust / C | 2.90 | 2.21 | 1.88 | 2.11 | 2.31 |
+| table-spread | Rust | 29.8 | 41.0 | 45.4 | 49.5 | 54.3 |
+| table-spread | C | 21.3 | 22.7 | 26.3 | 34.4 | 41.7 |
+| table-spread | Rust / C | 1.40 | 1.81 | 1.73 | 1.44 | 1.30 |
+| table-hot | Rust | 102.4 | 33.8 | 30.3 | 20.0 | 18.0 |
+| table-hot | C | 66.6 | 22.3 | 21.1 | 13.8 | 13.9 |
+| table-hot | Rust / C | 1.54 | 1.51 | 1.43 | 1.45 | 1.29 |
+
+### l4-proxy
+
+The median of 3 sessions of 5 runs each.
+
+| | direct | pacerd | edgefront |
+|---|---:|---:|---:|
+| bulk download, one connection (MiB/s) | 18345 | 5819 | 6026 |
+| 64-byte round trip, p50 (µs) | 45.6 | 94.0 | 96.0 |
+| 64-byte round trip, p99 (µs) | 108.5 | 194.5 | 173.1 |
+| round trips/s, 32 connections | 293212 | 133032 | 126463 |
+| proxy CPU per round trip (µs) | - | 21.8 | 22.2 |
+
+### Memory per tracked client
+
+| implementation | clients | RSS before (KiB) | table made (KiB) | filled (KiB) | bytes per client |
+|---|---:|---:|---:|---:|---:|
+| libpacer (C) | 1035213 | 896 | 3488 | 132512 | 130.2 |
+| edgefront-limiter (Rust) | 1035213 | 2456 | 138044 | 138328 | 134.4 |
+
+Reproduce with `scripts/bench-pacer-port.sh`, which runs all three. The C side needs legacy/pacer, so run it from 2965963a1d200e09c3dac5da49510087e660642e, the commit before legacy/pacer was deleted; the Rust side runs from any commit.
 
 Latency is response time from each request's scheduled send time, so queueing behind a stall counts (no coordinated omission). Hit ratio is the share of measured requests the origin never saw. Peak RSS is the highest resident set (anon plus mapped file pages) summed over the target's containers, sampled every 100 ms; peak memory is the cgroup's `memory.peak`, page cache and tmpfs included. CPU is the target's CPU time over the measured phase. Image is the uncompressed size of the target's images.
