@@ -108,9 +108,26 @@ tolerance = 0.05
 #     +9,328  index snapshot loading (04ff789, #90)
 #    -13,496  a921814 and f6be2bf before their code was linked in
 #
-# 1,180,808 bytes in all. The new ceiling is again about 10% above. ACME is
-# the largest part; putting it behind a cargo feature would take back
+# 1,180,808 bytes in all, and a ceiling of 11,450,000 was set from it. ACME
+# is the largest part; putting it behind a cargo feature would take back
 # about 0.69 MB if a smaller default binary is ever wanted.
+#
+# The same day the HTTP/2 and HTTP limits work reached main, and the ten-run
+# proof's unchanged branches (bench runs 105-107, at 34bea7b) failed both
+# ceilings: the binary was 13,358,992 bytes and the image 15,702,944. The
+# second size probe (Actions run 44769371778), from 3069b36 to f2af81c:
+#
+#   +2,404,200  HTTP/2 on the edge listener (282d224, #92): the h2 crate
+#     +293,272  upstream protocol choice and ALPN (c22e00a, #92)
+#     +241,208  HTTP limits in edgefront_limiter::http (8a9963f, #94)
+#      +67,896  upstream HTTP/2 windows from the bandwidth-delay product
+#               (f2af81c, #92)
+#      +11,208  gRPC over HTTP/2 (31a19a9, #92)
+#          -32  the upstream HTTP/2 pool (fc553a1, #92)
+#
+# 3,017,752 bytes, to 13,426,888 at f2af81c. Both ceilings are again about
+# 10% above: the binary's above f2af81c's, the image's above the 15,702,944
+# measured at 34bea7b. The roadmap's image target, under 20 MB, still holds.
 [ceilings]
-binary_bytes = 11450000
-image_bytes = 15200000
+binary_bytes = 14770000
+image_bytes = 17270000
