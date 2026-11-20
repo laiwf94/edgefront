@@ -125,13 +125,12 @@ fn not_modified(obj: &CachedObject, req: &HeaderMap) -> bool {
     if req.contains_key(header::IF_NONE_MATCH) {
         return false;
     }
-    match (
-        date_header(req, &header::IF_MODIFIED_SINCE),
-        date_header(&obj.headers, &header::LAST_MODIFIED),
-    ) {
-        (Some(since), Some(modified)) => modified <= since,
-        _ => false,
-    }
+    // A stored response without Last-Modified is judged by its Date, or
+    // failing that the time it was received (RFC 9111 section 4.3.2).
+    let modified = date_header(&obj.headers, &header::LAST_MODIFIED)
+        .or_else(|| date_header(&obj.headers, &header::DATE))
+        .unwrap_or(obj.freshness.response_time);
+    date_header(req, &header::IF_MODIFIED_SINCE).is_some_and(|since| modified <= since)
 }
 
 /// If-Range must name the stored representation exactly: a strong entity
@@ -356,8 +355,27 @@ mod tests {
             get(&o, &[("if-none-match", "nope"), ("if-modified-since", lm)]).status(),
             StatusCode::OK
         );
+        // Without Last-Modified, the stored Date stands in for it, and
+        // without a Date, the time the response was received (t(0)).
+        let dated = obj(&[("date", later.to_str().unwrap())]);
+        assert_eq!(
+            get(&dated, &[("if-modified-since", lm)]).status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get(&dated, &[("if-modified-since", later.to_str().unwrap())]).status(),
+            StatusCode::NOT_MODIFIED
+        );
         assert_eq!(
             get(&obj(&[]), &[("if-modified-since", lm)]).status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(
+            get(
+                &obj(&[]),
+                &[("if-modified-since", earlier.to_str().unwrap())]
+            )
+            .status(),
             StatusCode::OK
         );
     }
