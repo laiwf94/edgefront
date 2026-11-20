@@ -87,7 +87,7 @@ jobs:
           done
           cat target/bench/smoke/report.md >> "$GITHUB_STEP_SUMMARY"
 
-  # The regression gate (bench/gates.toml): the gate scenario `runs` (9)
+  # The regression gate (bench/gates.toml): the gate scenario `runs` (10)
   # times against edgefront on one CPU, judged with a Mann-Whitney U test
   # and the measured tolerances. On a CPU model whose committed samples are
   # steady enough (committed_models), against those; on any other, against

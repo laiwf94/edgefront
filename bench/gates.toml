@@ -11,9 +11,9 @@
 scenario = "bench/ci/gate.toml"
 target = "edgefront"
 target_cpus = 1
-# Nine a side, not the five the gate started with: see "Runs per side"
-# below.
-runs = 9
+# Ten a side, not the five the gate started with or the nine after it:
+# see "Runs per side" below.
+runs = 10
 p_value = 0.01
 baseline = "bench/baseline/gate.json"
 baseline_commit = "0f4230eb560a25a1e5e06d27b6a9d206d949de1b"
@@ -60,7 +60,9 @@ committed_models = []
 # unchanged runs passed both metrics (largest change 1.9%); the 3 us plant
 # measured 7.1% (p < 0.0001, failed), 3.1% (p = 0.0071, under 5%) and 7.8%
 # (p = 0.020, passed), so the proof still needs a plant that costs a
-# measured 10% (docs/DESIGN.md).
+# measured 10% (docs/DESIGN.md). Ten a side from 20 Nov 2026 (the owner's
+# choice of "10+10 runs" in #87): p < 0.01 then needs 81 of 100 pairs, so
+# up to 19 may go the wrong way, at about a minute more per job.
 
 # Response-time p99 at a fixed 2,000 requests per second.
 [metrics.p99_ms]

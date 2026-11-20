@@ -422,7 +422,7 @@ The runner needs Docker and builds the edgefront and harness images from `bench/
 
 The first published comparison is [docs/benchmarks/2026-11-baseline.md](docs/benchmarks/2026-11-baseline.md): edgefront, Varnish, NGINX and Apache Traffic Server on the cache-hit, cache-miss, mixed and large-object scenarios. `examples/bench-report.sh` regenerates it from the raw results.
 
-Pull requests that touch the crates run the regression gate (`bench/gates.toml`, `.github/workflows/bench.yml`). It runs edgefront nine times beside nine runs of the change's base commit, alternating on the same runner, and fails when p99 or requests per CPU second is worse by more than 5% at p < 0.01 (one-sided Mann-Whitney U). It also fails when the binary or the image grows past its fixed ceiling. [docs/DESIGN.md](docs/DESIGN.md#the-regression-gate) explains why it compares on the same runner.
+Pull requests that touch the crates run the regression gate (`bench/gates.toml`, `.github/workflows/bench.yml`). It runs edgefront ten times beside ten runs of the change's base commit, alternating on the same runner, and fails when p99 or requests per CPU second is worse by more than 5% at p < 0.01 (one-sided Mann-Whitney U). It also fails when the binary or the image grows past its fixed ceiling. [docs/DESIGN.md](docs/DESIGN.md#the-regression-gate) explains why it compares on the same runner.
 
 ## Where it stops
 

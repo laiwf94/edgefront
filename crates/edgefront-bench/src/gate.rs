@@ -1,6 +1,6 @@
 //! The benchmark regression gate.
 //!
-//! A pull request runs the gate scenario `runs` times (9) and compares
+//! A pull request runs the gate scenario `runs` times (10) and compares
 //! each metric's samples with the baseline's. On a CPU model listed in
 //! `committed_models` those are the samples committed in
 //! `bench/baseline/gate.json`, recorded from `baseline_commit`. On any
@@ -12,11 +12,11 @@
 //!
 //! - **It is significant.** A one-sided Mann-Whitney U test says the
 //!   candidate's samples are worse than the baseline's at `p < p_value`
-//!   (0.01). With 9 samples a side the exact test reaches that when at
-//!   least 67 of the 81 candidate-baseline pairs are worse: a few runs a
+//!   (0.01). With 10 samples a side the exact test reaches that when at
+//!   least 81 of the 100 candidate-baseline pairs are worse: a few runs a
 //!   noisy runner spoils cannot hide a real regression, and no single run
 //!   can make one. (With 5 a side it took 24 of 25 pairs, and one spoiled
-//!   run hid a real 8.6% slowdown.)
+//!   run hid a real 8.6% slowdown; with 9 it took 67 of 81.)
 //! - **It is large.** The candidate's median is worse than the baseline's
 //!   by more than the metric's `tolerance`, 5% (`bench/gates.toml` records
 //!   the noise measured on the CI runners that set it).
@@ -797,9 +797,10 @@ mod tests {
         // Two out of order: P(U >= 23) = 4 / 252.
         let p = mann_whitney_greater(&[5.5, 6.5, 8.0, 9.0, 10.0], &[1.0, 2.0, 3.0, 4.0, 7.0]);
         assert!((p - 4.0 / 252.0).abs() < 1e-12, "{p}");
-        // Nine against nine, the gate's runs: complete separation is
-        // 1 / C(18, 9); 14 pairs out of order (U = 67) is still under 0.01,
-        // P = 456 / 48,620, and 15 (U = 66) is not, 594 / 48,620.
+        // Nine against nine, the gate's runs until 20 Nov 2026: complete
+        // separation is 1 / C(18, 9); 14 pairs out of order (U = 67) is
+        // still under 0.01, P = 456 / 48,620, and 15 (U = 66) is not,
+        // 594 / 48,620.
         let base: Vec<f64> = (1..=9).map(f64::from).collect();
         let mut cand: Vec<f64> = (10..=18).map(f64::from).collect();
         let p = mann_whitney_greater(&cand, &base);
@@ -811,6 +812,22 @@ mod tests {
         cand[1] = 2.5;
         let p = mann_whitney_greater(&cand, &base);
         assert!((p - 594.0 / 48_620.0).abs() < 1e-12, "{p}");
+        // Ten against ten, the gate's runs: complete separation is
+        // 1 / C(20, 10); 19 pairs out of order (U = 81) is still under
+        // 0.01, P = 1,713 / 184,756, and 20 (U = 80) is not,
+        // 2,146 / 184,756.
+        let base: Vec<f64> = (1..=10).map(f64::from).collect();
+        let mut cand: Vec<f64> = (11..=20).map(f64::from).collect();
+        let p = mann_whitney_greater(&cand, &base);
+        assert!((p - 1.0 / 184_756.0).abs() < 1e-12, "{p}");
+        cand[0] = 1.5; // above one baseline run: 9 pairs out of order
+        cand[1] = 2.5; // above two: 8 more
+        cand[2] = 8.5; // above eight: 2 more
+        let p = mann_whitney_greater(&cand, &base);
+        assert!((p - 1_713.0 / 184_756.0).abs() < 1e-12, "{p}");
+        cand[2] = 7.5;
+        let p = mann_whitney_greater(&cand, &base);
+        assert!((p - 2_146.0 / 184_756.0).abs() < 1e-12, "{p}");
         // All tied: no evidence either way.
         assert_eq!(mann_whitney_greater(&[1.0; 5], &[1.0; 5]), 1.0);
         assert_eq!(mann_whitney_greater(&[], &[1.0]), 1.0);
