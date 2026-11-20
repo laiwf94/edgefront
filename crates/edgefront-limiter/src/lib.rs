@@ -12,6 +12,7 @@ pub mod clock;
 pub mod config;
 pub mod conn;
 pub mod gcra;
+pub mod key;
 pub mod lint;
 pub mod rate;
 pub mod shape;
