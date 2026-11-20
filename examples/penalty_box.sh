@@ -76,23 +76,28 @@ for _ in $(seq 100); do
     sleep 0.1
 done
 
-echo "1. key bad sends 8 requests a second for two seconds"
-for s in 1 2; do
-    codes=""
-    for _ in $(seq 8); do codes="$codes $(req bad)"; done
-    echo "   second $s:$codes"
-    [ "$s" = 1 ] && sleep 1
-done
+# Requests for KEY, one after another, for SECS seconds: every window of
+# the penalty box sees refusals, however slow the machine.
+hammer() {
+    local end=$((SECONDS + $2)) n=0 refused=0
+    while [ "$SECONDS" -lt "$end" ]; do
+        [ "$(req "$1")" = 429 ] && refused=$((refused + 1))
+        n=$((n + 1))
+    done
+    echo "   $n requests, $refused refused"
+}
+
+echo "1. key bad sends requests as fast as it can for 3 s, against 5 a second"
+hammer bad 3
 check "boxed" "$(req bad)" 429
 retry=$(head_of retry-after)
-check "Retry-After is the box's time left, 3 s or less" "$([ "$retry" -ge 1 ] && [ "$retry" -le 3 ] && echo yes)" yes
+check "Retry-After is the box's time left, 6 s or less" "$([ "$retry" -ge 1 ] && [ "$retry" -le 6 ] && echo yes)" yes
 check "another key is unaffected" "$(req good)" 200
 echo "   waiting ${retry} s for the box to open"
 sleep "$retry"
 check "released" "$(req bad)" 200
-for _ in $(seq 8); do req bad >/dev/null; done
-sleep 1
-for _ in $(seq 8); do req bad >/dev/null; done
+echo "   and again for 3 s"
+hammer bad 3
 check "second offence: banned" "$(req bad)" 429
 check "banned for the hour" "$([ "$(head_of retry-after)" -gt 3500 ] && echo yes)" yes
 

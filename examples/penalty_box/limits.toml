@@ -1,5 +1,5 @@
 # The demo's HTTP limits: 5 a second per API key; a key refused in two
-# seconds running is boxed for 3 s, and a key boxed twice is banned for
+# seconds running is boxed for 6 s, and a key boxed twice is banned for
 # an hour. Connections carry at most 3 requests each.
 [[http_limits]]
 name = "api"
@@ -8,7 +8,7 @@ key = ["header:x-api-key"]
 [http_limits.penalty]
 windows = 2
 window = "1s"
-timeout = "3s"
+timeout = "6s"
 ban_after = 2
 ban_for = "1h"
 
