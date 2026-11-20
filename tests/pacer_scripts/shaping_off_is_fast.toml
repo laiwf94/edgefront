@@ -8,6 +8,12 @@ listener shape {
   upstream {upstream}
 }
 """
+# Unshaped, 32 MiB through the listener takes no more than ten times the
+# same download straight from the upstream, timed in the same run. pacer's
+# check was a wall clock (under 1.5 s), which a slow or busy machine broke
+# (1,615 ms under coverage on CI). The proxy reads and writes every byte,
+# so it measures two to four times the direct download on this Mac in a
+# debug build; any shaping would take seconds per MiB.
 step = [
-  { op = "download", bytes = 33554432, max_ms = 1500, expect = "bytes=33554432 hash=ok time=ok" },
+  { op = "download", bytes = 33554432, max_vs_direct = 10, expect = "bytes=33554432 hash=ok time=ok" },
 ]

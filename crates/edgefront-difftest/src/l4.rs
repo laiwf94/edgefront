@@ -153,6 +153,12 @@ pub struct Step {
     pub min_ms: Option<u64>,
     #[serde(default)]
     pub max_ms: Option<u64>,
+    /// For `download`: at most this many times as long as the same
+    /// download straight from the upstream, timed in the same run just
+    /// before, instead of a wall-clock bound that a slow or busy machine
+    /// breaks.
+    #[serde(default)]
+    pub max_vs_direct: Option<u64>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Counter names for `stats`.
@@ -786,6 +792,22 @@ fn step(ctx: &mut Ctx<'_>, st: &Step) -> Result<String, String> {
         }
         "download" => {
             let total = st.bytes.ok_or("download needs bytes")?;
+            // The same-run control: the same bytes from the upstream itself.
+            let direct = match st.max_vs_direct {
+                None => None,
+                Some(_) => {
+                    let first = ctx.script.upstream.first().ok_or("no upstream")?;
+                    let up = ctx.ups[&first.name].addr;
+                    let start = Instant::now();
+                    let mut s = connect_from(None, up, Duration::from_secs(3))
+                        .map_err(|e| format!("connect upstream: {e}"))?;
+                    let (n, _, _) = read_to_eof(&mut s, timeout(st, 30_000));
+                    if n != total {
+                        return Err(format!("direct download got {n} bytes"));
+                    }
+                    Some(start.elapsed())
+                }
+            };
             let start = Instant::now();
             let mut s = connect_from(st.from.as_deref(), to, Duration::from_secs(3))
                 .map_err(|e| format!("connect: {e}"))?;
@@ -795,7 +817,19 @@ fn step(ctx: &mut Ctx<'_>, st: &Step) -> Result<String, String> {
             } else {
                 "wrong"
             };
-            format!("bytes={n} hash={hash} {}", timed(st, start.elapsed()))
+            let took = start.elapsed();
+            let time = match (st.max_vs_direct, direct) {
+                (Some(k), Some(d)) => {
+                    let (p, d) = (took.as_millis() as u64, (d.as_millis() as u64).max(1));
+                    if p <= d.saturating_mul(k) {
+                        "time=ok".to_string()
+                    } else {
+                        format!("time={p}ms, over {k} times the direct {d}ms")
+                    }
+                }
+                _ => timed(st, took),
+            };
+            format!("bytes={n} hash={hash} {time}")
         }
         "download_bg" => {
             // A download in the background, joined with `join`.
