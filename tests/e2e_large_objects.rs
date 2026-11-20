@@ -218,24 +218,11 @@ async fn a_2_gib_object_survives_a_kill_mid_fill_and_serves_ranges() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(hit.contains("edge-big; hit"), "{hit}");
-    let fills = fetches.load(Ordering::SeqCst);
-    for (start, end) in [
-        (0, 999),
-        ((1 << 20) - 500, (1 << 20) + 499),
-        (1 << 30, (1 << 30) + (3 << 20)),
-        (LEN / 3, LEN / 3 + 12_345),
-        (LEN - 1, LEN - 1),
-    ] {
-        let head = get_range(bin.proxy_addr, start, end).await;
-        assert!(head.contains("edge-big; hit"), "{start}-{end}: {head}");
-    }
-    assert_eq!(
-        fetches.load(Ordering::SeqCst),
-        fills,
-        "a range hit went to the origin"
-    );
     // The slices reach the segment store behind the memory tier: all
-    // 2,048 of them and the manifest, once the write queue drains.
+    // 2,048 of them and the manifest, once the write queue drains. Until
+    // then a slice the 256 MiB memory tier has already evicted may not be
+    // on disk yet, and a range over it is fetched again (#256), so the
+    // range hits below are checked once the queue has drained.
     let mut objects = 0u64;
     let mut text = String::new();
     for _ in 0..600 {
@@ -256,4 +243,20 @@ async fn a_2_gib_object_survives_a_kill_mid_fill_and_serves_ranges() {
         .filter(|l| l.starts_with("cachet_disk"))
         .collect();
     assert!(objects > 2048, "{objects} objects on disk: {disk_lines:#?}");
+    let fills = fetches.load(Ordering::SeqCst);
+    for (start, end) in [
+        (0, 999),
+        ((1 << 20) - 500, (1 << 20) + 499),
+        (1 << 30, (1 << 30) + (3 << 20)),
+        (LEN / 3, LEN / 3 + 12_345),
+        (LEN - 1, LEN - 1),
+    ] {
+        let head = get_range(bin.proxy_addr, start, end).await;
+        assert!(head.contains("edge-big; hit"), "{start}-{end}: {head}");
+    }
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        fills,
+        "a range hit went to the origin"
+    );
 }
