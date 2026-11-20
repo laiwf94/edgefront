@@ -451,10 +451,66 @@ pub fn grouped(value: f64) -> String {
     out
 }
 
+/// Collapses repeated runs (the same track, scenario and target) into one
+/// result holding the median of each number, errors summed, with the count
+/// in `extra["runs"]`. A result with no repeat is kept as it is.
+pub fn merge_repeats(results: &[BenchResult]) -> Vec<BenchResult> {
+    let mut groups: Vec<Vec<&BenchResult>> = Vec::new();
+    for r in results {
+        match groups.iter_mut().find(|g| {
+            g[0].track == r.track
+                && g[0].scenario.name == r.scenario.name
+                && g[0].target.name == r.target.name
+        }) {
+            Some(g) => g.push(r),
+            None => groups.push(vec![r]),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|g| {
+            let mut out = g[0].clone();
+            if g.len() == 1 {
+                return out;
+            }
+            let med = |f: &dyn Fn(&BenchResult) -> f64| {
+                let mut v: Vec<f64> = g.iter().map(|r| f(r)).collect();
+                v.sort_by(f64::total_cmp);
+                let n = v.len();
+                if n % 2 == 1 {
+                    v[n / 2]
+                } else {
+                    (v[n / 2 - 1] + v[n / 2]) / 2.0
+                }
+            };
+            let m = &mut out.measured;
+            m.throughput_rps = med(&|r| r.measured.throughput_rps);
+            m.hit_ratio = med(&|r| r.measured.hit_ratio);
+            m.latency.p50_ms = med(&|r| r.measured.latency.p50_ms);
+            m.latency.p90_ms = med(&|r| r.measured.latency.p90_ms);
+            m.latency.p99_ms = med(&|r| r.measured.latency.p99_ms);
+            m.latency.p999_ms = med(&|r| r.measured.latency.p999_ms);
+            m.errors = ErrorCounts {
+                connect: g.iter().map(|r| r.measured.errors.connect).sum(),
+                timeout: g.iter().map(|r| r.measured.errors.timeout).sum(),
+                other: g.iter().map(|r| r.measured.errors.other).sum(),
+            };
+            out.resources.peak_rss_bytes = med(&|r| r.resources.peak_rss_bytes as f64) as u64;
+            out.resources.peak_memory_bytes = med(&|r| r.resources.peak_memory_bytes as f64) as u64;
+            out.resources.cpu_seconds = med(&|r| r.resources.cpu_seconds);
+            out.resources.cpu_cores = med(&|r| r.resources.cpu_cores);
+            out.extra.insert("runs".into(), g.len() as f64);
+            out
+        })
+        .collect()
+}
+
 /// The Markdown report of `results`: a section per track (cache, proxy,
 /// limiter, then any other, in that order), a table per scenario in the
 /// order the scenarios first appear, a row per target.
 pub fn render(title: &str, intro: &str, results: &[BenchResult]) -> String {
+    let merged = merge_repeats(results);
+    let results = merged.as_slice();
     let mut out = String::new();
     let _ = writeln!(out, "# {title}\n");
     if !intro.is_empty() {
@@ -734,6 +790,32 @@ pub(crate) mod tests {
         assert!(text.contains(" 1,250,000 |"));
         assert!(text.contains("over 8 HTTP/1.1 connections"), "{text}");
         assert!(text.contains("```sh\nedgefront-bench run"));
+    }
+
+    #[test]
+    fn repeats_collapse_to_medians() {
+        let mut runs = Vec::new();
+        for (p99, errs) in [(3.0, 1), (1.0, 0), (2.0, 2)] {
+            let mut r = sample("steer", "proxy", "p");
+            r.measured.latency.p99_ms = p99;
+            r.measured.errors.timeout = errs;
+            runs.push(r);
+        }
+        let mut even = sample("edgefront", "proxy", "p");
+        even.resources.cpu_seconds = 1.0;
+        let mut even2 = even.clone();
+        even2.resources.cpu_seconds = 2.0;
+        runs.push(even);
+        runs.push(even2);
+        runs.push(sample("solo", "cache", "c"));
+        let merged = merge_repeats(&runs);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].measured.latency.p99_ms, 2.0);
+        assert_eq!(merged[0].measured.errors.timeout, 3);
+        assert_eq!(merged[0].extra["runs"], 3.0);
+        assert_eq!(merged[1].resources.cpu_seconds, 1.5);
+        assert!(merged[2].extra.is_empty());
+        assert!(render("t", "", &runs).contains("| runs |"));
     }
 
     #[test]

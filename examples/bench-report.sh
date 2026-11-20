@@ -2,8 +2,10 @@
 # Regenerates the November 2026 baseline report from its raw results and
 # checks it matches the committed one: every number in
 # docs/benchmarks/2026-11-baseline.md comes from a file under
-# docs/benchmarks/data/2026-11/, and a result that breaks the schema stops
-# the script.
+# docs/benchmarks/data/2026-11/ (the cache track) or
+# docs/benchmarks/data/steer-go-vs-rust/ (the proxy track's week 4 runs,
+# three repetitions, shown as medians), and a result that breaks the schema
+# stops the script.
 #
 # REPORT_WRITE=1 writes the report instead of checking it, after new raw
 # results are added (by any track: the report has a section per track).
@@ -11,6 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 DATA=docs/benchmarks/data/2026-11
+PROXY=docs/benchmarks/data/steer-go-vs-rust
 REPORT=docs/benchmarks/2026-11-baseline.md
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -23,7 +26,7 @@ BENCH=target/release/edgefront-bench
 
 step "Validate the raw results"
 files=()
-while IFS= read -r f; do files+=("$f"); done < <(find "$DATA" -name '*.json' | sort)
+while IFS= read -r f; do files+=("$f"); done < <(find "$DATA" "$PROXY" -name '*.json' | sort)
 [[ ${#files[@]} -gt 0 ]] || fail "no results under $DATA"
 "$BENCH" validate "${files[@]}" || fail "a result breaks bench/schema/result.schema.json"
 ok "${#files[@]} results match the schema"
@@ -31,7 +34,7 @@ ok "${#files[@]} results match the schema"
 step "Render"
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
-"$BENCH" report --results "$DATA" --out "$out" \
+"$BENCH" report --results "$DATA" --results "$PROXY" --out "$out" \
     --title "Baseline benchmark, November 2026" --intro "$DATA/intro.md"
 if [[ ${REPORT_WRITE:-0} == 1 ]]; then
     cp "$out" "$REPORT"

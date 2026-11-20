@@ -12,8 +12,9 @@
 //!     --machine TEXT      how the report names the machine
 //!     --harness-image IMG default edgefront-bench/harness:local
 //!     --rebuild           rebuild the images built from this repository
-//! edgefront-bench report --results DIR --out FILE [--title TEXT] [--intro FILE]
-//!     Renders every result under DIR into one Markdown report.
+//! edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE]
+//!     Renders every result under the DIRs into one Markdown report, repeated
+//!     runs as their medians.
 //! edgefront-bench gate --config bench/gates.toml --results DIR --machine CPU
 //!                      [--binary FILE] [--baseline FILE] [--verdict FILE] [--summary FILE]
 //!     Judges repeated gate runs against the committed baseline for the
@@ -59,7 +60,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench gate --config bench/gates.toml --results DIR --machine CPU [--baseline FILE] [--binary FILE] [--verdict FILE] [--summary FILE]
        edgefront-bench gate --config bench/gates.toml --machine CPU --plan
        edgefront-bench baseline --config bench/gates.toml --results DIR... --machine CPU --commit SHA [--target NAME] [--out FILE]
-       edgefront-bench report --results DIR --out FILE [--title TEXT] [--intro FILE]
+       edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE]
        edgefront-bench validate FILE...
        edgefront-bench origin [--listen ADDR]
        edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
@@ -371,11 +372,17 @@ pub fn summary(result: &BenchResult) -> String {
 fn render_report(args: &[String]) -> Result<(), Failure> {
     let flags = Flags::parse(args, &["results", "out", "title", "intro"], &[])?;
     flags.no_positional()?;
-    let dir = flags.required("results")?;
+    let dirs = flags.all("results");
+    if dirs.is_empty() {
+        return Err(usage("--results is required"));
+    }
     let out = flags.required("out")?;
-    let results = report::load_dir(Path::new(dir)).map_err(failed)?;
+    let mut results = Vec::new();
+    for dir in &dirs {
+        results.extend(report::load_dir(Path::new(dir)).map_err(failed)?);
+    }
     if results.is_empty() {
-        return Err(failed(format!("no results under {dir}")));
+        return Err(failed(format!("no results under {}", dirs.join(", "))));
     }
     let intro = match flags.one("intro")? {
         Some(path) => std::fs::read_to_string(path).map_err(|e| failed(format!("{path}: {e}")))?,
@@ -669,7 +676,7 @@ mod tests {
             vec!["run", "--scenario"],
             vec!["run", "extra"],
             vec!["report", "--results", "a"],
-            vec!["report", "--results", "a", "--results", "b", "--out", "c"],
+            vec!["report", "--out", "c"],
             vec!["validate"],
             vec!["origin", "--listen", "nowhere"],
             vec!["load", "--target", "x"],

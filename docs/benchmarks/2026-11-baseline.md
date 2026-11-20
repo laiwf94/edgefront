@@ -11,9 +11,11 @@ What the numbers say:
 - **Hit ratios.** Every target is below the 50% target in `miss-heavy` (40.6 to 47.5%), because once-only objects compete for the same space. In `large-objects`, edgefront reached 86.7% against NGINX's 93.8%.
 - **Varnish** failed 53 requests in `web-mix` (out of 600,000) and peaked at 4.4 GiB.
 
-The proxy (Go against Rust) and limiter (C against Rust) week 4 tables join this page as those tracks publish their raw results under `data/2026-11/`. Each result's `track` field files it into its own section.
+The proxy section is the proxy track's week 4 Go-against-Rust runs (#86): steer and `edgefront proxy`, over HTTP/1.1 and TLS, three repetitions each, read from [data/steer-go-vs-rust/](data/steer-go-vs-rust/). Each row is the median of the three (the `runs` column), errors summed; [steer-go-vs-rust.md](steer-go-vs-rust.md) has the full write-up. The limiter track's C-against-Rust results (#88) are in [pacer-port.md](pacer-port.md); they are decision rates and per-client memory in that track's own JSON format, not the harness's result schema, so they are not tabulated here.
 
 Machine: 16-core arm64, Docker 28, with 16 CPUs and 7.7 GiB for the container runtime (docker 28.0.4, kernel 6.10.14-linuxkit, aarch64). The target ran on CPUs 0-3, the origin on 4-9 and the load generator on 10-15.
+
+Machine: Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB), with 16 CPUs and 7.7 GiB for the container runtime (docker 28.0.4, kernel 6.10.14-linuxkit, aarch64). The target ran on CPUs 0-3, the origin on 4-9 and the load generator on 10-15.
 
 ## Cache
 
@@ -91,6 +93,144 @@ Reproduce with:
 
 ```sh
 edgefront-bench run --scenario bench/scenarios/cache-hit.toml --scenario bench/scenarios/miss-heavy.toml --scenario bench/scenarios/web-mix.toml --scenario bench/scenarios/large-objects.toml --targets edgefront,varnish,nginx,ats --out docs/benchmarks/data/2026-11/cache --run 2026-11-baseline --rebuild
+```
+
+## Proxy
+
+### steer-port-http1-1
+
+cleartext HTTP/1.1 to the origin through the proxy over 1 connection, 500 requests per second of 1 KiB objects.
+
+Load: 500 req/s over 1 HTTP/1.1 connections, 30 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy | 0.1.0 | 500 req/s | 143 µs | 2.98 ms | 9.99 ms | 0.0% | 0 | 0.8 MiB | 4.4 MiB | 1.8 s (0.06 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer | 0.1.0 | 500 req/s | 145 µs | 352 µs | 3.50 ms | 0.0% | 0 | 11.1 MiB | 14.1 MiB | 2.3 s (0.08 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/http1-1.toml --scenario bench/scenarios/steer-port/http1-10000.toml --scenario bench/scenarios/steer-port/http1-64-ramp.toml --scenario bench/scenarios/steer-port/http1-64.toml --targets steer,edgefront-proxy --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB) --rebuild
+```
+
+### steer-port-http1-10000
+
+cleartext HTTP/1.1 to the origin through the proxy over 10000 connections, 20,000 requests per second of 1 KiB objects.
+
+Load: 20,000 req/s over 10000 HTTP/1.1 connections, 30 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy | 0.1.0 | 20,000 req/s | 131 µs | 1.21 ms | 4.24 ms | 0.0% | 0 | 220.9 MiB | 239.7 MiB | 46.4 s (1.54 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer | 0.1.0 | 20,000 req/s | 128 µs | 1.52 ms | 5.17 ms | 0.0% | 0 | 337.5 MiB | 357.4 MiB | 39.1 s (1.30 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/http1-1.toml --scenario bench/scenarios/steer-port/http1-10000.toml --scenario bench/scenarios/steer-port/http1-64-ramp.toml --scenario bench/scenarios/steer-port/http1-64.toml --targets steer,edgefront-proxy --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB) --rebuild
+```
+
+### steer-port-http1-64
+
+cleartext HTTP/1.1 to the origin through the proxy over 64 connections, 20,000 requests per second of 1 KiB objects.
+
+Load: 20,000 req/s over 64 HTTP/1.1 connections, 30 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy | 0.1.0 | 20,000 req/s | 144 µs | 2.28 ms | 12.31 ms | 0.0% | 0 | 10.3 MiB | 13.3 MiB | 44.6 s (1.48 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer | 0.1.0 | 20,000 req/s | 155 µs | 27.87 ms | 74.51 ms | 0.0% | 175,488 | 15.3 MiB | 22.4 MiB | 41.3 s (1.37 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/http1-1.toml --scenario bench/scenarios/steer-port/http1-10000.toml --scenario bench/scenarios/steer-port/http1-64-ramp.toml --scenario bench/scenarios/steer-port/http1-64.toml --targets steer,edgefront-proxy --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB) --rebuild
+```
+
+### steer-port-http1-64-ramp
+
+cleartext HTTP/1.1 to the origin through the proxy over 64 connections, from 20,000 to 120,000 requests per second in six 10-second steps.
+
+Load: 70,000 req/s over 64 HTTP/1.1 connections, 60 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy | 0.1.0 | 70,000 req/s | 379 µs | 1672 ms | 1684 ms | 0.0% | 3,534,080 | 11.5 MiB | 14.2 MiB | 165.3 s (2.68 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer | 0.1.0 | 52,630 req/s | 93.78 ms | 4945 ms | 5004 ms | 0.0% | 2,518,626 | 284.8 MiB | 355.0 MiB | 172.3 s (2.65 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/http1-1.toml --scenario bench/scenarios/steer-port/http1-10000.toml --scenario bench/scenarios/steer-port/http1-64-ramp.toml --scenario bench/scenarios/steer-port/http1-64.toml --targets steer,edgefront-proxy --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB) --rebuild
+```
+
+### steer-port-tls-1
+
+HTTP/1.1 over TLS 1.3 to the origin through the proxy over 1 connection, 500 requests per second of 1 KiB objects.
+
+Load: 500 req/s over 1 HTTP/1.1 connections, 30 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy-tls | 0.1.0 | 500 req/s | 163 µs | 13.89 ms | 64.32 ms | 0.0% | 0 | 0.9 MiB | 4.9 MiB | 2.1 s (0.07 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer-tls | 0.1.0 | 500 req/s | 190 µs | 97.78 ms | 177 ms | 0.0% | 0 | 9.7 MiB | 12.3 MiB | 2.9 s (0.10 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)
+```
+
+### steer-port-tls-10000
+
+HTTP/1.1 over TLS 1.3 to the origin through the proxy over 10000 connections, 20,000 requests per second of 1 KiB objects.
+
+Load: 20,000 req/s over 10000 HTTP/1.1 connections, 30 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy-tls | 0.1.0 | 20,000 req/s | 149 µs | 3.62 ms | 12.94 ms | 0.0% | 0 | 309.3 MiB | 329.6 MiB | 48.4 s (1.61 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer-tls | 0.1.0 | 20,000 req/s | 153 µs | 6.49 ms | 72.88 ms | 0.0% | 0 | 495.3 MiB | 515.3 MiB | 43.4 s (1.44 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)
+```
+
+### steer-port-tls-64
+
+HTTP/1.1 over TLS 1.3 to the origin through the proxy over 64 connections, 20,000 requests per second of 1 KiB objects.
+
+Load: 20,000 req/s over 64 HTTP/1.1 connections, 30 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy-tls | 0.1.0 | 20,000 req/s | 126 µs | 438 µs | 9.34 ms | 0.0% | 0 | 9.4 MiB | 11.9 MiB | 43.4 s (1.45 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer-tls | 0.1.0 | 20,000 req/s | 154 µs | 11.28 ms | 64.68 ms | 0.0% | 0 | 16.7 MiB | 24.6 MiB | 41.6 s (1.39 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)
+```
+
+### steer-port-tls-64-ramp
+
+HTTP/1.1 over TLS 1.3 to the origin through the proxy over 64 connections, from 20,000 to 120,000 requests per second in six 10-second steps.
+
+Load: 70,000 req/s over 64 HTTP/1.1 connections, 60 s measured after 5 s of warm-up. Hit ratio target 90%, working set 1.0 MiB.
+
+| Target | Version | Throughput | p50 | p99 | p99.9 | Hit ratio | Errors | Peak RSS | Peak memory | CPU | Image | binary_bytes | runs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| edgefront-proxy-tls | 0.1.0 | 70,000 req/s | 292 µs | 946 ms | 954 ms | 0.0% | 2,360,979 | 13.0 MiB | 16.7 MiB | 162.8 s (2.69 cores) | 13.6 MiB | 8,198,480 | 3 |
+| steer-tls | 0.1.0 | 54,522 req/s | 322 ms | 4861 ms | 4987 ms | 0.0% | 2,905,683 | 31.1 MiB | 44.4 MiB | 163.6 s (2.52 cores) | 13.5 MiB | 7,602,336 | 3 |
+
+Reproduce with:
+
+```sh
+edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)
 ```
 
 Latency is response time from each request's scheduled send time, so queueing behind a stall counts (no coordinated omission). Hit ratio is the share of measured requests the origin never saw. Peak RSS is the highest resident set (anon plus mapped file pages) summed over the target's containers, sampled every 100 ms; peak memory is the cgroup's `memory.peak`, page cache and tmpfs included. CPU is the target's CPU time over the measured phase. Image is the uncompressed size of the target's images.
