@@ -1,0 +1,36 @@
+name: size-probe
+# Throwaway (#257): the x86_64 release binary's size at the commits that
+# grew it, and a per-crate breakdown at main. Never merged.
+on:
+  push:
+    branches: ["size-probe-*"]
+permissions:
+  contents: read
+jobs:
+  size:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: [5a4646e, a921814, f6be2bf, c40626f, e2339bf, 32a6b0d, b600e8b, 298fe3c, 2a534de, b5b79fc, 6466daf, 04ff789, 507b874, d6a79e8, dfb8578, 2afcf7d, c327675, d1e5769, 3069b36]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git checkout ${{ matrix.commit }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --bin edgefront
+      - run: echo "${{ matrix.commit }} $(git rev-parse HEAD) $(stat -c %s target/release/edgefront)" | tee -a "$GITHUB_STEP_SUMMARY"
+  bloat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 3069b36
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-bloat@0.12.1 --locked
+      - run: cargo bloat --release --locked --bin edgefront --crates -n 60 | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: git checkout b5b79fc && cargo bloat --release --locked --bin edgefront --crates -n 60 | tee -a "$GITHUB_STEP_SUMMARY"
