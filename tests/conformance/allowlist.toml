@@ -2,5 +2,46 @@
 # not pass (tests/conformance.rs): one [tests.<id>] per required or optimal
 # test that fails, with the suite's result name and the reason. A listed
 # test that starts passing, or fails another way, fails the conformance job
-# until this file is updated.
+# until this file is updated. docs/DESIGN.md ("Conformance") explains each
+# group.
 [tests]
+
+# Set-Cookie: a response carrying it is never stored (policy::storable), so a
+# cookie meant for one client is never handed to the next. RFC 9111 allows
+# storing it; almost no origin that sends one means it to be shared.
+headers-store-Set-Cookie = { result = "setup_fail", reason = "Responses with Set-Cookie are not stored, by design, so one client's cookie is never served to another" }
+other-set-cookie = { result = "optional_fail", reason = "Responses with Set-Cookie are not stored, by design, so one client's cookie is never served to another" }
+
+# Interim responses: hyper's HTTP/1.1 server cannot send a 1xx before the
+# final response, so a 102 or 103 from the origin is dropped and the final
+# response is forwarded (and cached, never the 1xx itself). Sending 103
+# Early Hints is the cache track's week 7 (#96).
+interim-102 = { result = "optional_fail", reason = "1xx responses from the origin are not forwarded: hyper's server cannot send them; 103 Early Hints come with #96" }
+interim-103 = { result = "optional_fail", reason = "1xx responses from the origin are not forwarded: hyper's server cannot send them; 103 Early Hints come with #96" }
+interim-no-header-reuse = { result = "optional_fail", reason = "1xx responses from the origin are not forwarded: hyper's server cannot send them; 103 Early Hints come with #96" }
+interim-not-cached = { result = "fail", reason = "The final response is cached and the 103 is not, which is what the test is for, but the test also requires the 103 to reach the client, and hyper's server cannot send it; #96" }
+
+# Partial content: a 206 from the origin is stored only as slices of an
+# object over the size limit (slice.rs), so a client's own Range request on
+# a miss is forwarded and its 206 is not kept, and a stored prefix is never
+# completed with a second ranged request.
+partial-store-partial-reuse-partial = { result = "optional_fail", reason = "A 206 is stored only as slices of a large object, not on its own" }
+partial-store-partial-reuse-partial-byterange = { result = "optional_fail", reason = "A 206 is stored only as slices of a large object, not on its own" }
+partial-store-partial-reuse-partial-absent = { result = "optional_fail", reason = "A 206 is stored only as slices of a large object, not on its own" }
+partial-store-partial-reuse-partial-suffix = { result = "optional_fail", reason = "A 206 is stored only as slices of a large object, not on its own" }
+partial-store-partial-complete = { result = "optional_fail", reason = "A stored partial response is never completed with a ranged request, since a lone 206 is not stored" }
+
+# Accept-Language is matched byte for byte against the stored variant's,
+# as RFC 9111 section 4.1 allows; it is not normalised.
+vary-normalise-lang-order = { result = "optional_fail", reason = "Vary selecting values are compared as sent, without normalising Accept-Language" }
+vary-normalise-lang-case = { result = "optional_fail", reason = "Vary selecting values are compared as sent, without normalising Accept-Language" }
+vary-normalise-lang-select = { result = "optional_fail", reason = "Vary selecting values are compared as sent, without normalising Accept-Language" }
+
+# Only GET is stored. A POST response is never reused for a later GET.
+method-POST = { result = "optional_fail", reason = "Only responses to GET are stored" }
+
+# With no Last-Modified, If-Modified-Since is judged against the stored
+# Date (RFC 9111 section 4.3.2). Here the Date is 3,000 s after the
+# If-Modified-Since date, so the stored response has changed since then
+# and the client gets it whole.
+conditional-lm-fresh-no-lm = { result = "optional_fail", reason = "If-Modified-Since is judged against the stored Date when there is no Last-Modified (RFC 9111 4.3.2); the Date is later than it, so the answer is 200" }
