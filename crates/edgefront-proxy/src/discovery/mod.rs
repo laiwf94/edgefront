@@ -242,51 +242,70 @@ impl Merger {
                 status.failures += 1;
                 status.last_error = Some(e);
                 status.stale = status.synced;
-                return Change::default();
+                Change::default()
             }
             UpdateKind::Set(list) => {
+                let mut touched: Vec<String> = set.keys().cloned().collect();
                 set.clear();
                 for e in list {
+                    if !set.contains_key(&e.address) {
+                        touched.push(e.address.clone());
+                    }
                     set.insert(e.address.clone(), e);
                 }
+                touched.sort_unstable();
+                touched.dedup();
+                status.updates += 1;
+                Merger::succeeded(status, now);
+                self.remerge(touched.iter().map(String::as_str))
             }
             UpdateKind::Upsert(e) => {
+                let address = e.address.clone();
                 set.insert(e.address.clone(), e);
+                status.updates += 1;
+                Merger::succeeded(status, now);
+                self.remerge([address.as_str()])
             }
             UpdateKind::Remove(address) => {
                 set.remove(&address);
+                status.updates += 1;
+                Merger::succeeded(status, now);
+                self.remerge([address.as_str()])
             }
         }
-        status.updates += 1;
+    }
+
+    fn succeeded(status: &mut SourceStatus, now: Instant) {
         status.synced = true;
         status.stale = false;
         status.last_error = None;
         status.last_success = Some(now);
-        self.remerge()
     }
 
-    /// Rebuilds the merged set and diffs it with the old one.
-    fn remerge(&mut self) -> Change {
-        let mut next = BTreeMap::new();
-        for (_, set) in &self.sources {
-            for (address, e) in set {
-                next.entry(address.clone()).or_insert_with(|| e.clone());
-            }
-        }
+    /// Settles the merged entry of each of `addresses`, the only ones an
+    /// update touched, so an update costs its own size rather than the
+    /// whole set's: the first source (in order) naming an address wins it.
+    fn remerge<'a>(&mut self, addresses: impl IntoIterator<Item = &'a str>) -> Change {
         let mut change = Change::default();
-        for (address, e) in &next {
-            match self.merged.get(address) {
-                None => change.added.push(e.clone()),
-                Some(old) if old != e => change.changed.push(e.clone()),
-                Some(_) => {}
+        for address in addresses {
+            let winner = self.sources.iter().find_map(|(_, set)| set.get(address));
+            match (winner, self.merged.get(address)) {
+                (None, None) => {}
+                (None, Some(_)) => {
+                    self.merged.remove(address);
+                    change.removed.push(address.to_owned());
+                }
+                (Some(e), None) => {
+                    change.added.push(e.clone());
+                    self.merged.insert(address.to_owned(), e.clone());
+                }
+                (Some(e), Some(old)) if old != e => {
+                    change.changed.push(e.clone());
+                    self.merged.insert(address.to_owned(), e.clone());
+                }
+                (Some(_), Some(_)) => {}
             }
         }
-        for address in self.merged.keys() {
-            if !next.contains_key(address) {
-                change.removed.push(address.clone());
-            }
-        }
-        self.merged = next;
         if !change.is_empty() {
             self.version += 1;
         }

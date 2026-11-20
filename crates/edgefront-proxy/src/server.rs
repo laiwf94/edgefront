@@ -184,6 +184,8 @@ pub struct Proxy {
     /// The latest endpoints discovery gave each cluster that has it, read
     /// whenever a runtime is built.
     discovered: Mutex<HashMap<String, Arc<[disc::Endpoint]>>>,
+    /// The merged version each discovering cluster balances on.
+    discovered_versions: Mutex<HashMap<String, u64>>,
 }
 
 /// One loaded configuration, never changed after it is built (steer's
@@ -803,6 +805,7 @@ impl Proxy {
             conn_quota: edgefront_core::listener::ConnQuota::default(),
             gate: None,
             discovered: Mutex::new(HashMap::new()),
+            discovered_versions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1069,6 +1072,10 @@ impl Proxy {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|name, _| wanted.contains_key(name.as_str()));
+        self.discovered_versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|name, _| wanted.contains_key(name.as_str()));
         for (name, cfg) in wanted {
             if running.contains_key(name) {
                 continue;
@@ -1183,6 +1190,10 @@ impl Proxy {
                     .insert(name.to_owned(), found);
                 self.current
                     .send_replace(Arc::new(rt.with_cluster(index, Arc::new(cluster))));
+                self.discovered_versions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.to_owned(), d.published);
                 d.metrics.applied(since.elapsed());
                 tracing::debug!(
                     cluster = name,
@@ -1200,6 +1211,18 @@ impl Proxy {
                 );
             }
         }
+    }
+
+    /// The version of the merged discovered set the cluster named `name`
+    /// balances on: it rises by one for each source update that changed
+    /// the set, so a caller that knows what it sent can tell when a change
+    /// reached the balancer. `None` before discovery first applied a set.
+    pub fn discovery_version(&self, name: &str) -> Option<u64> {
+        self.discovered_versions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .copied()
     }
 
     /// The endpoints discovery last gave the cluster named `name`, ready

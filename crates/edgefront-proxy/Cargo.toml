@@ -42,5 +42,9 @@ harness = false
 name = "balancer"
 harness = false
 
+[[bench]]
+name = "discovery"
+harness = false
+
 [lints]
 workspace = true
