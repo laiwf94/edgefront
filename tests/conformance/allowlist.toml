@@ -1,0 +1,6 @@
+# The http-cache-tests results the binary is expected to give where it does
+# not pass (tests/conformance.rs): one [tests.<id>] per required or optimal
+# test that fails, with the suite's result name and the reason. A listed
+# test that starts passing, or fails another way, fails the conformance job
+# until this file is updated.
+[tests]

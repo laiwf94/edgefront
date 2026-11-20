@@ -1,0 +1,84 @@
+name: conformance
+
+# The http-cache-tests suite against the binary as a shared cache
+# (tests/conformance.rs). The suite is third-party Node code, so it runs
+# only here, on GitHub's runner, checked out at a pinned commit; the run
+# must match tests/conformance/allowlist.toml exactly.
+on:
+  push:
+    # A conformance-* branch runs it without a pull request, to try a fix.
+    branches: [main, "conformance-*"]
+    paths:
+      - "crates/edgefront-cache/**"
+      - "crates/edgefront-core/**"
+      - "src/**"
+      - "tests/conformance.rs"
+      - "tests/conformance/**"
+      - "tests/common/**"
+      - "Cargo.lock"
+      - ".github/workflows/conformance.yml"
+  pull_request:
+    paths:
+      - "crates/edgefront-cache/**"
+      - "crates/edgefront-core/**"
+      - "src/**"
+      - "tests/conformance.rs"
+      - "tests/conformance/**"
+      - "tests/common/**"
+      - "Cargo.lock"
+      - ".github/workflows/conformance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # github.com/http-tests/cache-tests, 17 Nov 2026 ("update fastly"). Moving
+  # it is a change of its own, with the allowlist updated to the new tests.
+  CACHE_TESTS_COMMIT: 3942fbfe1f6d23406e55b4120cde61da98080539
+  # The suite's only runtime dependency, at the version its package.json pins.
+  UNDICI_VERSION: 8.12.3
+
+jobs:
+  http-cache-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.21.0"
+      - name: Check out the suite at the pinned commit
+        run: |
+          mkdir -p target/conformance/cache-tests
+          cd target/conformance/cache-tests
+          git init -q
+          git fetch -q --depth=1 https://github.com/http-tests/cache-tests "$CACHE_TESTS_COMMIT"
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$CACHE_TESTS_COMMIT"
+      # Beside the checkout, not in it, so nothing else from its package.json
+      # is installed; node finds it from the suite's directory upwards.
+      - name: Install undici
+        run: npm install --prefix target/conformance --no-save --no-package-lock --ignore-scripts "undici@$UNDICI_VERSION"
+      - name: Build the binary and the test
+        run: cargo test --locked --test conformance --no-run
+      - name: Run the suite
+        env:
+          CACHE_TESTS_DIR: ${{ github.workspace }}/target/conformance/cache-tests
+          CONFORMANCE_OUT: ${{ github.workspace }}/target/conformance/out
+        run: cargo test --locked --test conformance -- --ignored --nocapture
+      - name: Summary
+        if: always()
+        run: |
+          if [[ -f target/conformance/out/summary.md ]]; then
+            cat target/conformance/out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: http-cache-tests
+          path: target/conformance/out
+          if-no-files-found: ignore
