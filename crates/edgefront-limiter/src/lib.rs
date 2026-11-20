@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cidr;
+pub mod class;
 pub mod clock;
 pub mod config;
 pub mod conn;
