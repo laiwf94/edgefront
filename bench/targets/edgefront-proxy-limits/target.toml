@@ -1,0 +1,21 @@
+# edgefront proxy with HTTP limits (bench/targets/edgefront-proxy-limits/
+# limits.toml) on the same configuration as edgefront-proxy: the limiter
+# track's week 6 target. Compared against edgefront-proxy, the difference
+# is the limiter in the request path.
+product = "edgefront proxy + HTTP limits"
+version = "0.1.0"
+kind = "proxy"
+track = "limiter"
+image = "edgefront-bench/edgefront:local"
+build = { dockerfile = "bench/Dockerfile", stage = "edgefront" }
+port = 8080
+command = ["proxy", "--config", "/etc/edgefront-proxy.json", "--limits", "/etc/edgefront-limits.toml"]
+binary = "/edgefront"
+
+[env]
+EDGEFRONT_LOG = "warn"
+EDGEFRONT_DRAIN_PERIOD = "0s"
+
+[files]
+"/etc/edgefront-proxy.json" = "proxy.json"
+"/etc/edgefront-limits.toml" = "limits.toml"

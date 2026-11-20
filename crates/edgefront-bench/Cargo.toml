@@ -9,6 +9,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+edgefront-core.workspace = true
 edgefront-limiter.workspace = true
 bytes.workspace = true
 http.workspace = true

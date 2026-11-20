@@ -37,5 +37,10 @@ harness = false
 name = "prefix_list"
 harness = false
 
+[[bench]]
+name = "http_layer"
+harness = false
+required-features = ["http"]
+
 [lints]
 workspace = true

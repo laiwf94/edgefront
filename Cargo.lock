@@ -317,6 +317,7 @@ name = "edgefront-bench"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "edgefront-core",
  "edgefront-limiter",
  "http",
  "http-body-util",

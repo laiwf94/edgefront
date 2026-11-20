@@ -41,6 +41,7 @@ pub mod cli;
 pub mod client;
 pub mod gate;
 pub mod histogram;
+pub mod httplimits;
 pub mod l4proxy;
 pub mod limiter;
 pub mod load;

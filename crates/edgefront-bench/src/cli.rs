@@ -39,6 +39,10 @@
 //! edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
 //!     The L4 proxy's bulk, latency and concurrent round trips, direct and
 //!     through each proxy given; prints a Markdown table.
+//! edgefront-bench http-limits --scenario FILE --limits FILE [--host HOST] [--result FILE]... [--json FILE]
+//!     Replays a scenario's requests at their due times through the HTTP
+//!     limits in FILE and prints how many it should admit and refuse,
+//!     beside each run result's 2xx and 4xx counts.
 //! edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
 //!     Memory per tracked client of libpacer's table (through diffdrive)
 //!     and edgefront-limiter's (through edgefront-difftest); prints a
@@ -68,6 +72,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
        edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
        edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
+       edgefront-bench http-limits --scenario FILE --limits FILE [--host HOST] [--result FILE]... [--json FILE]
 ";
 
 /// Why a command failed.
@@ -178,6 +183,7 @@ pub fn run(args: &[String]) -> Result<(), Failure> {
         "load" => load(rest),
         "limiter" => limiter(rest),
         "l4" => l4(rest),
+        "http-limits" => http_limits(rest),
         "memory" => memory(rest),
         "--help" | "help" => {
             print!("{USAGE}");
@@ -611,6 +617,38 @@ fn limiter(args: &[String]) -> Result<(), Failure> {
     };
     print!("{}", report.markdown());
     write_json(flags.one("json")?, &report)
+}
+
+fn http_limits(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(args, &["scenario", "limits", "host", "result", "json"], &[])?;
+    flags.no_positional()?;
+    let path = flags.required("scenario")?;
+    let s = Scenario::load(path).map_err(|e| failed(e.to_string()))?;
+    let limits = flags.required("limits")?;
+    let rules = read_text(limits)?;
+    let host = flags.one("host")?.unwrap_or("origin");
+    let e = crate::httplimits::expected(&s, &rules, host)
+        .map_err(|e| failed(format!("{limits}: {e}")))?;
+    let mut rows = Vec::new();
+    for r in flags.all("result") {
+        let text = read_text(r)?;
+        let result: BenchResult =
+            serde_json::from_str(&text).map_err(|e| failed(format!("{r}: {e}")))?;
+        rows.push(crate::httplimits::compare(&e, &result));
+    }
+    print!("{}", crate::httplimits::markdown(&e, &rows));
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        expected: &'a crate::httplimits::Expected,
+        results: &'a [crate::httplimits::Comparison],
+    }
+    write_json(
+        flags.one("json")?,
+        &Out {
+            expected: &e,
+            results: &rows,
+        },
+    )
 }
 
 fn l4(args: &[String]) -> Result<(), Failure> {

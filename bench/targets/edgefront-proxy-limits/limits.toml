@@ -1,0 +1,11 @@
+# The limiter track's HTTP limits on edgefront proxy: one rule on every
+# request, keyed on the path and the Host header, at 20 a second with a
+# burst of 20, in a table large enough for every path a run sends.
+# header:host is meant: the load generator speaks HTTP/1.1, so every
+# request carries Host (edgefront check flags it as http-key-host-header,
+# because an HTTP/2 client would carry :authority instead).
+[[http_limits]]
+name = "bench"
+rate = "20/s burst 20"
+key = ["path", "header:host"]
+table_size = 1048576

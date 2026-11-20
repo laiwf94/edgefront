@@ -1,0 +1,37 @@
+# Week 6 of the limiter track: HTTP limits keyed on path and header at
+# 50,000 requests per second over 100,000 distinct paths, run with
+# `edgefront-bench run` against edgefront-proxy (no limits) and
+# edgefront-proxy-limits (bench/targets/edgefront-proxy-limits/limits.toml:
+# 20 a second with a burst of 20 per path and Host header). Under a Zipf 1.0
+# law the 200 or so most popular paths go over the limit and are refused;
+# the rest are admitted. `edgefront-bench http-limits` replays the same
+# requests at their scheduled times through the same rules and says how
+# many should have been refused, which the run's 4xx count is held to.
+name = "http-limits"
+description = "100,000 paths under a Zipf 1.0 law at a constant 50,000 requests per second over HTTP/1.1, limited per path and Host header."
+protocol = "http1"
+connections = 256
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 10000
+duration = "5s"
+
+[load]
+rate = 50000
+duration = "30s"
+
+# The proxies cache nothing, so every admitted request reaches the origin;
+# the keys spread the requests over distinct paths, the limiter's keys.
+# The hit ratio only sets how many once-only paths join the 100,000: at
+# 0.94 a run sends 104,973 distinct paths, so the table tracks about
+# 100,000 keys.
+[keys]
+count = 100000
+zipf = 1.0
+hit_ratio = 0.94
+
+[[objects]]
+size = "1KiB"
+weight = 1

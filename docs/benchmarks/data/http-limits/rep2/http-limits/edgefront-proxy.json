@@ -1,0 +1,128 @@
+{
+  "command": "edgefront-bench run --scenario crates/edgefront-bench/scenarios/http_limits.toml --targets edgefront-proxy-limits,edgefront-proxy --out docs/benchmarks/data/http-limits/rep2 --run http-limits-2 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)",
+  "extra": {
+    "binary_bytes": 8198480.0
+  },
+  "machine": {
+    "arch": "aarch64",
+    "cpus": 16,
+    "description": "Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)",
+    "kernel": "6.10.14-linuxkit",
+    "loadgen_cpus": "10-15",
+    "memory_bytes": 8217190400,
+    "origin_cpus": "4-9",
+    "runtime": "docker 28.0.4",
+    "target_cpus": "0-3"
+  },
+  "measured": {
+    "body_bytes": 1536000000,
+    "completed": 1500000,
+    "errors": {
+      "connect": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 0.0,
+    "latency": {
+      "max_ms": 12.191669,
+      "mean_ms": 0.136936411638,
+      "p50_ms": 0.126143,
+      "p90_ms": 0.178687,
+      "p999_ms": 2.619391,
+      "p99_ms": 0.248191
+    },
+    "origin_requests": 1500007,
+    "scheduled": 1500000,
+    "service_latency": {
+      "max_ms": 12.132,
+      "mean_ms": 0.13050551937733332,
+      "p50_ms": 0.120767,
+      "p90_ms": 0.171903,
+      "p999_ms": 1.851391,
+      "p99_ms": 0.236159
+    },
+    "status_classes": [
+      0,
+      1500000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 50000.0
+  },
+  "phases": [
+    {
+      "completed": 50000,
+      "duration_secs": 5.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 1020.392,
+        "mean_ms": 0.94734700504,
+        "p50_ms": 0.114879,
+        "p90_ms": 0.135807,
+        "p999_ms": 70.647807,
+        "p99_ms": 19.103743
+      },
+      "name": "warmup",
+      "rate": 10000.0,
+      "scheduled": 50000,
+      "throughput_rps": 10000.0,
+      "warmup": true
+    },
+    {
+      "completed": 1500000,
+      "duration_secs": 30.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 12.191669,
+        "mean_ms": 0.136936411638,
+        "p50_ms": 0.126143,
+        "p90_ms": 0.178687,
+        "p999_ms": 2.619391,
+        "p99_ms": 0.248191
+      },
+      "name": "load",
+      "rate": 50000.0,
+      "scheduled": 1500000,
+      "throughput_rps": 50000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 2.470986993775735,
+    "cpu_seconds": 74.135195,
+    "cpuset": "0-3",
+    "peak_memory_bytes": 34127872,
+    "peak_rss_bytes": 24858624
+  },
+  "run": "http-limits-2",
+  "scenario": {
+    "connections": 256,
+    "description": "100,000 paths under a Zipf 1.0 law at a constant 50,000 requests per second over HTTP/1.1, limited per path and Host header.",
+    "hit_ratio_target": 0.94,
+    "measured_secs": 30.0,
+    "name": "http-limits",
+    "protocol": "http1",
+    "rate": 50000.0,
+    "seed": 1,
+    "warmup_secs": 5.0,
+    "working_set_bytes": 102400000
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-20T15:38:34Z",
+  "target": {
+    "image_size_bytes": 15084364,
+    "images": [
+      {
+        "id": "sha256:403bb54033462bf17b00eb90579a567e954b40b7831eb3d656db75edb66e52de",
+        "reference": "edgefront-bench/edgefront:local-e8832965550a",
+        "size_bytes": 15084364
+      }
+    ],
+    "kind": "proxy",
+    "name": "edgefront-proxy",
+    "product": "edgefront proxy",
+    "version": "0.1.0"
+  },
+  "track": "proxy"
+}

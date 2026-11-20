@@ -1,0 +1,39 @@
+{
+  "expected": {
+    "scenario": "http-limits",
+    "warmup_requests": 50000,
+    "measured_requests": 1500000,
+    "admitted": 900472,
+    "refused": 599528,
+    "keys": 104973
+  },
+  "results": [
+    {
+      "target": "edgefront-proxy-limits",
+      "completed": 1500000,
+      "admitted": 889741,
+      "refused": 610259,
+      "other": 0,
+      "admitted_error_pct": 1.1917083485105588,
+      "refused_error_pct": 1.789908061007993
+    },
+    {
+      "target": "edgefront-proxy-limits",
+      "completed": 1500000,
+      "admitted": 900475,
+      "refused": 599525,
+      "other": 0,
+      "admitted_error_pct": 0.0003331586101511207,
+      "refused_error_pct": 0.0005003936429991594
+    },
+    {
+      "target": "edgefront-proxy-limits",
+      "completed": 1500000,
+      "admitted": 900475,
+      "refused": 599525,
+      "other": 0,
+      "admitted_error_pct": 0.0003331586101511207,
+      "refused_error_pct": 0.0005003936429991594
+    }
+  ]
+}
