@@ -4,7 +4,10 @@ name: bench
 # measures or is made of changes, to keep GitHub minutes for the rest.
 on:
   push:
-    branches: [main]
+    # A bench-gate-* branch runs only the gate job, against its merge base
+    # with main: how a planted slowdown proves the gate without a pull
+    # request (docs/DESIGN.md, "The regression gate").
+    branches: [main, "bench-gate-*"]
     paths:
       - "crates/**"
       - "src/**"
@@ -43,7 +46,7 @@ env:
 
 jobs:
   harness:
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -90,10 +93,10 @@ jobs:
   # steady enough (committed_models), against those; on any other, against
   # the change's base commit built and run here, interleaved with the
   # candidate: the pull request's base, or for a manual run the branch's
-  # merge base with main (on main itself, the parent). Pull requests and
-  # manual runs only: about ten minutes.
+  # merge base with main (on main itself, the parent). Pull requests,
+  # manual runs and pushes to bench-gate-* branches: about ten minutes.
   gate:
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/heads/bench-gate-')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -192,6 +195,7 @@ jobs:
   # than against numbers from another, is what makes 5% meaningful on a
   # shared runner.
   proxy-p99-gate:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
