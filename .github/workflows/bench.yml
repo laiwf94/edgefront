@@ -11,6 +11,7 @@ on:
       - "bench/**"
       - "Cargo.lock"
       - "examples/bench.sh"
+      - "scripts/check-p99-gate.py"
       - ".github/workflows/bench.yml"
   pull_request:
     paths:
@@ -19,6 +20,7 @@ on:
       - "bench/**"
       - "Cargo.lock"
       - "examples/bench.sh"
+      - "scripts/check-p99-gate.py"
       - ".github/workflows/bench.yml"
   workflow_dispatch:
     inputs:
@@ -163,3 +165,52 @@ jobs:
             target/bench/gate
             target/bench/gate-baseline.json
             target/bench/gate-verdict.json
+
+  # The proxy's p99 regression gate (#86): edgefront proxy at this commit
+  # against itself at the parent commit, on the same runner, in five
+  # alternating repetitions of bench/ci/steer-port-gate.toml. It fails when
+  # the median p99 is more than 5% above the parent's
+  # (scripts/check-p99-gate.py). Comparing two builds on one machine, rather
+  # than against numbers from another, is what makes 5% meaningful on a
+  # shared runner.
+  proxy-p99-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build this commit
+        run: cargo build --release --locked --bin edgefront --bin edgefront-bench
+      - name: Build the parent commit
+        run: |
+          git worktree add "$RUNNER_TEMP/parent" HEAD^
+          cargo build --release --locked --bin edgefront \
+            --manifest-path "$RUNNER_TEMP/parent/Cargo.toml" --target-dir target/parent
+      # The runner takes edgefront-bench/edgefront:local, so each side is
+      # tagged :local in turn before its run.
+      - name: Build the images
+        run: |
+          mkdir -p target/bench-images target/parent-images
+          cp target/release/edgefront target/release/edgefront-bench target/bench-images/
+          cp target/parent/release/edgefront target/release/edgefront-bench target/parent-images/
+          docker build -f bench/Dockerfile.prebuilt --target harness -t edgefront-bench/harness:local target/bench-images
+          docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:this target/bench-images
+          docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:parent target/parent-images
+      - name: Five alternating repetitions
+        run: |
+          side() {
+            docker tag "edgefront-bench/edgefront:$1" edgefront-bench/edgefront:local
+            target/release/edgefront-bench run --scenario bench/ci/steer-port-gate.toml \
+              --targets edgefront-proxy --target-cpus 1 \
+              --out "target/bench-gate/run$2/$1" --run "gate$2-$1"
+          }
+          for i in 1 2 3 4 5; do
+            if (( i % 2 )); then side parent "$i"; side this "$i"; else side this "$i"; side parent "$i"; fi
+          done
+      - name: Median p99 within 5% of the parent's
+        run: |
+          set -o pipefail
+          scripts/check-p99-gate.py 0.05 target/bench-gate/run* | tee -a "$GITHUB_STEP_SUMMARY"

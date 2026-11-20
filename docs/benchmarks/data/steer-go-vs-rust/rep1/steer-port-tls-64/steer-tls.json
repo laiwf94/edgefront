@@ -1,0 +1,129 @@
+{
+  "command": "edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep1 --run steer-port-1 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)",
+  "extra": {
+    "binary_bytes": 7602336.0
+  },
+  "machine": {
+    "arch": "aarch64",
+    "cpus": 16,
+    "description": "Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)",
+    "kernel": "6.10.14-linuxkit",
+    "loadgen_cpus": "10-15",
+    "memory_bytes": 8217190400,
+    "origin_cpus": "4-9",
+    "runtime": "docker 28.0.4",
+    "target_cpus": "0-3"
+  },
+  "measured": {
+    "body_bytes": 614400000,
+    "completed": 600000,
+    "errors": {
+      "connect": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 0.0,
+    "latency": {
+      "max_ms": 77.808296,
+      "mean_ms": 0.6662255570566668,
+      "p50_ms": 0.153727,
+      "p90_ms": 0.898047,
+      "p999_ms": 64.684031,
+      "p99_ms": 7.786495
+    },
+    "origin_requests": 600000,
+    "scheduled": 600000,
+    "service_latency": {
+      "max_ms": 25.346709,
+      "mean_ms": 0.351739736935,
+      "p50_ms": 0.149375,
+      "p90_ms": 0.793087,
+      "p999_ms": 9.584639,
+      "p99_ms": 3.188735
+    },
+    "status_classes": [
+      0,
+      600000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 20000.0
+  },
+  "phases": [
+    {
+      "completed": 50000,
+      "duration_secs": 5.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 45.679209,
+        "mean_ms": 0.3781682388,
+        "p50_ms": 0.176255,
+        "p90_ms": 0.464383,
+        "p999_ms": 15.654911,
+        "p99_ms": 4.177919
+      },
+      "name": "warmup",
+      "rate": 10000.0,
+      "scheduled": 50000,
+      "throughput_rps": 10000.0,
+      "warmup": true
+    },
+    {
+      "completed": 600000,
+      "duration_secs": 30.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 77.808296,
+        "mean_ms": 0.6662255570566668,
+        "p50_ms": 0.153727,
+        "p90_ms": 0.898047,
+        "p999_ms": 64.684031,
+        "p99_ms": 7.786495
+      },
+      "name": "load",
+      "rate": 20000.0,
+      "scheduled": 600000,
+      "throughput_rps": 20000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 1.386644463892855,
+    "cpu_seconds": 41.600259,
+    "cpuset": "0-3",
+    "peak_memory_bytes": 25804800,
+    "peak_rss_bytes": 18677760
+  },
+  "run": "steer-port-1",
+  "scenario": {
+    "connections": 64,
+    "description": "HTTP/1.1 over TLS 1.3 to the origin through the proxy over 64 connections, 20,000 requests per second of 1 KiB objects.",
+    "hit_ratio_target": 0.9,
+    "measured_secs": 30.0,
+    "name": "steer-port-tls-64",
+    "protocol": "http1",
+    "rate": 20000.0,
+    "seed": 1,
+    "tls_server_name": "api.example.com",
+    "warmup_secs": 5.0,
+    "working_set_bytes": 1024000
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-19T23:43:59Z",
+  "target": {
+    "image_size_bytes": 14115950,
+    "images": [
+      {
+        "id": "sha256:8cfb6e4834317eb73c821263d795c0cdcd417900e1d9cdcab4d45dfea0afea2f",
+        "reference": "edgefront-bench/steer:local-a9c2022b04a2",
+        "size_bytes": 14115950
+      }
+    ],
+    "kind": "proxy",
+    "name": "steer-tls",
+    "product": "steer",
+    "version": "0.1.0"
+  },
+  "track": "proxy"
+}

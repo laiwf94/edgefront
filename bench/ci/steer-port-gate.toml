@@ -1,0 +1,27 @@
+# The proxy p99 regression gate's load (.github/workflows/bench.yml, job
+# proxy-p99-gate): cleartext HTTP/1.1 through edgefront proxy at a rate a
+# 4-vCPU runner sustains with room to spare, so the p99 is the proxy's and
+# not a queue's.
+name = "steer-port-gate"
+description = "Cleartext HTTP/1.1 through the proxy over 64 connections, 5,000 requests per second of 1 KiB objects for 15 seconds."
+protocol = "http1"
+connections = 64
+timeout = "5s"
+seed = 1
+
+[warmup]
+rate = 2500
+duration = "3s"
+
+[load]
+rate = 5000
+duration = "15s"
+
+# The proxy caches nothing, so every request reaches the origin.
+[keys]
+count = 1000
+zipf = 1.0
+hit_ratio = 0.9
+
+[[objects]]
+size = "1KiB"

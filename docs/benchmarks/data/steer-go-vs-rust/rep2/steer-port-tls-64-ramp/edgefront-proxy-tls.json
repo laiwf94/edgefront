@@ -1,0 +1,219 @@
+{
+  "command": "edgefront-bench run --scenario bench/scenarios/steer-port/tls-1.toml --scenario bench/scenarios/steer-port/tls-10000.toml --scenario bench/scenarios/steer-port/tls-64-ramp.toml --scenario bench/scenarios/steer-port/tls-64.toml --targets steer-tls,edgefront-proxy-tls --out target/bench/steer-port/rep2 --run steer-port-2 --machine Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)",
+  "extra": {
+    "binary_bytes": 8198480.0
+  },
+  "machine": {
+    "arch": "aarch64",
+    "cpus": 16,
+    "description": "Apple Mac, 16-core arm64, Docker Desktop 28 (Linux VM, 16 CPUs, 7.6 GiB)",
+    "kernel": "6.10.14-linuxkit",
+    "loadgen_cpus": "10-15",
+    "memory_bytes": 8217190400,
+    "origin_cpus": "4-9",
+    "runtime": "docker 28.0.4",
+    "target_cpus": "0-3"
+  },
+  "measured": {
+    "body_bytes": 4300800000,
+    "completed": 4200000,
+    "errors": {
+      "connect": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 3.809523809517046e-6,
+    "latency": {
+      "max_ms": 957.662445,
+      "mean_ms": 153.97226735557786,
+      "p50_ms": 0.291583,
+      "p90_ms": 834.666495,
+      "p999_ms": 954.204159,
+      "p99_ms": 946.339839
+    },
+    "origin_requests": 4199984,
+    "scheduled": 4200000,
+    "service_latency": {
+      "max_ms": 24.491,
+      "mean_ms": 0.3713720720183334,
+      "p50_ms": 0.258815,
+      "p90_ms": 0.711167,
+      "p999_ms": 4.214783,
+      "p99_ms": 1.436671
+    },
+    "status_classes": [
+      0,
+      4200000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 70000.0
+  },
+  "phases": [
+    {
+      "completed": 50000,
+      "duration_secs": 5.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 37.270125,
+        "mean_ms": 0.4147728215,
+        "p50_ms": 0.134015,
+        "p90_ms": 0.226047,
+        "p999_ms": 26.345471,
+        "p99_ms": 9.527295
+      },
+      "name": "warmup",
+      "rate": 10000.0,
+      "scheduled": 50000,
+      "throughput_rps": 10000.0,
+      "warmup": true
+    },
+    {
+      "completed": 200000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 12.672585,
+        "mean_ms": 0.23112035153,
+        "p50_ms": 0.154111,
+        "p90_ms": 0.251135,
+        "p999_ms": 8.454143,
+        "p99_ms": 2.473983
+      },
+      "name": "step-1",
+      "rate": 20000.0,
+      "scheduled": 200000,
+      "throughput_rps": 20000.0,
+      "warmup": false
+    },
+    {
+      "completed": 400000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 20.371635,
+        "mean_ms": 0.32258761456999996,
+        "p50_ms": 0.144255,
+        "p90_ms": 0.265471,
+        "p999_ms": 12.328959,
+        "p99_ms": 5.640191
+      },
+      "name": "step-2",
+      "rate": 40000.0,
+      "scheduled": 400000,
+      "throughput_rps": 40000.0,
+      "warmup": false
+    },
+    {
+      "completed": 600000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 8.80793,
+        "mean_ms": 0.3391396238516667,
+        "p50_ms": 0.166783,
+        "p90_ms": 0.522751,
+        "p999_ms": 5.656575,
+        "p99_ms": 3.719167
+      },
+      "name": "step-3",
+      "rate": 60000.0,
+      "scheduled": 600000,
+      "throughput_rps": 60000.0,
+      "warmup": false
+    },
+    {
+      "completed": 800000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 196.957518,
+        "mean_ms": 9.95935747883,
+        "p50_ms": 0.197503,
+        "p90_ms": 18.808831,
+        "p999_ms": 194.379775,
+        "p99_ms": 178.520063
+      },
+      "name": "step-4",
+      "rate": 80000.0,
+      "scheduled": 800000,
+      "throughput_rps": 80000.0,
+      "warmup": false
+    },
+    {
+      "completed": 1000000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 156.618188,
+        "mean_ms": 15.998553409387,
+        "p50_ms": 0.307711,
+        "p90_ms": 82.771967,
+        "p999_ms": 155.058175,
+        "p99_ms": 150.863871
+      },
+      "name": "step-5",
+      "rate": 100000.0,
+      "scheduled": 1000000,
+      "throughput_rps": 100000.0,
+      "warmup": false
+    },
+    {
+      "completed": 1200000,
+      "duration_secs": 10.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 957.662445,
+        "mean_ms": 518.6156171754425,
+        "p50_ms": 461.111295,
+        "p90_ms": 941.621247,
+        "p999_ms": 956.825599,
+        "p99_ms": 951.582719
+      },
+      "name": "step-6",
+      "rate": 120000.0,
+      "scheduled": 1200000,
+      "throughput_rps": 120000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 2.7595096055071595,
+    "cpu_seconds": 168.163733,
+    "cpuset": "0-3",
+    "peak_memory_bytes": 15798272,
+    "peak_rss_bytes": 13017088
+  },
+  "run": "steer-port-2",
+  "scenario": {
+    "connections": 64,
+    "description": "HTTP/1.1 over TLS 1.3 to the origin through the proxy over 64 connections, from 20,000 to 120,000 requests per second in six 10-second steps.",
+    "hit_ratio_target": 0.9,
+    "measured_secs": 60.0,
+    "name": "steer-port-tls-64-ramp",
+    "protocol": "http1",
+    "rate": 70000.0,
+    "seed": 1,
+    "tls_server_name": "api.example.com",
+    "warmup_secs": 5.0,
+    "working_set_bytes": 1024000
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-19T23:54:50Z",
+  "target": {
+    "image_size_bytes": 14306962,
+    "images": [
+      {
+        "id": "sha256:6043d394eb7820b693d74ad302a16a72fa3118a5aed50c579644a25d7c8b4cc2",
+        "reference": "edgefront-bench/edgefront:local-a9c2022b04a2",
+        "size_bytes": 14306962
+      }
+    ],
+    "kind": "proxy",
+    "name": "edgefront-proxy-tls",
+    "product": "edgefront proxy",
+    "version": "0.1.0"
+  },
+  "track": "proxy"
+}
