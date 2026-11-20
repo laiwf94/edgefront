@@ -45,6 +45,8 @@ hmac = "=0.13.0"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"
+# Async DNS for service discovery (A, AAAA and SRV with their TTLs).
+hickory-resolver = "=0.26.3"
 hyper = { version = "=1.12.0", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "http2", "tokio"] }
 # TLS with ring as the one crypto provider: aws-lc-rs, rustls's default,
@@ -64,6 +66,9 @@ tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "net", "
 
 # Development only.
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+# DNS messages for the discovery tests' local DNS server; hickory-resolver
+# already depends on it.
+hickory-proto = "=0.26.3"
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 # gRPC test services and clients for the proxy's gRPC tests, with a raw
 # bytes codec instead of prost and generated code.

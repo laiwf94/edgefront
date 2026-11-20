@@ -28,7 +28,7 @@ cov:
 # The supply-chain gate: cargo deny's policy on the workspace and on each fuzz
 # crate's own lockfile, RustSec on every lockfile, and the direct dependency
 # budget (exact pins, at most DIRECT_DEPS runtime crates).
-DIRECT_DEPS ?= 18
+DIRECT_DEPS ?= 19
 audit:
 	cargo deny check
 	for d in $(FUZZ_DIRS); do cargo deny --manifest-path $$d/Cargo.toml check || exit 1; done
@@ -61,7 +61,7 @@ TSAN_CRATES := cachet edgefront-cache edgefront-core edgefront-limiter edgefront
 TSAN_TESTS_cachet := proxy revalidation failure cluster
 TSAN_TESTS_edgefront-core := listener admin client l4 tls ocsp client_auth h2 h2_pool
 TSAN_TESTS_edgefront-cache := layer proxy_layer
-TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier filters retry resilience operate lifecycle upstream_tls protocol grpc discovery_file
+TSAN_TESTS_edgefront-proxy := server health fakeupstream outlier filters retry resilience operate lifecycle upstream_tls protocol grpc discovery_file discovery_dns
 
 define tsan_crate
 .PHONY: tsan-$(1)

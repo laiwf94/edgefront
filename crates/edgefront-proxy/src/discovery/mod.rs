@@ -32,6 +32,7 @@
 //!    [`UpdateKind::Remove`] changes one source's set; one for a source
 //!    that has not yet sent a full set starts it from empty.
 
+pub mod dns;
 pub mod file;
 
 use std::collections::{BTreeMap, HashMap};
