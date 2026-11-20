@@ -262,6 +262,7 @@ raw_struct!(RawHttp2, "an object" {
     max_frame_size: Option<i64>,
     max_header_list_size: Option<i64>,
     cleartext: bool,
+    adaptive_window: bool,
 });
 
 raw_struct!(RawAcme, "an object" {

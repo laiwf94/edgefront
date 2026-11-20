@@ -7,8 +7,10 @@
 //! the connection is served by the same [`Handler`](crate::listener::Handler)
 //! as HTTP/1.1, one request per stream.
 
+pub mod flow;
 pub mod pool;
 pub mod server;
 
+pub use flow::Flow;
 pub use pool::{Pool, PoolBody, PoolError, PoolLimits};
 pub use server::{ALPN_H2, PREFACE, Settings};

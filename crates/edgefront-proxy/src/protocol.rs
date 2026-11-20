@@ -25,7 +25,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use edgefront_core::body::Body;
+use edgefront_core::body::{Body, BoxError};
 use edgefront_core::config::UpstreamProtocol;
 use edgefront_core::h2::{Pool, PoolBody, PoolError, PoolLimits, Settings};
 use edgefront_core::http1::{Client, ClientError, ClientLimits, TlsTo};
@@ -44,14 +44,16 @@ pub enum ResponseBody {
 
 impl HttpBody for ResponseBody {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = BoxError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         match self.get_mut() {
-            ResponseBody::Http1(b) => Pin::new(b).poll_frame(cx),
+            ResponseBody::Http1(b) => Pin::new(b)
+                .poll_frame(cx)
+                .map(|f| f.map(|r| r.map_err(BoxError::from))),
             ResponseBody::Http2(b) => Pin::new(b).poll_frame(cx),
         }
     }
@@ -111,7 +113,12 @@ impl Upstream {
             idle_timeout: limits.pool_idle_timeout,
             ..PoolLimits::default()
         };
-        let settings = Settings::default();
+        // Origins sit at any distance, so upstream windows follow the
+        // measured bandwidth-delay product.
+        let settings = Settings {
+            adaptive_window: true,
+            ..Settings::default()
+        };
         let http2 = match (protocol, tls) {
             (UpstreamProtocol::Http1, _) => None,
             (UpstreamProtocol::Http2, None) | (UpstreamProtocol::Auto, None) => {

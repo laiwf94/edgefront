@@ -273,6 +273,7 @@ async fn the_configured_settings_are_advertised() {
         max_frame_size: 32_768,
         max_header_list_size: 8_192,
         cleartext: true,
+        adaptive_window: false,
     });
     let server = Server::plain("127.0.0.1:0", limits(Some(configured))).await;
     let mut tcp = TcpStream::connect(server.addr).await.unwrap();

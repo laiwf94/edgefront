@@ -146,6 +146,9 @@ pub struct Http2 {
     /// Also accept HTTP/2 with prior knowledge (h2c, RFC 9113 section
     /// 3.3) on a cleartext listener.
     pub cleartext: bool,
+    /// Grow the receive windows to the measured bandwidth-delay product,
+    /// from 65,535 bytes up to 16 MiB, instead of the two windows above.
+    pub adaptive_window: bool,
 }
 
 impl Default for Http2 {
@@ -157,6 +160,7 @@ impl Default for Http2 {
             max_frame_size: defaults::H2_MAX_FRAME_SIZE,
             max_header_list_size: defaults::H2_MAX_HEADER_LIST_SIZE,
             cleartext: false,
+            adaptive_window: false,
         }
     }
 }

@@ -38,6 +38,9 @@ pub struct Settings {
     pub max_header_list_size: u32,
     /// Accept prior-knowledge HTTP/2 on a cleartext listener.
     pub cleartext: bool,
+    /// Grow the receive windows to the measured bandwidth-delay product
+    /// instead of keeping the configured ones ([`super::flow`]).
+    pub adaptive_window: bool,
 }
 
 impl Default for Settings {
@@ -55,21 +58,34 @@ impl From<&Http2> for Settings {
             max_frame_size: h.max_frame_size,
             max_header_list_size: h.max_header_list_size,
             cleartext: h.cleartext,
+            adaptive_window: h.adaptive_window,
         }
     }
 }
 
 impl Settings {
-    /// The hyper builder for a server connection with these settings. The
-    /// windows are fixed: hyper's own adaptive window is off, so the
-    /// configured sizes are what a client sees.
+    /// How the windows are sized.
+    pub fn flow(&self) -> super::Flow {
+        if self.adaptive_window {
+            super::Flow::Adaptive
+        } else {
+            super::Flow::Fixed {
+                stream: self.initial_stream_window,
+                connection: self.initial_connection_window,
+            }
+        }
+    }
+
+    /// The hyper builder for a server connection with these settings,
+    /// with windows as [`flow`](Self::flow) says.
     pub fn builder(&self) -> http2::Builder<TokioExecutor> {
+        let (adaptive, stream, connection) = self.flow().hyper();
         let mut b = http2::Builder::new(TokioExecutor::new());
         b.timer(TokioTimer::new())
-            .adaptive_window(false)
+            .initial_stream_window_size(stream)
+            .initial_connection_window_size(connection)
+            .adaptive_window(adaptive)
             .max_concurrent_streams(self.max_concurrent_streams)
-            .initial_stream_window_size(self.initial_stream_window)
-            .initial_connection_window_size(self.initial_connection_window)
             .max_frame_size(self.max_frame_size)
             .max_header_list_size(self.max_header_list_size)
             // Enough to keep a full stream window in flight per stream
@@ -187,7 +203,14 @@ mod tests {
         assert_eq!(s.max_frame_size, 16_384);
         assert_eq!(s.max_header_list_size, 65_536);
         assert!(!s.cleartext);
+        assert!(!s.adaptive_window);
         let _ = s.builder();
+        let adaptive = Settings {
+            adaptive_window: true,
+            ..s
+        };
+        assert_eq!(adaptive.flow(), super::super::Flow::Adaptive);
+        let _ = adaptive.builder();
     }
 
     async fn sniff(input: &[u8]) -> (bool, Vec<u8>, Vec<u8>) {

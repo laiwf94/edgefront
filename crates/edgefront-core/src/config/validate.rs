@@ -444,6 +444,7 @@ impl Validator {
                 limits::H2_MAX_HEADER_LIST_SIZE,
             ),
             cleartext: raw.cleartext,
+            adaptive_window: raw.adaptive_window,
         };
         if h.initial_connection_window < h.initial_stream_window {
             self.add(
