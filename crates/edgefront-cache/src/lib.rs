@@ -12,6 +12,7 @@ pub mod cache_control;
 pub mod cluster;
 pub mod collapse;
 pub mod config;
+pub mod encoding;
 pub mod fill;
 pub mod headers;
 pub mod layer;

@@ -1,0 +1,2 @@
+br;q=1.0, gzip;q=0.5
+*;q=0, identity

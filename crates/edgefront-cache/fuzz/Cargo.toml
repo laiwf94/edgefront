@@ -64,3 +64,10 @@ path = "fuzz_targets/purge_messages.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "accept_encoding"
+path = "fuzz_targets/accept_encoding.rs"
+test = false
+doc = false
+bench = false
