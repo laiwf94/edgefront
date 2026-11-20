@@ -131,7 +131,13 @@ async fn text(resp: Response<edgefront_core::h2::PoolBody>) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_connection_carries_100_concurrent_streams() {
-    let handler = Counting::new(Duration::from_millis(200));
+    // Every request waits until all 100 are in flight at once. A fixed
+    // hold proved nothing under ThreadSanitizer, where sending 100 requests
+    // took longer than the hold and the first ones finished before the last
+    // ones started (a peak of 94 on CI). If the pool could not carry 100
+    // streams at once the requests would wait forever, so the wait is
+    // bounded and reported instead.
+    let handler = Counting::gated(Duration::from_millis(1), 100);
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 1000).await;
     let pool: Pool<Full<Bytes>> = Pool::new(pool_limits(), Settings::default());
     let mut tasks = Vec::new();
@@ -144,7 +150,15 @@ async fn one_connection_carries_100_concurrent_streams() {
         }));
     }
     for (i, t) in tasks.into_iter().enumerate() {
-        assert_eq!(t.await.unwrap(), format!("HTTP/2.0 /{i}"));
+        let body = tokio::time::timeout(Duration::from_secs(60), t)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of 100 requests were ever in flight at once",
+                    handler.peak.load(Ordering::SeqCst)
+                )
+            });
+        assert_eq!(body.unwrap(), format!("HTTP/2.0 /{i}"));
     }
     assert_eq!(handler.connections(), 1, "one upstream connection");
     assert_eq!(handler.peak.load(Ordering::SeqCst), 100, "all 100 at once");
@@ -187,7 +201,9 @@ async fn ten_thousand_streams_use_under_four_connections() {
 
 #[tokio::test]
 async fn the_stream_cap_opens_more_connections_up_to_the_limit() {
-    let handler = Counting::new(Duration::from_millis(200));
+    // All 25 requests are held until they are in flight together, so they
+    // need three connections of 10 streams whatever the machine's speed.
+    let handler = Counting::gated(Duration::from_millis(1), 25);
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 1000).await;
     let limits = PoolLimits {
         max_connections: 3,
@@ -204,10 +220,17 @@ async fn the_stream_cap_opens_more_connections_up_to_the_limit() {
                 .unwrap()
                 .status()
         }));
-        tokio::time::sleep(Duration::from_millis(2)).await;
     }
     for t in tasks {
-        assert_eq!(t.await.unwrap(), 200);
+        let status = tokio::time::timeout(Duration::from_secs(60), t)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} of 25 requests were ever in flight at once",
+                    handler.peak.load(Ordering::SeqCst)
+                )
+            });
+        assert_eq!(status.unwrap(), 200);
     }
     assert_eq!(handler.connections(), 3);
     assert_eq!(pool.connections(&addr.to_string()), 3);
