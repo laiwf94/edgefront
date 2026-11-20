@@ -120,6 +120,18 @@ The failover drill keeps its 100.00% table over HTTPS with mutual TLS.
 
 `/metrics` adds `edgefront_acme_certificate_expiry_seconds` and `edgefront_acme_renewals_total{result}`. A failed renewal is retried with backoff from 5 minutes to 6 hours. `crates/edgefront-core/tests/acme.rs` and `crates/edgefront/tests/e2e_acme_mtls.rs` issue against Pebble in Docker. The end-to-end test issues the proxy's certificate over TLS-ALPN-01, and then a client that trusts only Pebble's root and presents a certificate reaches a mutual-TLS upstream through it.
 
+### Migrating from steer
+
+steer is fully ported, and `legacy/steer` is deleted. Its history stays reachable: `git log -- legacy/steer` lists every commit that touched it in this repository, and `git log c57a076^2` lists its own 23 commits from before the merge. `make steer-src` extracts it at its last commit. To move a steer deployment to `edgefront proxy`:
+
+- **The configuration file is unchanged.** steer's JSON loads as it is, and TOML with the same schema works too. `edgefront proxy --check-config <file>` checks it, certificates included. steer's examples are in `examples/steer/`.
+- **Rename the environment variables** from `STEER_` to `EDGEFRONT_`: `EDGEFRONT_ADMIN_TOKEN`, `EDGEFRONT_DRAIN_PERIOD`, `EDGEFRONT_SHUTDOWN_TIMEOUT`, and `EDGEFRONT_LOG` instead of `STEER_LOG_LEVEL`. The configuration path is `--config <file>` instead of `STEER_CONFIG`.
+- **The admin API, `/metrics`, the request log and SIGHUP and SIGTERM handling are steer's**, and the metric names and labels are unchanged, so dashboards and alerts keep working.
+- **TLS differs in two places, both because rustls lacks the feature.** The four AES-CBC suites of `cipher_policy: "compatible"` are not offered: they are dropped with a warning each, and a `cipher_suites` list of only CBC suites is refused. A client whose ALPN list lacks `http/1.1` gets `no_application_protocol` instead of a connection without ALPN.
+- **What steer did not have:** OCSP stapling, session tickets that survive reloads, client certificates, TLS to upstreams, and ACME (see [TLS](#tls)).
+
+[docs/benchmarks/steer-go-vs-rust.md](docs/benchmarks/steer-go-vs-rust.md) compares the two on the shared harness. At 10,000 connections edgefront's peak RSS is 220.9 MiB against steer's 337.5 MiB in cleartext, and 309.3 against 495.3 MiB over TLS. Both carry every request at the same rates and medians. edgefront uses 4 to 19% more CPU at 20,000 requests per second, and its binary is 7.8 MiB against steer's 7.3 MiB stripped. The bench workflow's `proxy-p99-gate` fails a change that raises edgefront proxy's p99 by more than 5% against its parent commit.
+
 ## Limiter (port of pacer)
 
 `edgefront-limiter` holds libpacer's algorithms, ported to safe Rust, and pacerd's config. Its only dependency is serde, for the config:
