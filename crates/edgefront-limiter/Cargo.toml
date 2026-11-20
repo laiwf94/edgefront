@@ -19,5 +19,9 @@ toml = { workspace = true, features = ["display"] }
 name = "decisions"
 harness = false
 
+[[bench]]
+name = "prefix_list"
+harness = false
+
 [lints]
 workspace = true
