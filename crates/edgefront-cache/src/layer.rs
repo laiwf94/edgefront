@@ -511,6 +511,11 @@ impl Shared {
         detail: &str,
         outcome: Outcome,
     ) -> Response<Body> {
+        // Planted slowdown for proving the benchmark gate (#87): never merged.
+        let spin = std::time::Instant::now();
+        while spin.elapsed() < std::time::Duration::from_micros(3) {
+            std::hint::spin_loop();
+        }
         let now = self.clock.now();
         let mut resp = respond::from_cache(obj, method, req, now);
         let status = format!("hit; ttl={}{detail}", obj.freshness.ttl_secs(now));
