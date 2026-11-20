@@ -17,7 +17,12 @@
 //! same file may set `[connection_quota]` (requests and bytes per client
 //! connection, closed with `Connection: close` or GOAWAY) and
 //! `[overload]` (limits scaled down while the host's pressure stall
-//! information shows CPU or memory pressure; Linux only).
+//! information shows CPU or memory pressure; Linux only) and
+//! `[recording]` (every decision written for `edgefront ctl limits
+//! replay`). The file is watched: a change that only moves rules between
+//! `enforce`, `shadow` and `off` is applied in place within a second,
+//! keeping every counter, and any other change is logged and waits for a
+//! restart.
 //!
 //! Exit codes follow the rest of the binary: 0 on success, 2 for bad usage,
 //! an unreadable or invalid file or bad settings, 1 when the proxy cannot
@@ -85,6 +90,7 @@ fn check(path: &str) -> Result<(), String> {
 pub struct Extras {
     pub conn_quota: Option<edgefront_core::listener::ConnQuota>,
     pub overload: Option<edgefront_limiter::overload::OverloadConfig>,
+    pub recording: Option<edgefront_limiter::record::RecordConfig>,
 }
 
 /// The `[connection_quota]` and `[overload]` sections of `path`.
@@ -94,7 +100,17 @@ pub fn extras(path: &str) -> Result<Extras, String> {
         toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
     let o: edgefront_limiter::overload::OverloadSection =
         toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    let r: edgefront_limiter::record::RecordSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    let base = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
     Ok(Extras {
+        recording: r
+            .recording
+            .map(|c| c.build(base))
+            .transpose()
+            .map_err(|e| format!("{path}: {e}"))?,
         conn_quota: q
             .connection_quota
             .map(|c| c.build())
@@ -147,14 +163,74 @@ fn watch_pressure(overload: Arc<edgefront_limiter::overload::Overload>) {
     });
 }
 
-/// The HTTP limits in `path`, built and attached to `routes` routes.
+/// Watches the limits file at `path` once a second and, when it
+/// changes, applies its rules' modes to `limiter` in place, so a rule
+/// promoted from shadow to enforce keeps every counter. A change to
+/// anything but modes is logged and left for a restart.
+fn watch_modes(path: String, limiter: Arc<HttpLimiter>) {
+    let modified = |p: &str| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut last = modified(&path);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let now = modified(&path);
+            if now == last {
+                continue;
+            }
+            last = now;
+            let rules = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| toml::from_str::<HttpLimitsSection>(&t).map_err(|e| e.to_string()))
+                .and_then(|s| http_limits::build(&s.http_limits));
+            match rules.and_then(|r| limiter.apply_modes(&r)) {
+                Ok(changed) => {
+                    for (rule, mode) in changed {
+                        tracing::warn!(rule = %rule, mode = mode.name(), "http limit mode changed");
+                    }
+                }
+                Err(e) => tracing::error!(file = %path, error = %e, "http limits not applied"),
+            }
+        }
+    });
+}
+
+/// Flushes `recorder` to its files once a second.
+fn flush_recordings(recorder: Arc<edgefront_limiter::record::Recorder>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let r = Arc::clone(&recorder);
+            match tokio::task::spawn_blocking(move || r.flush()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::error!(error = %e, "recording not written"),
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// The HTTP limits in `path`, built and attached to `routes` routes,
+/// recording into `recording` when it is set.
 pub fn limits(path: &str, routes: usize) -> Result<(Arc<HttpLimiter>, RouteFilters), String> {
+    limits_recorded(path, routes, None)
+}
+
+fn limits_recorded(
+    path: &str,
+    routes: usize,
+    recording: Option<&edgefront_limiter::record::RecordConfig>,
+) -> Result<(Arc<HttpLimiter>, RouteFilters), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let section: HttpLimitsSection =
         toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
     let rules = http_limits::build(&section.http_limits).map_err(|e| format!("{path}: {e}"))?;
-    let limiter = HttpLimiter::new(rules, Arc::new(MonotonicClock::new()))
+    let mut limiter = HttpLimiter::new(rules, Arc::new(MonotonicClock::new()))
         .map_err(|e| format!("{path}: {e}"))?;
+    if let Some(cfg) = recording {
+        let rec = edgefront_limiter::record::Recorder::new(cfg.clone(), limiter.rule_names())
+            .map_err(|e| format!("{path}: recording in {}: {e}", cfg.dir.display()))?;
+        limiter = limiter.with_recorder(Arc::new(rec));
+    }
     let limiter = Arc::new(limiter);
     let filters = limiter
         .route_filters(routes)
@@ -235,9 +311,19 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     runtime.block_on(async {
         let mut proxy = Proxy::new(&loaded.config);
+        let mut recorder: Option<Arc<edgefront_limiter::record::Recorder>> = None;
         if let Some(lp) = limits_path {
-            match limits(lp, loaded.config.routes.len()).and_then(|l| Ok((l, extras(lp)?))) {
+            let built = extras(lp).and_then(|x| {
+                let l = limits_recorded(lp, loaded.config.routes.len(), x.recording.as_ref())?;
+                Ok((l, x))
+            });
+            match built {
                 Ok(((limiter, filters), extras)) => {
+                    watch_modes(lp.to_owned(), Arc::clone(&limiter));
+                    if let Some(rec) = limiter.recorder() {
+                        flush_recordings(Arc::clone(rec));
+                        recorder = Some(Arc::clone(rec));
+                    }
                     if let Some(q) = extras.conn_quota {
                         proxy = proxy.with_conn_quota(q);
                     }
@@ -270,6 +356,12 @@ pub fn run(args: &[String]) -> ExitCode {
             |_| {},
         )
         .await;
+        // What was recorded since the last flush is written before exit.
+        if let Some(rec) = recorder
+            && let Err(e) = rec.flush()
+        {
+            tracing::error!(error = %e, "recording not written");
+        }
         match served {
             Ok(_) => ExitCode::SUCCESS,
             Err(e) => {
