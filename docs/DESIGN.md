@@ -204,7 +204,7 @@ A refused handshake is a connect error, which steer's retry rules always retry. 
 - a CA down at renewal time, retried after about 5, 10 and 20 minutes before it recovers;
 - the configuration rules.
 
-The tests need Docker.
+The tests need Docker. `crates/edgefront/tests/e2e_acme_mtls.rs` runs the whole path against the binary. The proxy starts with no certificate, gets one from Pebble over TLS-ALPN-01 on its own listener, and requires client certificates (checked after the handshake, so Pebble's validation completes). A client that trusts only Pebble's root and presents the fixture client certificate then reaches an upstream that requires the proxy's own client certificate. The upstream answers with the proxy's SPIFFE ID and the forwarded one of the client. The test also checks the state files at 0600, the refused client without a certificate, and the ACME series on `/metrics`.
 
 ### The failover drill
 

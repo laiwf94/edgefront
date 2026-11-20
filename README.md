@@ -76,7 +76,49 @@ SIGHUP reloads like `POST /reload`. A reload keeps each endpoint's health, eject
 
 Each phase sends 2,000 requests. With the features on, edgefront keeps every request through every fault, as steer did in its published table, and ends in the same state: both primaries out by health check, primary-b ejected twice, the backup taking 100% of the load. Phase 4's tail is the 250 ms per-try timeout moving a request off the blackholed primary before health checks take it out. With them off, the faults reach the client in the same proportions. edgefront's median is about 0.6 ms above steer's at this rate. `crates/edgefront/tests/e2e_port_failover.rs` runs the same drill in process under `make test` and asserts the success rates, the tails and the end state, and CI's `failover-drill` job runs both scripts, each checked by `scripts/check-failover.sh`. `CHECK=1 examples/failover.sh` does the same locally.
 
-With a `tls` block the proxy listener terminates TLS as steer's did: certificates chosen by exact or wildcard SNI, with the first certificate as the fallback or a refused handshake under `strict_sni`, steer's handshake timeout and concurrency cap, and `X-Forwarded-Proto: https` to the upstream. SIGHUP and `POST /reload` re-read the certificates too: new handshakes get the new ones and connections already open keep theirs. A reload cannot turn TLS on or off. OCSP responses are stapled and refreshed in the background (`ocsp_stapling`, on by default, and `ocsp_responder` to override the certificate's responder), and session tickets resume across reloads, with their keys rotated hourly. `tls.client_auth` asks clients for certificates from a CA bundle; a cluster's `allowed_clients` admits only matching SPIFFE IDs or DNS names, and the verified SPIFFE ID goes upstream as `X-Client-Spiffe-Id`. A cluster's `tls` block (`ca_file`, `server_name`, `cert_file`, `key_file`) makes the proxy reach its endpoints over TLS or mutual TLS with a pinned CA; the failover drill keeps its 100.00% table over HTTPS with mutual TLS. The four AES-CBC suites of steer's `compatible` policy are not offered, because rustls does not implement them; a configuration that names them loads and logs a warning for each.
+### TLS
+
+With a `tls` block the proxy listener terminates TLS on rustls. SIGHUP and `POST /reload` re-read every certificate and key: new handshakes get the new ones, and connections already open keep theirs. A reload cannot turn TLS on or off.
+
+| setting | what it does |
+|---|---|
+| `certificates` | PEM chains and keys, chosen by exact or `*.` SNI from each certificate's DNS names (or `server_names`); the first is the fallback |
+| `strict_sni` | refuse handshakes whose name no certificate covers, instead of serving the fallback |
+| `min_version`, `cipher_policy`, `cipher_suites` | steer's version and TLS 1.2 suite policy; the four AES-CBC suites of `compatible` are not offered, because rustls does not implement them, and each is logged |
+| `handshake_timeout`, `max_concurrent_handshakes` | steer's limits on handshakes |
+| `ocsp_stapling`, `ocsp_responder` | staple OCSP responses fetched and refreshed in the background (on by default); `ocsp_responder` overrides the certificate's `http://` responder |
+| `client_auth` | `ca_file` and `required` (default true): verify client certificates; their SANs and SPIFFE ID reach routing |
+| `acme` | issue and renew a certificate over ACME (below) |
+
+Session tickets resume across reloads, and their keys rotate hourly. Requests that arrive over TLS send `X-Forwarded-Proto: https` upstream. A cluster's `allowed_clients` (`spiffe://` IDs, `/*` prefixes and `dns:<name>`) admits only matching client certificates and answers others `403 client_not_allowed`. The verified SPIFFE ID goes upstream as `X-Client-Spiffe-Id`, and a client's own value is always removed. A cluster's `tls` block reaches its endpoints over TLS or mutual TLS:
+- `ca_file` is the only trust;
+- `server_name` sets the SNI and the name to verify;
+- `cert_file` and `key_file` are the client certificate.
+
+The failover drill keeps its 100.00% table over HTTPS with mutual TLS.
+
+`tls.acme` gets the certificate from an ACME CA (RFC 8555) and renews it at two thirds of its lifetime:
+
+```json
+"tls": {
+  "certificates": [],
+  "acme": {
+    "directory": "https://acme-v02.api.letsencrypt.org/directory",
+    "contact": ["mailto:ops@example.com"],
+    "domains": ["example.com", "www.example.com"],
+    "challenge": "tls-alpn-01",
+    "state_dir": "/var/lib/edgefront/acme"
+  }
+}
+```
+
+| setting | meaning |
+|---|---|
+| `challenge` | `http-01` (default; needs `http_listen`, such as `":80"`), `tls-alpn-01` (answered by the proxy listener itself, which must be the name's port 443), or `dns-01` (needs `dns_hook`, a command run as `<hook> set\|clear <name> <value>`; the only one for `*.` names) |
+| `state_dir` | the account key, the account URL and the issued certificate and key, at mode 0600 |
+| `ca_file` | the CAs the directory's certificate must chain to; by default the system bundle |
+
+`/metrics` adds `edgefront_acme_certificate_expiry_seconds` and `edgefront_acme_renewals_total{result}`. A failed renewal is retried with backoff from 5 minutes to 6 hours. `crates/edgefront-core/tests/acme.rs` and `crates/edgefront/tests/e2e_acme_mtls.rs` issue against Pebble in Docker. The end-to-end test issues the proxy's certificate over TLS-ALPN-01, and then a client that trusts only Pebble's root and presents a certificate reaches a mutual-TLS upstream through it.
 
 ## Limiter (port of pacer)
 
