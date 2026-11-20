@@ -269,6 +269,27 @@ impl TlsTo {
             server_name,
         })
     }
+
+    /// The same trust and identity offering `protocols` over ALPN instead
+    /// of `http/1.1`.
+    pub fn with_alpn(&self, protocols: Vec<Vec<u8>>) -> TlsTo {
+        let mut config = rustls::ClientConfig::clone(&self.config);
+        config.alpn_protocols = protocols;
+        TlsTo {
+            config: Arc::new(config),
+            server_name: self.server_name.clone(),
+        }
+    }
+
+    /// The rustls configuration handshakes use.
+    pub fn client_config(&self) -> Arc<rustls::ClientConfig> {
+        Arc::clone(&self.config)
+    }
+
+    /// The name origin certificates must carry, when it is not the host.
+    pub fn server_name(&self) -> Option<&ServerName<'static>> {
+        self.server_name.as_ref()
+    }
 }
 
 /// An idle pooled connection and when it went idle.
