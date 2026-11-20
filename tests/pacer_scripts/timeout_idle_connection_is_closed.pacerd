@@ -1,0 +1,5 @@
+connect a: ok
+works a: yes
+mark t: ok
+closed_within a: closed time=ok
+log "reason=idle_timeout": found

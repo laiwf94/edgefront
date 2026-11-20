@@ -1,29 +1,35 @@
-//! pacerd's config reader against edgefront-limiter's, on every config in
-//! legacy/pacer.
+//! pacerd's config reader against edgefront-limiter's, on every config
+//! pacer shipped.
 //!
-//! The C side is `diffdrive config [PATH]`, which runs `pd_config_load` and
-//! prints `error MESSAGE`, or `ok` and every parsed field in a fixed layout
-//! (see the top of `legacy/pacer/tests/diffdrive.c`). [`rust_answer`] prints
-//! the same layout from [`edgefront_limiter::config`], so the two answers
-//! are compared as text: accept or reject, the error message with its line
-//! number, and, for an accepted config, every value it set.
+//! The C side was `diffdrive config [PATH]`, which ran `pd_config_load`
+//! and printed `error MESSAGE`, or `ok` and every parsed field in a fixed
+//! layout. [`rust_answer`] prints the same layout from
+//! [`edgefront_limiter::config`], so the two answers compare as text:
+//! accept or reject, the error message with its line number, and, for an
+//! accepted config, every value it set. libpacer was deleted with
+//! legacy/pacer in week 4; its answers for the whole corpus and for 2,000
+//! mutants were recorded first, and [`check_recorded`] holds the Rust
+//! reader to them. [`run`] still diffs against any driver of the protocol.
 //!
-//! The inputs ([`corpus`]) are:
+//! The inputs ([`corpus`]), under [`pacer_root`], the copy of pacer's data
+//! files kept in `crates/edgefront-limiter/tests/data/pacer`, are:
 //!
-//! - every file under `tests`, `examples` and `fuzz/corpus`, read by each
-//!   side's own file reader (`pd_config_load` and `read_pacerd`), whether
-//!   or not it is meant to be a config;
-//! - every string literal in `tests/*.c` and `fuzz/*.c`, which is where
-//!   `test_config.c` and the integration tests keep their configs, with
-//!   adjacent literals joined as the C compiler joins them. A literal with
-//!   printf conversions is also tried with them filled in (numbers become
-//!   `9000`, strings become empty), as the integration tests fill them;
+//! - every file under `tests`, `examples` and `fuzz/corpus`, read by
+//!   [`read_pacerd`], whether or not it is meant to be a config (pacer's C
+//!   sources were inputs too while legacy/pacer existed; the configs in
+//!   them are the literals below);
+//! - every string literal of pacer's `tests/*.c` and `fuzz/*.c`, which is
+//!   where `test_config.c` and the integration tests kept their configs,
+//!   with adjacent literals joined as the C compiler joins them, kept in
+//!   `recorded/config-literals.jsonl`. A literal with printf conversions is
+//!   also tried with them filled in (numbers become `9000`, strings become
+//!   empty), as the integration tests filled them;
 //! - each literal again inside the one-listener block that
-//!   `expect_listener_error` in `test_config.c` wraps around a directive.
+//!   `expect_listener_error` in `test_config.c` wrapped around a directive.
 //!
 //! On top of these, [`Plan::mutants`] seeded mutants of the corpus (byte
 //! flips, tokens from `fuzz/config.dict`, dropped, repeated, swapped and
-//! spliced lines, generated directives and truncation) go to the C side on
+//! spliced lines, generated directives and truncation) go to the driver on
 //! stdin and to [`parse_pacerd`] directly. Mutant `i` comes from seed
 //! `seed + i` alone, so `edgefront-difftest pacer-config-mutant --seed S`
 //! prints any one of them again.
@@ -41,7 +47,7 @@ use crate::driver;
 use crate::pacer::DriverCommand;
 use crate::rng::Rng;
 
-/// The directories of legacy/pacer whose files are all tried as configs.
+/// The directories of pacer's files that are all tried as configs.
 pub const CORPUS_DIRS: [&str; 3] = ["tests", "examples", "fuzz/corpus"];
 
 /// The block `expect_listener_error` in `tests/test_config.c` puts around a
@@ -56,9 +62,9 @@ const MUTATIONS_MAX: usize = 4;
 /// Answers longer than this are cut in reports.
 const SHOWN_ANSWER: usize = 600;
 
-/// The path of legacy/pacer in this repository.
+/// The copy of pacer's data files in this repository.
 pub fn pacer_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../legacy/pacer")
+    crate::pacer::recorded_dir()
 }
 
 /// Where an input comes from.
@@ -219,7 +225,7 @@ pub fn error_line(answer: &str) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // The corpus.
 
-/// Every input in legacy/pacer at `root`, in a fixed order: the files, then
+/// Every input under `root`, in a fixed order: the files, then
 /// the literals, the literals with their conversions filled in, and the
 /// literals inside a listener block.
 pub fn corpus(root: &Path) -> io::Result<Vec<Input>> {
@@ -240,28 +246,7 @@ pub fn corpus(root: &Path) -> io::Result<Vec<Input>> {
             });
         }
     }
-    let mut sources = Vec::new();
-    for dir in ["tests", "fuzz"] {
-        for entry in fs::read_dir(root.join(dir))? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "c") {
-                sources.push(path);
-            }
-        }
-    }
-    sources.sort();
-    let mut literals = Vec::new();
-    for path in &sources {
-        let text = fs::read(path)?;
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        for (line, bytes) in c_string_literals(&text) {
-            literals.push((format!("{file}:{line}"), bytes));
-        }
-    }
+    let literals = recorded_literals(root)?;
     for (name, bytes) in &literals {
         inputs.push(Input {
             name: format!("literal {name}"),
@@ -286,6 +271,130 @@ pub fn corpus(root: &Path) -> io::Result<Vec<Input>> {
         });
     }
     Ok(inputs)
+}
+
+/// The string literals of pacer's C tests, as recorded in
+/// `recorded/config-literals.jsonl` under `root`: `(file:line, bytes)`.
+fn recorded_literals(root: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
+    #[derive(serde::Deserialize)]
+    struct Literal {
+        name: String,
+        hex: String,
+    }
+    let text = fs::read_to_string(root.join("recorded/config-literals.jsonl"))?;
+    text.lines()
+        .map(|l| {
+            let lit: Literal = serde_json::from_str(l).map_err(io::Error::other)?;
+            let bytes = (0..lit.hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&lit.hex[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(io::Error::other)?;
+            let name = lit
+                .name
+                .strip_prefix("literal ")
+                .unwrap_or(&lit.name)
+                .to_string();
+            Ok((name, bytes))
+        })
+        .collect()
+}
+
+/// What [`check_recorded`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedReport {
+    /// Corpus inputs checked against pacerd's recorded answer.
+    pub inputs: usize,
+    /// Mutants checked against the digest of pacerd's answer.
+    pub mutants: usize,
+    /// Every difference.
+    pub mismatches: Vec<String>,
+}
+
+/// Holds [`rust_answer`] to the answers pacerd's reader gave before it
+/// was deleted: each corpus input's whole answer
+/// (`recorded/config-answers.jsonl`), then the mutants of
+/// `recorded/config-mutants.sha256`, each by the first 16 hex digits of
+/// the SHA-256 of its answer.
+pub fn check_recorded(root: &Path) -> io::Result<RecordedReport> {
+    use sha2::{Digest, Sha256};
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        name: String,
+        answer: String,
+    }
+    let inputs = corpus(root)?;
+    let mut r = RecordedReport::default();
+    let text = fs::read_to_string(root.join("recorded/config-answers.jsonl"))?;
+    // In corpus order, which is the order they were recorded in; names
+    // repeat where a C line held several literals.
+    let answers = text
+        .lines()
+        .map(|l| serde_json::from_str::<Answer>(l).map_err(io::Error::other))
+        .collect::<io::Result<Vec<Answer>>>()?;
+    for (input, a) in inputs.iter().zip(&answers) {
+        r.inputs += 1;
+        if input.name != a.name {
+            r.mismatches.push(format!(
+                "input {}: recorded as {:?}, found {:?}",
+                r.inputs, a.name, input.name
+            ));
+            continue;
+        }
+        let ours = rust_answer(input);
+        if ours != a.answer {
+            r.mismatches.push(format!(
+                "{}:\n  pacerd:    {}\n  edgefront: {}",
+                a.name,
+                show(&a.answer),
+                show(&ours)
+            ));
+        }
+    }
+    if answers.len() != inputs.len() {
+        r.mismatches.push(format!(
+            "{} inputs, {} recorded answers",
+            inputs.len(),
+            answers.len()
+        ));
+    }
+    let base = MutationBase::load(root, &inputs)?;
+    let digests = fs::read_to_string(root.join("recorded/config-mutants.sha256"))?;
+    for l in digests.lines() {
+        let Some((seed, want)) = l.split_once(' ') else {
+            return Err(io::Error::other(format!("bad line {l:?}")));
+        };
+        let seed: u64 = seed.parse().map_err(io::Error::other)?;
+        let input = Input {
+            name: format!("mutant {seed}"),
+            source: Source::Bytes(base.mutant(seed)),
+        };
+        let ours = rust_answer(&input);
+        let got: String = Sha256::digest(ours.as_bytes())
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        r.mutants += 1;
+        if got != want {
+            r.mismatches.push(format!(
+                "mutant {seed}: the answer differs from pacerd's; replay with `edgefront-difftest pacer-config-mutant --seed {seed}`. edgefront answers:\n  {}",
+                show(&ours)
+            ));
+        }
+    }
+    Ok(r)
+}
+
+/// An answer cut for a report.
+fn show(a: &str) -> String {
+    let a = a.trim_end().replace('\n', " | ");
+    if a.len() > SHOWN_ANSWER {
+        let cut: String = a.chars().take(SHOWN_ANSWER).collect();
+        format!("{cut}...")
+    } else {
+        a
+    }
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -504,7 +613,7 @@ pub struct MutationBase {
 }
 
 impl MutationBase {
-    /// The base for the corpus of legacy/pacer at `root`.
+    /// The base for the corpus at `root`.
     pub fn load(root: &Path, corpus: &[Input]) -> io::Result<Self> {
         let mut all = Vec::with_capacity(corpus.len());
         for input in corpus {
@@ -943,7 +1052,7 @@ impl fmt::Display for Report {
     }
 }
 
-/// Runs the corpus of legacy/pacer at `root` and `plan.mutants` mutants
+/// Runs the corpus at `root` and `plan.mutants` mutants
 /// through `driver` and the Rust parser and reports every divergence.
 pub fn run(driver: &DriverCommand, root: &Path, plan: Plan) -> io::Result<Report> {
     let corpus = corpus(root)?;
@@ -973,7 +1082,7 @@ pub fn run(driver: &DriverCommand, root: &Path, plan: Plan) -> io::Result<Report
     Ok(report)
 }
 
-/// The mutant `seed` gives for the corpus of legacy/pacer at `root`.
+/// The mutant `seed` gives for the corpus at `root`.
 pub fn mutant(root: &Path, seed: u64) -> io::Result<Vec<u8>> {
     let corpus = corpus(root)?;
     Ok(MutationBase::load(root, &corpus)?.mutant(seed))

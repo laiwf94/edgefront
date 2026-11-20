@@ -13,16 +13,15 @@
 //! - [`resilience`]: outlier ejection and decay, and retry decisions with
 //!   their budget and backoff, on generated failure traces against the same
 //!   driver's `outlier` and `retry` queries.
-//! - [`pacer`]: libpacer's GCRA, keyed table and sliding window, against
-//!   `legacy/pacer/tests/diffdrive.c`. The driver reads one operation per
-//!   line on stdin and prints one line per operation; this crate's build
-//!   script compiles it with the system C compiler, and
-//!   [`PACER_DIFFDRIVE`] is the path of the binary. [`driver::run`] feeds
-//!   it a script and collects the transcript, and [`pacer::Interpreter`]
-//!   answers the same script from edgefront-limiter.
-//! - [`pacer_config`]: pacerd's config reader, against the same driver's
-//!   parse mode (`diffdrive config`), on every config in legacy/pacer and
-//!   seeded mutants of them.
+//! - [`pacer`]: libpacer's GCRA, keyed table and sliding window.
+//!   [`pacer::Interpreter`] answers the C driver's one-line-per-operation
+//!   protocol from edgefront-limiter. libpacer and its driver were deleted
+//!   with legacy/pacer in week 4; what they answered is kept, and
+//!   [`pacer::check_recorded`] holds the Rust side to it.
+//! - [`pacer_config`]: pacerd's config reader, on every config pacer
+//!   shipped, the string literals of its tests and seeded mutants of them,
+//!   held to the answers pacerd's reader recorded
+//!   ([`pacer_config::check_recorded`]).
 //! - [`cache`]: the cache node as a client sees it, against cachet 0.1, the
 //!   binary from before the workspace split. A recorded request log is
 //!   replayed against both binaries on one logical clock, and status,
@@ -30,8 +29,8 @@
 //!
 //! - [`l4`]: pacerd's data path as a client sees it: the scenarios of
 //!   pacer's `tests/it_*.c` as traffic scripts under `tests/pacer_scripts`,
-//!   run against legacy pacerd and against `edgefront limits`, with their
-//!   accept, refuse and close outcomes and counters diffed step by step.
+//!   run against `edgefront limits` and held to the transcripts legacy
+//!   pacerd gave before it was deleted, outcomes and counters step by step.
 //! - [`drill`]: not a diff but the tools of steer's failover drill, its
 //!   fake upstream and its open-loop load generator, so the drill runs
 //!   against the Rust binary without Go.
@@ -49,6 +48,3 @@ pub mod pacer_config;
 pub mod resilience;
 pub mod rng;
 pub mod steer;
-
-/// Path of the compiled `legacy/pacer/tests/diffdrive.c` driver.
-pub const PACER_DIFFDRIVE: &str = env!("EDGEFRONT_PACER_DIFFDRIVE");

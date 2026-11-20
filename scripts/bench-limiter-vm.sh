@@ -9,6 +9,11 @@
 # Needs Docker. The cargo build cache lives in the docker volume
 # edgefront-bench-target, so later runs do not rebuild from scratch.
 set -euo pipefail
+if [ ! -d "$(git rev-parse --show-toplevel)/legacy/pacer" ]; then
+    echo "$0: legacy/pacer was deleted in week 4 (#88); run this from a commit before" >&2
+    echo "'Delete legacy/pacer', such as 92a1f82, to measure the C side." >&2
+    exit 2
+fi
 
 runs=${1:-4}
 root=$(git rev-parse --show-toplevel)

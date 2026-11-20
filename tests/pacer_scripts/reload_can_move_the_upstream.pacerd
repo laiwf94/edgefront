@@ -1,0 +1,7 @@
+connect a: ok
+recv_eof a: bytes=5
+config: ok
+signal HUP: yes
+log "msg=reloaded": found
+connect b: ok
+recv_eof b: bytes=7

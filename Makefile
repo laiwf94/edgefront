@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-resilience difftest-pacer difftest-pacer-config difftest-l4 difftest-cache e2e-steer
+.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-resilience difftest-pacer difftest-cache e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -130,31 +130,15 @@ e2e-steer: steer-src
 	STEER_BIN=$(CURDIR)/target/steer cargo test --locked -p edgefront --test e2e_port_http1
 	STEER_DIFFDRIVE=$(CURDIR)/target/diffdrive cargo test --locked -p edgefront --test e2e_port_balancer
 
-# Diff edgefront-limiter against libpacer: 100 generated scripts of 10,000
-# operations each through legacy/pacer/tests/diffdrive.c (built by
-# edgefront-difftest's build script) and the Rust crate. Needs a C compiler.
-# The seed comes from the clock and is printed; a divergence prints the
-# command that replays it.
+# Hold the pacer port to what libpacer and pacerd answered, recorded before
+# legacy/pacer was deleted: the golden transcripts and 100 scripts of 10,000
+# operations (1,013,182 answers, by digest), pacerd's config reader on its
+# whole corpus and 2,000 mutants, and the 23 it_*.c scenarios as traffic
+# scripts (tests/pacer_scripts) against edgefront limits, each against
+# pacerd's recorded transcript. `make test` runs all of them too.
 difftest-pacer:
-	cargo run --release --locked -p edgefront-difftest -- pacer $(DIFFTEST_ARGS)
-
-# Diff pacerd's config reader against edgefront-limiter's: every file under
-# legacy/pacer's tests, examples and fuzz/corpus, every string literal in its
-# tests, and 2,000 seeded mutants (more with DIFFTEST_ARGS="--mutants N"),
-# through `diffdrive config` and the Rust parser.
-difftest-pacer-config:
-	cargo run --release --locked -p edgefront-difftest -- pacer-config $(DIFFTEST_ARGS)
-
-# Run pacer's integration scenarios (legacy/pacer/tests/it_*.c), written as
-# the traffic scripts in tests/pacer_scripts, against legacy pacerd and
-# against edgefront limits, and diff their outcomes and counters step by
-# step. pacerd needs Linux; `make test` runs the scripts against edgefront
-# alone.
-PACER_RELEASE := $(CURDIR)/legacy/pacer/build/release
-difftest-l4:
-	$(MAKE) -C legacy/pacer VARIANT=release build/release/pacerd build/release/pacerctl
-	PACERD_BIN=$(PACER_RELEASE)/pacerd PACERCTL_BIN=$(PACER_RELEASE)/pacerctl \
-		cargo test --locked -p edgefront --test pacer_scripts -- --nocapture
+	cargo run --release --locked -p edgefront-difftest -- pacer-recorded
+	cargo test --release --locked -p edgefront --test pacer_scripts -- --nocapture
 
 # Diff the cache node against cachet 0.1: replay 50,000 generated requests
 # (or DIFFTEST_ARGS="--log FILE", a recorded log) against cachet as it was

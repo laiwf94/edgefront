@@ -1,0 +1,12 @@
+connect a: ok
+works a: yes
+connect b: ok
+works b: yes
+connect c: ok
+works c: yes
+connect d: ok
+works d: yes
+connect e: ok
+refused e: yes
+log "reason=listener_full": found
+stats: open=4 rejected_listener_full=1

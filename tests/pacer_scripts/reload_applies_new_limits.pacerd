@@ -1,0 +1,14 @@
+connect a: ok
+works a: yes
+connect b: ok
+works b: no
+close b: ok
+config: ok
+signal HUP: yes
+log "msg=reloaded source=SIGHUP": found
+connect c: ok
+works c: yes
+connect d: ok
+works d: yes
+connect e: ok
+works e: no

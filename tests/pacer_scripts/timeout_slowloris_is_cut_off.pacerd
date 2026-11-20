@@ -1,0 +1,6 @@
+connect a: ok
+mark t: ok
+trickle a: started
+log "reason=slow_client": found
+elapsed t: time=ok
+join a: cut before the end

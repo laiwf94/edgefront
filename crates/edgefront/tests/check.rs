@@ -231,7 +231,7 @@ fn allow_drops_a_class_and_a_clean_config_is_ok() {
 
     let example = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../legacy/pacer/examples/pacerd.conf"
+        "/../../examples/limiter/pacerd.conf"
     );
     let out = edgefront(&["check", example]);
     assert!(out.status.success());
@@ -311,7 +311,7 @@ fn print_writes_the_config_as_toml_that_reads_back_the_same() {
     let dir = Scratch::new("print");
     let example = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../legacy/pacer/examples/pacerd.conf"
+        "/../../examples/limiter/pacerd.conf"
     );
     let out = edgefront(&["check", "--print", example]);
     assert!(out.status.success(), "{out:?}");

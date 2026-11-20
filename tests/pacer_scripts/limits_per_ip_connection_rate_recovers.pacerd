@@ -1,0 +1,8 @@
+works_n: 5 of 5
+connect x: ok
+refused x: yes
+log "reason=per_ip_rate": found
+sleep: ok
+connect y: ok
+works y: yes
+stats: accepted=6 rejected_per_ip_rate=1

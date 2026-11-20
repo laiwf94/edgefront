@@ -184,16 +184,19 @@ fn run_with_stdin(args: &[&str], input: &[u8]) -> Output {
 }
 
 #[test]
-fn pacer_against_the_c_driver_finds_nothing() {
-    let out = run(&["pacer", "--scripts", "5", "--ops", "2000", "--seed", "12"]);
-    let stdout = text(&out.stdout);
-    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
-    assert!(
-        stdout.starts_with("seed 12\nscripts: 5\noperations: "),
-        "{stdout}"
-    );
-    assert!(stdout.contains("table take rc=1 "), "{stdout}");
-    assert!(stdout.contains("\ndivergences: 0\n"), "{stdout}");
+fn pacer_needs_a_driver_since_libpacers_was_deleted() {
+    for cmd in ["pacer", "pacer-config"] {
+        let out = run(&[cmd, "--seed", "12"]);
+        assert_eq!(out.status.code(), Some(2), "{cmd}");
+        let err = text(&out.stderr);
+        assert!(
+            err.contains("libpacer's C driver was deleted with legacy/pacer"),
+            "{err}"
+        );
+        assert!(err.contains("pacer-recorded"), "{err}");
+    }
+    let out = run(&["pacer-recorded", "extra"]);
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
@@ -237,7 +240,9 @@ fn a_pacer_divergence_prints_the_seed_step_and_replay() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("replay: edgefront-difftest pacer --seed 6 --scripts 1 --ops 100\n"),
+        stdout.contains(
+            "replay: edgefront-difftest pacer --seed 6 --scripts 1 --ops 100 -- DRIVER [ARGS...]\n"
+        ),
         "{stdout}"
     );
 }

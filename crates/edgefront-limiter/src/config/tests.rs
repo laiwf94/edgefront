@@ -602,7 +602,7 @@ fn reads_files() {
 
 #[test]
 fn reads_pacers_own_files() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../legacy/pacer");
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/pacer");
     let example = read_pacerd(Path::new(&format!("{root}/examples/pacerd.conf"))).unwrap();
     assert_eq!(example.workers, 2);
     assert_eq!(
@@ -649,7 +649,7 @@ table_full = "deny"
 
 #[test]
 fn toml_matches_pacerd_conf() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../legacy/pacer");
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/pacer");
     let example = read_pacerd(Path::new(&format!("{root}/examples/pacerd.conf"))).unwrap();
     assert_eq!(from_toml(EXAMPLE_TOML).unwrap(), example);
     // Sizes and counts may be integers or strings.

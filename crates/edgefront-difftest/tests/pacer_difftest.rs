@@ -1,28 +1,32 @@
 //! The pacer differential runner: the Rust side of the protocol against
-//! the golden transcripts, generated scripts against the C driver, and the
-//! diff against drivers that answer wrongly or die.
+//! libpacer's golden transcripts, generated scripts through the driver
+//! binary, and the diff against drivers that answer wrongly or die. Until
+//! legacy/pacer was deleted the driver here was libpacer's C driver; it is
+//! now `edgefront-difftest pacer-rust-driver`, and libpacer's own answers
+//! are held by `pacer::check_recorded` (tests/e2e_limiter_port.rs).
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use edgefront_difftest::PACER_DIFFDRIVE;
 use edgefront_difftest::driver;
 use edgefront_difftest::pacer::{self, DriverCommand, Plan, Script};
 
+const BIN: &str = env!("CARGO_BIN_EXE_edgefront-difftest");
+
 fn golden_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../legacy/pacer/tests/diffdrive")
+    pacer::recorded_dir().join("tests/diffdrive")
 }
 
-/// The C driver behind a shell pipeline, such as an awk program that
+/// The driver behind a shell pipeline, such as an awk program that
 /// rewrites one of its answers.
 fn piped(filter: &str) -> DriverCommand {
     DriverCommand {
         program: "sh".into(),
         args: vec![
             "-c".into(),
-            format!("\"$1\" | {filter}"),
+            format!("\"$1\" pacer-rust-driver | {filter}"),
             "sh".into(),
-            PACER_DIFFDRIVE.into(),
+            BIN.into(),
         ],
     }
 }
@@ -49,13 +53,13 @@ fn the_rust_side_prints_the_golden_transcripts() {
 }
 
 #[test]
-fn generated_scripts_agree_with_the_c_driver() {
+fn generated_scripts_agree_through_the_driver_binary() {
     let plan = Plan {
         scripts: 24,
         ops: 5_000,
         seed: 20_261_104,
     };
-    let report = pacer::run_c(plan).unwrap();
+    let report = pacer::run(&DriverCommand::rust(BIN), plan).unwrap();
     assert_eq!(report.divergence, None, "{report}");
     assert_eq!(report.scripts, 24);
     assert!(report.ops > 24 * 5_000, "{report}");
@@ -232,7 +236,7 @@ fn a_driver_that_cannot_start_is_an_error() {
 }
 
 #[test]
-fn the_rust_and_c_drivers_reject_the_same_malformed_scripts() {
+fn the_driver_binary_rejects_malformed_scripts_at_their_line() {
     for script in [
         "now 1\nbogus\nnow 2\n",
         "gcra 0 take 1\n",
@@ -240,13 +244,18 @@ fn the_rust_and_c_drivers_reject_the_same_malformed_scripts() {
         "window 0 init 10\n",
         "now -1\n",
     ] {
-        let c = driver::run(Path::new(PACER_DIFFDRIVE), script).unwrap();
+        let c = driver::run_with_args(
+            std::path::Path::new(BIN),
+            &["pacer-rust-driver".to_string()],
+            script,
+        )
+        .unwrap();
         assert_eq!(c.status.code(), Some(2), "{script:?}");
         let rust = pacer::transcript(script).unwrap_err();
         let c_err = c.stderr.trim_end();
         assert!(
             c_err.starts_with(&format!("diffdrive: line {}: ", rust.line)),
-            "{script:?}: C said {c_err:?}, Rust {rust}"
+            "{script:?}: the driver said {c_err:?}, the interpreter {rust}"
         );
         assert_eq!(c.stdout.lines().count(), rust.line - 1, "{script:?}");
     }

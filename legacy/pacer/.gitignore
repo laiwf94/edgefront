@@ -1,7 +1,0 @@
-/build/
-*.profraw
-*.profdata
-crash-*
-leak-*
-timeout-*
-oom-*

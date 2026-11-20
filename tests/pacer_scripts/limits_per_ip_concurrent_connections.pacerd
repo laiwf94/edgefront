@@ -1,0 +1,22 @@
+connect a: ok
+works a: yes
+connect b: ok
+works b: yes
+connect c: ok
+works c: yes
+connect x: ok
+refused x: yes
+close x: ok
+log "reason=per_ip_conns": found
+connect other: ok
+works other: yes
+close other: ok
+close a: ok
+log "peer={peer:a} reason=done": found
+connect again: ok
+works again: yes
+stats: accepted=5 rejected_per_ip_conns=1
+close b: ok
+close c: ok
+close again: ok
+stats: open=0 accepted=5 rejected_listener_full=0 rejected_per_ip_conns=1 rejected_per_ip_rate=0 rejected_table_full=0 rejected_fd_exhausted=0 closed_done=5 closed_idle=0 closed_slow=0 closed_upstream_failed=0 closed_reset=0 closed_drain=0 closed_other=0 bytes_up=20 bytes_down=20 throttled=0 clients_tracked=2 client_table_capacity=16384 client_table_evictions=0

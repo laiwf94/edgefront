@@ -10,6 +10,11 @@
 #
 # Usage: scripts/bench-pacer-port.sh
 set -euo pipefail
+if [ ! -d "$(git rev-parse --show-toplevel)/legacy/pacer" ]; then
+    echo "$0: legacy/pacer was deleted in week 4 (#88); run this from a commit before" >&2
+    echo "'Delete legacy/pacer', such as 92a1f82, to measure the C side." >&2
+    exit 2
+fi
 root=$(git rev-parse --show-toplevel)
 tag=edgefront-limiter-bench:1
 docker image inspect "$tag" >/dev/null 2>&1 || "$root/scripts/bench-limiter-vm.sh" 0 >/dev/null
