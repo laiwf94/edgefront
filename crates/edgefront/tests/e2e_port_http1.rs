@@ -756,13 +756,13 @@ fn edgefront(args: &[&str]) -> (i32, String, String) {
 
 #[test]
 fn command_line() {
-    let usage =
-        "usage: edgefront proxy --config <file>\n       edgefront proxy --check-config <file>\n";
+    let usage = "usage: edgefront proxy --config <file> [--limits <file.toml>]\n       edgefront proxy --check-config <file> [--limits <file.toml>]\n";
     for args in [
         &["proxy"][..],
         &["proxy", "--config"],
         &["proxy", "--bogus", "x"],
         &["proxy", "--config", "a", "b"],
+        &["proxy", "--config", "a", "--limits"],
     ] {
         assert_eq!(
             edgefront(args),
