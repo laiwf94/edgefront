@@ -171,10 +171,10 @@ jobs:
             target/bench/gate-verdict.json
 
   # The proxy's p99 regression gate (#86): edgefront proxy at this commit
-  # against itself at the parent commit, on the same runner, in five
+  # against itself at the parent commit, on the same runner, in nine
   # alternating repetitions of bench/ci/steer-port-gate.toml. It fails when
-  # the median p99 is more than 5% above the parent's
-  # (scripts/check-p99-gate.py). Comparing two builds on one machine, rather
+  # the median p99 is more than 5% above the parent's and a one-sided
+  # Mann-Whitney U test agrees at p < 0.01 (scripts/check-p99-gate.py). Comparing two builds on one machine, rather
   # than against numbers from another, is what makes 5% meaningful on a
   # shared runner.
   proxy-p99-gate:
@@ -203,7 +203,7 @@ jobs:
           docker build -f bench/Dockerfile.prebuilt --target harness -t edgefront-bench/harness:local target/bench-images
           docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:this target/bench-images
           docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:parent target/parent-images
-      - name: Five alternating repetitions
+      - name: Nine alternating repetitions
         run: |
           side() {
             docker tag "edgefront-bench/edgefront:$1" edgefront-bench/edgefront:local
@@ -211,7 +211,7 @@ jobs:
               --targets edgefront-proxy --target-cpus 1 \
               --out "target/bench-gate/run$2/$1" --run "gate$2-$1"
           }
-          for i in 1 2 3 4 5; do
+          for i in 1 2 3 4 5 6 7 8 9; do
             if (( i % 2 )); then side parent "$i"; side this "$i"; else side this "$i"; side parent "$i"; fi
           done
       - name: Median p99 within 5% of the parent's

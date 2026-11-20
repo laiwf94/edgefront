@@ -60,8 +60,10 @@ BENCH_REBUILD=1 BENCH_MACHINE="Apple Mac, 16-core arm64, Docker Desktop 28 (Linu
 
 `.github/workflows/bench.yml`'s `proxy-p99-gate` job fails a change that makes edgefront proxy's p99 more than 5% worse.
 - On every push and pull request that touches the crates, it builds `edgefront proxy` at the commit and at its parent.
-- It runs `bench/ci/steer-port-gate.toml` (cleartext HTTP/1.1, 64 connections, 5,000/s for 15 s, one target CPU) five times per side on the same runner, alternating which side goes first.
-- `scripts/check-p99-gate.py` fails the job when this commit's median p99 is more than 5% above the parent's, or when any request went unanswered.
-- The verdict and each run's p99 go to the job summary.
+- It runs `bench/ci/steer-port-gate.toml` (cleartext HTTP/1.1, 64 connections, 5,000/s for 15 s, one target CPU) nine times per side on the same runner, alternating which side goes first.
+- `scripts/check-p99-gate.py` fails the job when this commit's median p99 is more than 5% above the parent's and a one-sided Mann-Whitney U test (exact, ties at mid ranks) finds this commit's p99s larger at p < 0.01, the noise model the cache's gate uses. It also fails if any request went unanswered.
+- The verdict, the p-value and each run's p99 go to the job summary.
+
+A single run's p99 on a shared runner moves by an order of magnitude from noise alone. In the gate's second run, single-run p99s ranged from 0.09 to 1.18 ms for unchanged request-path code. A bare median comparison read that as a 122% rise; the test gives it p = 0.048, which is not evidence.
 
 It compares two builds on one machine instead of against the numbers above, because a p99 measured on a shared CI runner is not comparable with one from this machine.
