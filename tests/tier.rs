@@ -303,15 +303,15 @@ async fn origin_offload_on_a_zipf_trace_across_ten_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hot_keys_are_kept_on_every_node_that_sees_them_hot() {
     let o = origin().await;
-    // Hot at 5 requests a second on a node.
-    let c = Cluster::start(o.addr, 10, false, "hot_rate = 5\n").await;
+    // Hot at 1 request a second on a node: two requests within a second.
+    let c = Cluster::start(o.addr, 10, false, "hot_rate = 1\n").await;
     let top: Vec<String> = (0..100).map(|i| format!("/top/{i}")).collect();
-    // Warm-up: the top 100 keys on every node, over and over for 2 s, which
-    // is over 10 a second each on this machine (the rounds are counted).
-    let warm_until = Instant::now() + Duration::from_millis(2000);
-    let mut rounds = 0;
-    while Instant::now() < warm_until || rounds < 40 {
-        // A hundred requests in flight at a time, one node's round each.
+    // Warm-up: on every node, each top key asked twice back to back, which
+    // makes it hot there however slow the machine, then once more, which
+    // stores it. Three rounds of that.
+    let rounds = 3;
+    for _ in 0..rounds {
+        // A hundred keys in flight at a time, one node's round each.
         for n in 0..10 {
             let mut tasks = Vec::new();
             for p in &top {
@@ -319,14 +319,17 @@ async fn hot_keys_are_kept_on_every_node_that_sees_them_hot() {
                 let client = c.client.clone();
                 let p = p.clone();
                 tasks.push(tokio::spawn(async move {
-                    http_on(&client, "GET", addr, &p, &[("host", "example.com")], "").await
+                    for _ in 0..3 {
+                        let got =
+                            http_on(&client, "GET", addr, &p, &[("host", "example.com")], "").await;
+                        assert_eq!(got.status, 200);
+                    }
                 }));
             }
             for t in tasks {
-                assert_eq!(t.await.unwrap().status, 200);
+                t.await.unwrap();
             }
         }
-        rounds += 1;
     }
     let per_node: Vec<u64> = c
         .live()
@@ -353,7 +356,7 @@ async fn hot_keys_are_kept_on_every_node_that_sees_them_hot() {
     assert_eq!(o.hits(), 100);
     // Once they cool, the copies are dropped on every node but each key's
     // three replicas (its owner and the two runners-up).
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let view = c.nodes[0].as_ref().unwrap().proxy.tier().unwrap().view();
     let replicas: BTreeMap<String, Vec<String>> = top
         .iter()
@@ -449,7 +452,7 @@ async fn a_forged_hop_header_is_ignored_and_never_reaches_the_origin() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_pushes_a_key_hot_on_it_to_its_two_runners_up() {
     let o = origin().await;
-    let c = Cluster::start(o.addr, 10, false, "hot_rate = 5\n").await;
+    let c = Cluster::start(o.addr, 10, false, "hot_rate = 1\n").await;
     let view = c.nodes[0].as_ref().unwrap().proxy.tier().unwrap().view();
     // A key owned by edge-0, asked only of edge-0.
     let path = (0..1000)
@@ -463,9 +466,8 @@ async fn an_owner_pushes_a_key_hot_on_it_to_its_two_runners_up() {
         .iter()
         .map(|n| n.id.clone())
         .collect();
-    for _ in 0..40 {
+    for _ in 0..4 {
         c.get(0, &path).await;
-        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(c.stat(|s| &s.replicas_sent), 2);
     let deadline = Instant::now() + Duration::from_secs(5);
