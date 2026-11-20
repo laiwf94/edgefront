@@ -18,6 +18,7 @@
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
+use edgefront_limiter::hotkey::{HotConfig, HotTable};
 use edgefront_limiter::{FullPolicy, Gcra, Rate, Table, TableConfig};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,10 @@ pub enum Workload {
     MutexGcra,
     TableSpread,
     TableHot,
+    /// One hot key with 10,000 cold ones, all in the table.
+    HotKeyTable,
+    /// The same traffic through a [`HotTable`], the hot key split.
+    HotKeySplit,
 }
 
 impl Workload {
@@ -57,6 +62,8 @@ impl Workload {
             Workload::MutexGcra => "gcra, one shared limiter (mutex baseline)",
             Workload::TableSpread => "table, 10k keys per thread",
             Workload::TableHot => "table, one hot key",
+            Workload::HotKeyTable => "hot key, single bucket (no C equivalent)",
+            Workload::HotKeySplit => "hot key, sub-buckets (no C equivalent)",
         }
     }
 
@@ -66,6 +73,8 @@ impl Workload {
             Workload::MutexGcra => "mutex-gcra",
             Workload::TableSpread => "table-spread",
             Workload::TableHot => "table-hot",
+            Workload::HotKeyTable => "hot-key-table",
+            Workload::HotKeySplit => "hot-key-split",
         }
     }
 }
@@ -139,10 +148,19 @@ pub fn run_once(w: Workload, threads: usize, ops: u64) -> f64 {
     let g = Arc::new(Gcra::new(&RATE).expect("a valid constant rate"));
     let l = Arc::new(Locked::new());
     let t = Arc::new(table());
+    let hot = HotTable::new(
+        table(),
+        RATE,
+        HotConfig {
+            parts: threads,
+            ..HotConfig::default()
+        },
+    );
     let go = Arc::new(Barrier::new(threads + 1));
     let hs: Vec<_> = (0..threads)
         .map(|id| {
             let (g, l, t, go) = (g.clone(), l.clone(), t.clone(), go.clone());
+            let mut h = hot.handle(id);
             std::thread::spawn(move || {
                 go.wait();
                 let mut now = SEC;
@@ -158,6 +176,23 @@ pub fn run_once(w: Workload, threads: usize, ops: u64) -> f64 {
                             t.take(&k.to_ne_bytes(), now, 1).is_ok_and(|d| d.allowed)
                         }
                         Workload::TableHot => t.take(b"hot", now, 1).is_ok_and(|d| d.allowed),
+                        Workload::HotKeyTable | Workload::HotKeySplit => {
+                            // Nine in ten for the hot key, the rest over
+                            // 10,000 cold keys.
+                            let cold;
+                            let key: &[u8] = if i % 10 == 9 {
+                                cold =
+                                    ((i as u32).wrapping_mul(2_654_435_761) % 10_000).to_ne_bytes();
+                                &cold
+                            } else {
+                                b"hot"
+                            };
+                            if w == Workload::HotKeyTable {
+                                t.take(key, now, 1).is_ok_and(|d| d.allowed)
+                            } else {
+                                h.take(key, now, 1).is_ok_and(|d| d.allowed)
+                            }
+                        }
                     });
                     now += 50;
                 }

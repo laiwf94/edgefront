@@ -1,0 +1,11 @@
+# Limiter week 7: one hot key and 10,000 cold keys (nine decisions in ten
+# for the hot key), in one table where every thread meets on the hot key's
+# shard lock, and through a HotTable that splits the hot key into a
+# sub-bucket per thread. 10^7 a second with a burst of 1000, each thread's
+# clock 50 ns a decision, as limiter_decisions.toml.
+# `edgefront-bench limiter --scenario THIS --json FILE`.
+name = "hot-key"
+threads = [1, 2, 4, 8, 16]
+ops = 4000000
+runs = 3
+workloads = ["hot-key-table", "hot-key-split"]
