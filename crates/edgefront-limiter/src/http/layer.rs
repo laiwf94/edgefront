@@ -45,6 +45,7 @@ use super::headers::{self, RATELIMIT, RATELIMIT_POLICY};
 use super::key::{Key, KeySpec, View, host_part, under_prefix};
 use super::response_count::{Settle, StatusSet, settle};
 use crate::clock::Clock;
+use crate::cost::{Cost, graphql_cost, header_cost};
 use crate::gcra::{Error, Rate};
 use crate::table::{FullPolicy, Table, TableConfig};
 
@@ -149,6 +150,8 @@ pub struct HttpRule {
     /// Whether responses carry this rule's RateLimit headers.
     pub headers: bool,
     pub refusal: Refusal,
+    /// What a request costs ([`crate::cost`]); 1 by default.
+    pub cost: Cost,
 }
 
 /// A rule's counters.
@@ -161,6 +164,7 @@ struct Counters {
     logged: AtomicU64,
     refunded: AtomicU64,
     table_full: AtomicU64,
+    charged_after: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -185,6 +189,8 @@ pub struct RuleStats {
     pub refunded: u64,
     /// Requests whose key found no room in the table.
     pub table_full: u64,
+    /// Responses whose cost was charged after they arrived.
+    pub charged_after: u64,
     /// Keys the rule's table holds now.
     pub keys: u64,
 }
@@ -291,6 +297,7 @@ impl HttpLimiter {
                     logged: get(&c.logged),
                     refunded: get(&c.refunded),
                     table_full: get(&c.table_full),
+                    charged_after: get(&c.charged_after),
                     keys: r.table.stats().entries,
                 }
             })
@@ -321,8 +328,43 @@ impl HttpLimiter {
 struct Charge {
     rule: usize,
     key: Key,
+    /// Tokens taken, refunded in full when the status is excluded.
+    cost: u64,
     remaining: u64,
     reset_ns: u64,
+}
+
+/// The request's cost under `cost`, or `None` when it is charged after
+/// the response (then nothing is taken now).
+fn request_cost(cost: &Cost, view: &View<'_>) -> Option<u64> {
+    match cost {
+        Cost::Fixed(n) => Some(*n),
+        Cost::RequestBytes { missing } => Some(
+            view.headers
+                .get(http::header::CONTENT_LENGTH)
+                .map(|v| crate::cost::header_cost(Some(v.as_bytes()), *missing))
+                .unwrap_or(*missing),
+        ),
+        Cost::Graphql { missing } => {
+            let q = (view.method == Method::GET)
+                .then(|| view.uri.query())
+                .flatten()
+                .and_then(|q| {
+                    q.split('&').find_map(|p| {
+                        let (n, v) = p.split_once('=')?;
+                        (n == "query").then(|| decode(v))
+                    })
+                });
+            Some(q.map_or(*missing, |q| graphql_cost(&q)))
+        }
+        Cost::ResponseHeader { .. } => None,
+    }
+}
+
+/// A form-encoded value as text.
+fn decode(v: &str) -> String {
+    let bytes: Vec<u8> = super::key::Decode(v.as_bytes()).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 struct RouteLimits {
@@ -370,18 +412,41 @@ async fn decide(
             continue;
         };
         bump(&rule.counters.matched);
-        let retry_ns = match rule.table.take_reset(key.as_bytes(), now, 1) {
+        // A cost charged after the response takes nothing now: the
+        // request is refused only while the key is in debt.
+        let cost = request_cost(&rule.spec.cost, &view);
+        let retry_ns = match rule
+            .table
+            .take_reset(key.as_bytes(), now, cost.unwrap_or(1))
+        {
             Ok((d, reset_ns)) if d.allowed => {
                 bump(&rule.counters.allowed);
+                let taken = match cost {
+                    Some(c) => c,
+                    None => {
+                        rule.table.refund(key.as_bytes(), now, 1);
+                        0
+                    }
+                };
                 charges.push(Charge {
                     rule: ri,
                     key,
-                    remaining: d.remaining,
+                    cost: taken,
+                    remaining: d.remaining + u64::from(cost.is_none()),
                     reset_ns,
                 });
                 continue;
             }
             Ok((d, _)) => d.retry_after_ns,
+            Err(Error::CostExceedsBurst) => {
+                // More than the whole burst: it can never be admitted, and
+                // waiting a full refill is the honest answer.
+                u64::try_from(
+                    u128::from(rule.spec.rate.burst) * u128::from(rule.spec.rate.period_ns)
+                        / u128::from(rule.spec.rate.tokens.max(1)),
+                )
+                .unwrap_or(u64::MAX)
+            }
             Err(Error::TableFull) => {
                 // Only under `table_full = "deny"`: the key is new and
                 // there is no room for it, so it is refused as over the
@@ -408,8 +473,10 @@ async fn decide(
                 continue;
             }
             Action::Delay(max) if u128::from(retry_ns) <= max.as_nanos() => {
-                if let Ok(b) = rule.table.book(key.as_bytes(), now, 1)
+                let c = cost.unwrap_or(1);
+                if let Ok(b) = rule.table.book(key.as_bytes(), now, c)
                     && b.allowed
+                    && b.granted == c
                 {
                     if u128::from(b.retry_after_ns) <= max.as_nanos() {
                         bump(&rule.counters.delayed);
@@ -418,13 +485,14 @@ async fn decide(
                         charges.push(Charge {
                             rule: ri,
                             key,
+                            cost: c,
                             remaining: 0,
                             reset_ns: b.retry_after_ns,
                         });
                         continue;
                     }
                     // Others booked first: the wait grew past the limit.
-                    rule.table.refund(key.as_bytes(), now, 1);
+                    rule.table.refund(key.as_bytes(), now, c);
                 }
             }
             _ => {}
@@ -432,7 +500,9 @@ async fn decide(
         // Refused: no other rule keeps what it took for this request.
         bump(&rule.counters.refused);
         for c in &charges {
-            limiter.rules[c.rule].table.refund(c.key.as_bytes(), now, 1);
+            limiter.rules[c.rule]
+                .table
+                .refund(c.key.as_bytes(), now, c.cost);
         }
         return Decision::Respond(refusal(rule, retry_ns));
     }
@@ -441,7 +511,7 @@ async fn decide(
     }
     let needed = charges.iter().any(|c| {
         let spec = &limiter.rules[c.rule].spec;
-        spec.headers || spec.count.is_some()
+        spec.headers || spec.count.is_some() || spec.cost.after_response()
     });
     if !needed {
         return Decision::Forward(None);
@@ -499,12 +569,41 @@ impl Exchange for Settlement {
         for c in &self.charges {
             let rule = &self.limiter.rules[c.rule];
             let (mut remaining, mut reset_ns) = (c.remaining, c.reset_ns);
-            if settle(rule.spec.count.as_ref(), status) == Settle::Refund {
+            let counted = settle(rule.spec.count.as_ref(), status) == Settle::Keep;
+            if !counted && c.cost > 0 {
                 let t = *now.get_or_insert_with(|| self.limiter.clock.now_ns());
-                rule.table.refund(c.key.as_bytes(), t, 1);
+                rule.table.refund(c.key.as_bytes(), t, c.cost);
                 bump(&rule.counters.refunded);
-                remaining = (remaining + 1).min(rule.spec.rate.burst);
-                reset_ns = reset_ns.saturating_sub(interval_ns(&rule.spec.rate));
+                remaining = (remaining + c.cost).min(rule.spec.rate.burst);
+                reset_ns =
+                    reset_ns.saturating_sub(interval_ns(&rule.spec.rate).saturating_mul(c.cost));
+            }
+            if let Cost::ResponseHeader { name, missing } = &rule.spec.cost
+                && counted
+            {
+                // Charged now, into debt if need be: the key's next
+                // requests wait until it is paid off.
+                let mut owed = header_cost(
+                    resp.headers().get(name.as_str()).map(|v| v.as_bytes()),
+                    *missing,
+                );
+                if owed > 0 {
+                    let t = *now.get_or_insert_with(|| self.limiter.clock.now_ns());
+                    // A booking is at most one burst, so a larger cost is
+                    // booked a burst at a time.
+                    let burst = rule.spec.rate.burst.max(1);
+                    while owed > 0 {
+                        let Ok(b) = rule.table.book(c.key.as_bytes(), t, owed.min(burst)) else {
+                            break;
+                        };
+                        if !b.allowed {
+                            break;
+                        }
+                        remaining = b.remaining;
+                        owed -= b.granted;
+                    }
+                    bump(&rule.counters.charged_after);
+                }
             }
             if rule.spec.headers {
                 policies.push(rule.policy_item.clone());

@@ -18,6 +18,8 @@
 //! host = "app.example.com"
 //! path_prefix = "/login"
 //! methods = ["POST"]
+//! cost = "request_bytes"                 # or a number, "graphql", "response_header:x-cost"
+//! cost_missing = 4096                     # the cost when the request says nothing
 //! [http_limits.response]
 //! status = 429
 //! body = "slow down\n"
@@ -43,6 +45,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::cost::Cost;
 use crate::http::key::{KeySpec, Selector};
 use crate::http::layer::{Action, HttpRule, Match, Refusal, normal_host};
 use crate::http::response_count::StatusSet;
@@ -121,6 +124,14 @@ pub struct HttpLimitConfig {
     pub headers: Option<bool>,
     #[serde(default)]
     pub response: Option<ResponseConfig>,
+    /// A number, `"request_bytes"`, `"graphql"` or
+    /// `"response_header:NAME"`; 1 by default.
+    #[serde(default)]
+    pub cost: Option<StatusItem>,
+    /// What a request costs when the cost's source says nothing (no
+    /// `Content-Length`, no query, no header); 1 by default.
+    #[serde(default)]
+    pub cost_missing: Option<u64>,
 }
 
 /// A document's `http_limits` array, ignoring every other section, so
@@ -272,7 +283,29 @@ impl HttpLimitConfig {
                 refusal.content_type = ct.clone();
             }
         }
+        let missing = self.cost_missing.unwrap_or(1);
+        let cost = match &self.cost {
+            None => Ok(Cost::Fixed(1)),
+            Some(StatusItem::Code(n)) => Cost::parse(&n.to_string(), missing),
+            Some(StatusItem::Text(t)) => Cost::parse(t, missing),
+        }
+        .map_err(|e| format!("cost: {e}"))?;
+        if let Cost::Fixed(n) = cost
+            && n > rate.burst
+        {
+            return Err(format!(
+                "cost: {n} is more than the burst of {}, so no request would ever be admitted",
+                rate.burst
+            ));
+        }
+        if self.cost_missing.is_some() && matches!(cost, Cost::Fixed(_)) {
+            return Err(
+                "cost_missing: only a cost read from the request or response has a missing case"
+                    .into(),
+            );
+        }
         Ok(HttpRule {
+            cost,
             name: self.name.clone(),
             routes: self.routes.clone(),
             matches: Match {

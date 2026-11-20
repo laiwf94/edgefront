@@ -470,7 +470,7 @@ fn query<'a>(q: Option<&'a str>, name: &[u8]) -> Found<'a> {
 
 /// Percent-decoding as forms do it: `%XX` is the byte, `+` a space, and a
 /// `%` not followed by two hex digits stays itself.
-struct Decode<'a>(&'a [u8]);
+pub(crate) struct Decode<'a>(pub(crate) &'a [u8]);
 
 impl Iterator for Decode<'_> {
     type Item = u8;
