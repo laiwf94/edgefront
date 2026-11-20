@@ -6,7 +6,7 @@ A self-hosted application edge in one Rust binary. It brings three projects toge
 |---|---|---|
 | Cache | cachet | An HTTP caching reverse proxy in Rust, split into `edgefront-cache` and the root package and served by the `edgefront` binary |
 | Proxy | steer | A Go edge proxy and load balancer, ported to `edgefront-proxy` and `edgefront-core` and deleted from `legacy/` once the differential suite passed (see [Migrating from steer](#migrating-from-steer)) |
-| Limiter | pacer | A C rate limiter and TCP proxy, ported to `edgefront-limiter` and `edgefront limits`; the C was deleted in week 4, after the port gave the same answers and the benchmark below (see the migration note) |
+| Limiter | pacer | A C rate limiter and TCP proxy, ported to `edgefront-limiter` and `edgefront limits`; the C was deleted in week 4, after the port gave the same answers and the benchmark below (see [Migrating from pacer](#migrating-from-pacer)) |
 
 All three keep their full history. The plan for the next year, three tracks in parallel, is in [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap`.
 
@@ -185,7 +185,17 @@ edgefront ctl limits -s /run/pacerd/admin.sock client 192.0.2.7
 
 `examples/l4_limits.sh` is pacer's live demo on edgefront: the same config and clients, checking the connection-rate limit and its recovery, a slowloris client cut off beside a steady one, and a drain that finishes a download in flight byte for byte. CI runs it, and `crates/edgefront/tests/e2e_l4_limits.rs` runs it under `make test`. How it maps onto pacerd, and the two places it differs, are in [docs/DESIGN.md](docs/DESIGN.md#running-the-data-path-edgefront-limits).
 
-The C-versus-Rust benchmark of the port is in [docs/benchmarks/pacer-port.md](docs/benchmarks/pacer-port.md).
+### Migrating from pacer
+
+pacer is fully ported, and `legacy/pacer` is deleted (commit 54a2d6f). Its history stays reachable: `git log -- legacy/pacer` lists every commit that touched it in this repository, and `git log ff1d5f6^2` lists its own 36 commits from before the merge; `git checkout 54a2d6f^ -- legacy/pacer` brings the C back to build it. To move a pacerd deployment to `edgefront limits`:
+
+- **The config file is unchanged.** A pacerd.conf loads as it is, with pacerd's messages and line numbers for its mistakes; `edgefront limits -c pacerd.conf -t` is `pacerd -t`, and `edgefront check pacerd.conf` adds the lints. `edgefront check --print pacerd.conf` writes the same config as the TOML limiter section, which also takes `RateSpec` rates and quotas. pacer's example is `examples/limiter/pacerd.conf`.
+- **pacerctl is `edgefront ctl limits -s SOCKET`**, with the same `stats`, `ping`, `reload` and `drain`; `stats` prints the same lines. The admin socket speaks HTTP instead of pacerd's line protocol, so a script that wrote to the socket itself moves to `ctl` or to `curl --unix-socket SOCKET http://edgefront/stats`.
+- **The log lines, counters, exit codes and signals are pacerd's**: SIGHUP reloads in place, SIGTERM drains, and a client keeps its debt across a reload as it did.
+- **What pacer did not have:** `top` and `client` in `ctl`, connection quotas, and the lints of `edgefront check`.
+- **libpacer users** move to `edgefront-limiter`: the same algorithms with the same answers, held to libpacer's recorded transcripts by `make difftest-pacer`; the differences are listed in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
+
+[docs/benchmarks/pacer-port.md](docs/benchmarks/pacer-port.md) compares the two, measured before the deletion. edgefront-limiter makes more decisions per second than libpacer at every workload and thread count, from 1.07 to 2.90 times as many. Through `edgefront limits` a 64-byte round trip has a p99 of 173.1 µs against pacerd's 194.5, and a p50 of 96.0 against 94.0 (medians of three sessions). A tracked client costs 134.4 bytes against libpacer's 130.2. `crates/edgefront/tests/e2e_pacer_retired.rs` runs pacer's own example config through `edgefront limits` and checks that nothing in the build still needs legacy/pacer.
 
 ### Limiter config reference
 
