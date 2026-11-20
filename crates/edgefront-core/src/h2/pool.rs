@@ -90,6 +90,9 @@ pub enum PoolError {
     Connect,
     /// The connect took longer than `connect_timeout`.
     ConnectTimeout,
+    /// The origin was reached but does not speak HTTP/2: TLS negotiated
+    /// another protocol, or the HTTP/2 handshake failed.
+    NotHttp2,
     /// The origin did not process the stream (GOAWAY or REFUSED_STREAM):
     /// it is safe to send again.
     Refused,
@@ -104,6 +107,7 @@ impl PoolError {
         match self {
             PoolError::Connect => "connect",
             PoolError::ConnectTimeout => "connect_timeout",
+            PoolError::NotHttp2 => "not_http2",
             PoolError::Refused => "refused_stream",
             PoolError::Protocol => "protocol",
         }
@@ -265,6 +269,14 @@ where
         Pool::build(limits, settings, Some(tls.with_alpn(vec![b"h2".to_vec()])))
     }
 
+    /// Like [`with_tls`](Self::with_tls), offering `http/1.1` after `h2`,
+    /// so an origin without HTTP/2 completes its handshake and the pool
+    /// reports [`PoolError::NotHttp2`] instead of a TLS failure.
+    pub fn with_tls_auto(limits: PoolLimits, settings: Settings, tls: TlsTo) -> Pool<B> {
+        let alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Pool::build(limits, settings, Some(tls.with_alpn(alpn)))
+    }
+
     fn build(limits: PoolLimits, settings: Settings, tls: Option<TlsTo>) -> Pool<B> {
         let inner = Arc::new(Inner {
             limits,
@@ -365,12 +377,24 @@ where
         let builder = self.builder();
         let sender = match &self.inner.tls {
             None => {
+                // With prior knowledge the handshake is only the client's
+                // preface; whether the origin speaks HTTP/2 shows in the
+                // first frame it sends back, which must be SETTINGS.
+                let (first, tap) = Tap::new(tcp);
                 let (sender, conn) =
-                    tokio::time::timeout(limit, builder.handshake(TokioIo::new(tcp)))
+                    tokio::time::timeout(limit, builder.handshake(TokioIo::new(tap)))
                         .await
                         .map_err(|_| PoolError::ConnectTimeout)?
-                        .map_err(|_| PoolError::Connect)?;
+                        .map_err(|_| PoolError::NotHttp2)?;
                 tokio::spawn(conn);
+                match tokio::time::timeout(limit, first).await {
+                    Ok(Ok(true)) => {}
+                    Ok(_) => {
+                        tracing::debug!(origin = authority, "the origin did not answer in HTTP/2");
+                        return Err(PoolError::NotHttp2);
+                    }
+                    Err(_) => return Err(PoolError::ConnectTimeout),
+                }
                 sender
             }
             Some(tls) => {
@@ -389,13 +413,13 @@ where
                     })?;
                 if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
                     tracing::debug!(origin = authority, "the origin did not negotiate h2");
-                    return Err(PoolError::Connect);
+                    return Err(PoolError::NotHttp2);
                 }
                 let (sender, conn) =
                     tokio::time::timeout(limit, builder.handshake(TokioIo::new(stream)))
                         .await
                         .map_err(|_| PoolError::ConnectTimeout)?
-                        .map_err(|_| PoolError::Connect)?;
+                        .map_err(|_| PoolError::NotHttp2)?;
                 tokio::spawn(conn);
                 sender
             }
@@ -422,6 +446,23 @@ where
         b
     }
 
+    /// Makes sure a connection to the origin `uri` names is open, opening
+    /// one if none is, without sending anything: so a caller can learn
+    /// that the origin does not speak HTTP/2 ([`PoolError::NotHttp2`])
+    /// while it still holds its request.
+    pub async fn prepare(&self, uri: &Uri) -> Result<(), PoolError> {
+        let host = uri.host().ok_or(PoolError::Protocol)?;
+        let port = uri
+            .port_u16()
+            .unwrap_or(if self.inner.tls.is_some() { 443 } else { 80 });
+        let authority = format!("{host}:{port}");
+        let origin = self.origin(&authority);
+        if self.pick(&origin, true).is_some() {
+            return Ok(());
+        }
+        self.checkout(&authority, host).await.map(drop)
+    }
+
     /// Sends `req`, whose URI must be absolute (`http://host:port/path`;
     /// the scheme on the wire is `https` over TLS), once, and returns when
     /// the response head arrives.
@@ -432,12 +473,19 @@ where
             .port_u16()
             .unwrap_or(if self.inner.tls.is_some() { 443 } else { 80 });
         let authority = format!("{}:{port}", uri.authority().map_or("", |a| a.host()));
-        if self.inner.tls.is_some() {
-            *req.uri_mut() = with_scheme(&uri, "https")?;
-        }
+        // The URI names the origin to connect to; `:authority` carries the
+        // request's `Host` when it has one, as HTTP/1.1's `Host` would.
+        let scheme = if self.inner.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        let named = req
+            .headers_mut()
+            .remove(http::header::HOST)
+            .and_then(|h| h.to_str().ok().map(str::to_owned));
+        *req.uri_mut() = rebuild(&uri, scheme, named.as_deref())?;
         *req.version_mut() = http::Version::HTTP_2;
-        // HTTP/2 carries the host in :authority.
-        req.headers_mut().remove(http::header::HOST);
         let conn = self.checkout(&authority, &host).await?;
         conn.streams.fetch_add(1, Ordering::Relaxed);
         let stream = Stream(Arc::clone(&conn) as Arc<dyn StreamCount>);
@@ -482,9 +530,109 @@ where
     }
 }
 
-fn with_scheme(uri: &Uri, scheme: &str) -> Result<Uri, PoolError> {
+/// A stream that reports whether the first frame header the peer sends
+/// is a `SETTINGS` frame on stream 0, as an HTTP/2 server's must be (RFC
+/// 9113 section 3.4).
+struct Tap<S> {
+    inner: S,
+    head: Vec<u8>,
+    first: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+impl<S> Tap<S> {
+    fn new(inner: S) -> (tokio::sync::oneshot::Receiver<bool>, Tap<S>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tap = Tap {
+            inner,
+            head: Vec::with_capacity(9),
+            first: Some(tx),
+        };
+        (rx, tap)
+    }
+
+    fn saw(&mut self, bytes: &[u8]) {
+        let Some(tx) = self.first.take() else { return };
+        if bytes.is_empty() {
+            let _ = tx.send(false);
+            return;
+        }
+        let take = (9 - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..take]);
+        if self.head.len() < 9 {
+            self.first = Some(tx);
+            return;
+        }
+        let h = &self.head;
+        let _ = tx.send(h[3] == 0x4 && h[5..9] == [0, 0, 0, 0]);
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Tap<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        match &polled {
+            Poll::Ready(Ok(())) if this.first.is_some() => {
+                let filled = buf.filled()[before..].to_vec();
+                this.saw(&filled);
+            }
+            Poll::Ready(Err(_)) => {
+                if let Some(tx) = this.first.take() {
+                    let _ = tx.send(false);
+                }
+            }
+            _ => {}
+        }
+        polled
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tap<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// `uri` with `scheme`, and with `authority` in place of its own when
+/// given.
+fn rebuild(uri: &Uri, scheme: &str, authority: Option<&str>) -> Result<Uri, PoolError> {
     let mut parts = uri.clone().into_parts();
     parts.scheme = Some(scheme.parse().map_err(|_| PoolError::Protocol)?);
+    if let Some(a) = authority {
+        parts.authority = Some(a.parse().map_err(|_| PoolError::Protocol)?);
+    }
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+    }
     Uri::from_parts(parts).map_err(|_| PoolError::Protocol)
 }
 
@@ -530,6 +678,7 @@ mod tests {
         for (e, name) in [
             (PoolError::Connect, "connect"),
             (PoolError::ConnectTimeout, "connect_timeout"),
+            (PoolError::NotHttp2, "not_http2"),
             (PoolError::Refused, "refused_stream"),
             (PoolError::Protocol, "protocol"),
         ] {
@@ -537,12 +686,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn the_tap_reads_the_first_frame_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (input, want) in [
+            (&[0u8, 0, 6, 4, 0, 0, 0, 0, 0, 1][..], true),
+            (&b"HTTP/1.1 400 Bad Request\r\n"[..], false),
+            (&[0u8, 0, 0, 4, 0, 0, 0, 0, 1][..], false),
+            (&[0u8, 0, 0][..], false),
+        ] {
+            let (mut far, near) = tokio::io::duplex(64);
+            let (first, mut tap) = Tap::new(near);
+            far.write_all(input).await.unwrap();
+            drop(far);
+            let mut sink = Vec::new();
+            let _ = tap.read_to_end(&mut sink).await;
+            assert_eq!(first.await, Ok(want), "{input:?}");
+        }
+    }
+
     #[test]
-    fn schemes_are_rewritten_for_tls() {
-        let u: Uri = "http://a.test:8443/x?y=1".parse().unwrap();
+    fn uris_take_the_scheme_and_the_named_authority() {
+        let u: Uri = "http://10.0.0.1:8443/x?y=1".parse().unwrap();
         assert_eq!(
-            with_scheme(&u, "https").unwrap().to_string(),
-            "https://a.test:8443/x?y=1"
+            rebuild(&u, "https", None).unwrap().to_string(),
+            "https://10.0.0.1:8443/x?y=1"
+        );
+        assert_eq!(
+            rebuild(&u, "http", Some("api.test")).unwrap().to_string(),
+            "http://api.test/x?y=1"
+        );
+        assert_eq!(
+            rebuild(&u, "http", Some("bad host")),
+            Err(PoolError::Protocol)
         );
     }
 }

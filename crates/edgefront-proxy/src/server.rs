@@ -101,7 +101,7 @@ use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
 use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
 use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
-use edgefront_core::http1::{Client, ClientLimits, TlsTo};
+use edgefront_core::http1::{ClientLimits, TlsTo};
 use edgefront_core::listener::Handler;
 use edgefront_core::reload;
 use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics, TlsMetrics};
@@ -122,6 +122,7 @@ use crate::forwarded;
 use crate::health::{self, Checker};
 use crate::outlier::Detector;
 use crate::path::RequestTarget;
+use crate::protocol::{ResponseBody, Upstream as Way};
 use crate::reqid;
 use crate::retry::{self, Budget, Outcome, Policy};
 use crate::route::Router;
@@ -242,7 +243,8 @@ struct Cluster {
     /// The header Maglev hashes, when the policy is Maglev.
     hash_header: Option<HeaderName>,
     clock: Arc<dyn Clock>,
-    client: Client<Body>,
+    /// The way to the endpoints: HTTP/1.1, HTTP/2 or either.
+    client: Way,
     timeout: Option<Duration>,
     /// Requests holding a permit; shared with the cluster of the same name
     /// in the next runtime, so a reload keeps the count right.
@@ -395,14 +397,16 @@ impl Cluster {
             ..ClientLimits::default()
         };
         let client = match (&tls, prev) {
-            (Some(Ok(t)), _) => Client::with_tls(&limits, t.clone()),
-            (Some(Err(())), _) => Client::refusing(&limits),
+            (Some(Ok(t)), _) => Way::new(cfg.protocol, &limits, Some(t)),
+            (Some(Err(())), _) => Way::refusing(&limits),
             (None, Some(p))
-                if p.config.connect_timeout == cfg.connect_timeout && p.config.tls.is_none() =>
+                if p.config.connect_timeout == cfg.connect_timeout
+                    && p.config.tls.is_none()
+                    && p.config.protocol == cfg.protocol =>
             {
-                p.client.clone()
+                Way::with_http1(cfg.protocol, &limits, None, p.client.http1().clone())
             }
-            (None, _) => Client::new(&limits),
+            (None, _) => Way::new(cfg.protocol, &limits, None),
         };
         let addresses: Vec<&str> = cfg.endpoints.iter().map(|e| e.address.as_str()).collect();
         Cluster {
@@ -932,7 +936,7 @@ impl Proxy {
         };
         let key = cluster.key(&parts.headers);
         let mut headers = parts.headers;
-        let length = request_length(&headers, &incoming);
+        let length = request_length(&headers, &incoming, parts.version);
         fwd.apply(&mut headers);
 
         let deadline = cluster.timeout.map(|t| started + t);
@@ -1152,7 +1156,7 @@ impl Cluster {
         length: Option<u64>,
         key: Option<u64>,
         tried: &mut Vec<usize>,
-    ) -> Result<(Response<Incoming>, InFlight), Failure> {
+    ) -> Result<(Response<ResponseBody>, InFlight), Failure> {
         let uri_for = |address: &str| {
             Uri::try_from(format!(
                 "http://{address}{}",
@@ -1193,7 +1197,7 @@ impl Cluster {
             *out.headers_mut() = headers.clone();
             let began = self.clock.now();
             let result = match retry::per_try(&*self.clock, per_try, self.client.send(out)).await {
-                Ok(r) => r.map_err(Outcome::of_error),
+                Ok(r) => r.map(|(resp, _)| resp).map_err(Outcome::of_error),
                 Err(retry::PerTryTimeout) => Err(Outcome::Timeout),
             };
             let now = self.clock.now();
@@ -1252,7 +1256,7 @@ impl Cluster {
 /// Reads up to 4 KiB of a response that will not be delivered, so a short
 /// body leaves its connection ready for reuse, as steer did before a
 /// retry, then drops it.
-async fn drain(resp: Response<Incoming>) {
+async fn drain(resp: Response<ResponseBody>) {
     const DRAIN: usize = 4 << 10;
     let mut body = resp.into_body();
     let mut read = 0;
@@ -1267,7 +1271,7 @@ async fn drain(resp: Response<Incoming>) {
 /// An upstream response on its way to the client, with the hop-by-hop
 /// headers removed and its body cut at the deadline.
 fn proxied(
-    resp: Response<Incoming>,
+    resp: Response<ResponseBody>,
     deadline: Option<Instant>,
     permit: Permit,
     in_flight: InFlight,
@@ -1563,7 +1567,12 @@ fn go_bad_request(reason: Option<&'static str>) -> Response<Body> {
 }
 
 /// One of steer's JSON errors.
-fn error(id: &HeaderValue, status: StatusCode, code: &str, message: &str) -> Response<Body> {
+fn error(
+    id: &HeaderValue,
+    status: StatusCode,
+    code: &str,
+    message: &'static str,
+) -> Response<Body> {
     // The ID passed `reqid::valid` or is hex, and the code and message are
     // fixed, so nothing needs JSON escaping. Go's encoder ends with "\n".
     let id_text = id.to_str().expect("request IDs are ASCII");
@@ -1623,9 +1632,14 @@ fn has_token(value: &[u8], token: &[u8]) -> bool {
 
 /// The request body's length as Go's server saw it: `Some(n)` for a
 /// `Content-Length` body (hyper has checked it), `None` when chunked.
-fn request_length(headers: &HeaderMap, body: &Incoming) -> Option<u64> {
+fn request_length(headers: &HeaderMap, body: &Incoming, version: Version) -> Option<u64> {
     if headers.contains_key(header::TRANSFER_ENCODING) {
         return None;
+    }
+    // HTTP/2 frames bodies itself: without `content-length` a body that
+    // did not end with its headers streams, as chunked would.
+    if version == Version::HTTP_2 && !body.is_end_stream() {
+        return body.size_hint().exact();
     }
     Some(body.size_hint().exact().unwrap_or(0))
 }
@@ -1747,7 +1761,7 @@ impl HttpBody for Prefixed {
 /// `max_requests` and in its endpoint's in-flight count until it is
 /// dropped.
 struct Proxied {
-    inner: Incoming,
+    inner: ResponseBody,
     deadline: Option<Pin<Box<Sleep>>>,
     _permit: Permit,
     _in_flight: InFlight,

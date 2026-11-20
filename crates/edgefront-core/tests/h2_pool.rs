@@ -404,7 +404,8 @@ async fn unreachable_origins_fail_to_connect() {
         pool.send(get(addr, "/")).await.map(|r| r.status()),
         Err(PoolError::Connect)
     );
-    // An HTTP/1.1-only cleartext origin fails the HTTP/2 handshake.
+    // An HTTP/1.1-only cleartext origin answers the preface in HTTP/1.1,
+    // not with SETTINGS: it does not speak HTTP/2.
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let h1 = socket.local_addr().unwrap();
     tokio::spawn(serve(
@@ -414,8 +415,30 @@ async fn unreachable_origins_fail_to_connect() {
         std::future::pending(),
     ));
     let r = pool.send(get(h1, "/")).await.map(|r| r.status());
-    assert!(
-        matches!(r, Err(PoolError::Connect | PoolError::Protocol)),
-        "{r:?}"
-    );
+    assert_eq!(r, Err(PoolError::NotHttp2));
+    // So does a TLS origin that negotiates only http/1.1, when the pool
+    // offers both.
+    let snapshot =
+        Snapshot::load_with(&tls_config(vec![cert("exact", &[])]), &Shared::default()).unwrap();
+    let acceptor = Acceptor::new(Store::new(Arc::new(snapshot)), None);
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let h1s = socket.local_addr().unwrap();
+    tokio::spawn(serve_tls(
+        socket,
+        acceptor,
+        Counting::new(Duration::ZERO),
+        ServerLimits::default(),
+        std::future::pending(),
+    ));
+    let tls = TlsTo::load(&UpstreamTls {
+        ca_file: fixture("ca.crt"),
+        server_name: Some("api.example.com".to_owned()),
+        cert_file: None,
+        key_file: None,
+    })
+    .unwrap();
+    let auto: Pool<Full<Bytes>> =
+        Pool::with_tls_auto(PoolLimits::default(), Settings::default(), tls);
+    let r = auto.send(get(h1s, "/")).await.map(|r| r.status());
+    assert_eq!(r, Err(PoolError::NotHttp2));
 }

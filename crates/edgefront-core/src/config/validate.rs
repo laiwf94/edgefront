@@ -10,7 +10,7 @@ use super::raw::{self, RawCluster, RawConfig, RawHttp2, RawTls};
 use super::{
     Acme, AcmeChallenge, Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config,
     ConfigError, Endpoint, FieldError, HealthCheck, Http2, IpPrefix, Ocsp, OutlierDetection,
-    Policy, Retry, Route, Tls, TlsVersion, UpstreamTls, defaults, go, limits,
+    Policy, Retry, Route, Tls, TlsVersion, UpstreamProtocol, UpstreamTls, defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -626,6 +626,21 @@ impl Validator {
                 .tls
                 .as_ref()
                 .map(|t| self.upstream_tls(&format!("{path}.tls"), t)),
+            protocol: match rc.protocol.as_str() {
+                "" | "http1" => UpstreamProtocol::Http1,
+                "http2" => UpstreamProtocol::Http2,
+                "auto" => UpstreamProtocol::Auto,
+                other => {
+                    self.add(
+                        format!("{path}.protocol"),
+                        format!(
+                            "unknown protocol {}; use http1, http2 or auto",
+                            go::quote(other)
+                        ),
+                    );
+                    UpstreamProtocol::Http1
+                }
+            },
         }
     }
 

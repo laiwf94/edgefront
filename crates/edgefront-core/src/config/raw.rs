@@ -313,6 +313,7 @@ raw_struct!(RawCluster, "an object" {
     retry: Option<RawRetry>,
     allowed_clients: Option<Vec<String>>,
     tls: Option<RawUpstreamTls>,
+    protocol: String,
 });
 
 raw_struct!(RawEndpoint, "an object" {

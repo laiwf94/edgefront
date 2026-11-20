@@ -406,6 +406,32 @@ pub struct Cluster {
     /// TLS, or mutual TLS, to the endpoints. `None` is plain HTTP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<UpstreamTls>,
+    /// The HTTP version spoken to the endpoints.
+    #[serde(skip_serializing_if = "UpstreamProtocol::is_default")]
+    pub protocol: UpstreamProtocol,
+}
+
+/// The HTTP version a cluster speaks to its endpoints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProtocol {
+    /// HTTP/1.1 only, steer's behaviour.
+    #[default]
+    Http1,
+    /// HTTP/2 only: with prior knowledge in cleartext, or `h2` over ALPN
+    /// with TLS. An endpoint that does not speak it fails the attempt.
+    Http2,
+    /// HTTP/2 where the endpoint speaks it, HTTP/1.1 where it does not:
+    /// `h2` and `http/1.1` offered over ALPN with TLS, or prior knowledge
+    /// tried first in cleartext, with the endpoint downgraded to HTTP/1.1
+    /// for a while after an HTTP/2 handshake fails.
+    Auto,
+}
+
+impl UpstreamProtocol {
+    pub fn is_default(&self) -> bool {
+        *self == UpstreamProtocol::Http1
+    }
 }
 
 /// TLS from the proxy to a cluster's endpoints.

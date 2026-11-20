@@ -13,6 +13,7 @@ pub mod forwarded;
 pub mod health;
 pub mod outlier;
 pub mod path;
+pub mod protocol;
 pub use edgefront_core::reqid;
 pub mod retry;
 pub mod route;
