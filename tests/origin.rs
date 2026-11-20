@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cachet::origin::{HealthSettings, Origin, OriginError, OriginPool, Outbound, client};
+use cachet::origin::{HealthSettings, Origin, OriginError, OriginPool, OutBody, Outbound, client};
 use cachet::respond::full;
 use common::{TestOrigin, black_hole, closed_port, eventually, garbage_server, handler, reply};
 use http::uri::PathAndQuery;
@@ -43,7 +43,7 @@ fn get(path: &'static str) -> Outbound {
         method: Method::GET,
         path: PathAndQuery::from_static(path),
         headers: HeaderMap::new(),
-        body: None,
+        body: OutBody::None,
     }
 }
 
@@ -86,9 +86,24 @@ async fn requests_with_a_body_are_not_retried() {
     let p = pool(&[down, b.addr]);
     let mut out = get("/submit");
     out.method = Method::POST;
-    out.body = Some(full("payload"));
+    out.body = OutBody::Stream(full("payload"));
     assert_eq!(p.send(out).await.unwrap_err(), OriginError::Connect);
     assert_eq!(b.hits(), 0);
+}
+
+#[tokio::test]
+async fn a_replayable_body_fails_over_whole() {
+    let down = closed_port().await;
+    let b = named("b").await;
+    let p = pool(&[down, b.addr]);
+    let mut out = get("/config");
+    out.method = Method::PUT;
+    out.body = OutBody::Replayable(bytes::Bytes::from_static(b"payload"));
+    let (resp, origin) = p.send(out).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin.name, "o1");
+    assert_eq!(b.hits(), 1);
+    assert_eq!(b.last().body, "payload");
 }
 
 #[tokio::test]

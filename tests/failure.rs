@@ -190,3 +190,100 @@ async fn concurrent_clients_evictions_and_purges() {
     );
     Arc::into_inner(node).unwrap().shutdown().await;
 }
+
+/// An origin that answers the first request on each connection, keeps it
+/// open, then closes it on the second without an answer: what a pooled
+/// connection looks like when the origin's keep-alive timeout ends it just
+/// as the proxy reuses it. Returns the address and the requests seen.
+async fn closes_reused_connections() -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // The first request: its head, then its declared body.
+                let head_end = loop {
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: "))
+                    .map_or(0, |v| v.trim().parse().unwrap());
+                while buf.len() < head_end + len {
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {body}", head.lines().next().unwrap()));
+                let _ = s
+                    .write_all(b"HTTP/1.1 201 Created\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+                // The second request on this connection: closed unanswered.
+                let _ = s.read(&mut chunk).await;
+            });
+        }
+    });
+    (addr, seen)
+}
+
+#[tokio::test]
+async fn a_small_idempotent_body_is_sent_again_when_a_reused_connection_was_closed() {
+    let (addr, seen) = closes_reused_connections().await;
+    let h = harness(&[addr], |_, _| {});
+    let put = |body: &'static str| {
+        let len = body.len().to_string();
+        let h = &h;
+        async move {
+            h.send(
+                "PUT",
+                "/config/a",
+                &[("content-length", len.as_str())],
+                body,
+            )
+            .await
+        }
+    };
+    assert_eq!(put("first").await.status, 201);
+    // The pooled connection is reused and closed under the request; the
+    // body is sent again on a fresh connection.
+    let got = put("second").await;
+    assert_eq!(got.status, 201);
+    assert_eq!(got.body, "ok");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            "put /config/a http/1.1 first",
+            "put /config/a http/1.1 second"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_post_body_is_sent_once() {
+    let (addr, seen) = closes_reused_connections().await;
+    let h = harness(&[addr], |_, _| {});
+    let post = || h.send("POST", "/form", &[("content-length", "4")], "data");
+    assert_eq!(post().await.status, 201);
+    // POST is not idempotent, so the request that met a closed connection
+    // is not sent again.
+    assert_eq!(post().await.status, 502);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
