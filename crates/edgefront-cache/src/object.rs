@@ -83,7 +83,7 @@ impl CachedObject {
     ) -> Self {
         CachedObject {
             status,
-            cc: CacheControl::from_headers(&headers),
+            cc: CacheControl::for_response(&headers),
             etag: EntityTag::from_header(&headers),
             tags: surrogate_keys(&headers),
             headers,

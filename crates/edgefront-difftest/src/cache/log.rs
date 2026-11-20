@@ -376,7 +376,14 @@ fn proxy(rng: &mut Rng, s: &Scenario, t: u64, k: usize) -> Entry {
     }
     if rng.chance(0.03) {
         let at = START_OF_CONTENT + rng.below(40) as u64 * 3600;
-        h.push(("if-modified-since".into(), http_date(at)));
+        // Only where the origin sends Last-Modified. cachet 0.1 answered
+        // If-Modified-Since on a stored response without one with 200;
+        // since #90 the node judges it by the stored Date, as RFC 9111
+        // section 4.3.2 says, a deliberate difference that the unit tests
+        // and the conformance suite check instead.
+        if matches!(family, "page" | "heuristic") {
+            h.push(("if-modified-since".into(), http_date(at)));
+        }
     }
     if rng.chance(0.04) {
         let directives = [

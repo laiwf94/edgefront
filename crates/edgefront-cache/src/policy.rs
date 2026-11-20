@@ -39,7 +39,10 @@ impl NotStorable {
     }
 }
 
-/// Status codes this cache understands well enough to store.
+/// Status codes this cache understands: what `must-understand` needs before
+/// it may override `no-store` (RFC 9111 section 5.2.2.3). Any other final
+/// status may still be stored when the response has explicit freshness
+/// (RFC 9111 section 3), except 206, which is cached only as slices.
 fn understood(status: StatusCode) -> bool {
     matches!(
         status.as_u16(),
@@ -90,11 +93,15 @@ pub fn storable(x: &Exchange<'_>, heuristic_max: Duration) -> Result<(), NotStor
     if req_cc.no_store {
         return Err(NotStorable::RequestNoStore);
     }
-    if !understood(status) {
+    let code = status.as_u16();
+    if !(200..600).contains(&code) || code == 206 || code == 304 {
         return Err(NotStorable::Status);
     }
-    // must-understand overrides no-store for status codes the cache
-    // understands (RFC 9111 section 5.2.2.3).
+    // must-understand: the status must be understood, and then it
+    // overrides no-store (RFC 9111 section 5.2.2.3).
+    if resp_cc.must_understand && !understood(status) {
+        return Err(NotStorable::Status);
+    }
     if resp_cc.no_store && !resp_cc.must_understand {
         return Err(NotStorable::NoStore);
     }
@@ -117,7 +124,7 @@ pub fn storable(x: &Exchange<'_>, heuristic_max: Duration) -> Result<(), NotStor
     }
     let explicit = resp_cc.s_maxage.is_some()
         || resp_cc.max_age.is_some()
-        || resp_headers.contains_key(header::EXPIRES);
+        || !resp_cc.targeted && resp_headers.contains_key(header::EXPIRES);
     if !explicit && !resp_cc.public && !heuristically_cacheable(status) {
         return Err(NotStorable::Status);
     }
@@ -147,7 +154,9 @@ pub(crate) fn freshness_lifetime(
         return Duration::from_secs(s);
     }
     let date = date_header(headers, &header::DATE).unwrap_or(response_time);
-    if headers.contains_key(header::EXPIRES) {
+    // Directives from CDN-Cache-Control replace Expires as well as
+    // Cache-Control (RFC 9213 section 2.2).
+    if !cc.targeted && headers.contains_key(header::EXPIRES) {
         // An invalid Expires (such as "0") means already expired.
         return date_header(headers, &header::EXPIRES)
             .and_then(|e| e.duration_since(date).ok())
@@ -430,9 +439,42 @@ mod tests {
             store_check(&[], 206, &[("cache-control", "max-age=60")]),
             Err(NotStorable::Status)
         );
+        // Any final status with explicit freshness (RFC 9111 section 3),
+        // but never 206, 304, an informational or an out-of-range code.
+        for code in [299, 400, 500, 502, 503, 504, 599] {
+            assert_eq!(
+                store_check(&[], code, &[("cache-control", "max-age=60")]),
+                Ok(()),
+                "{code}"
+            );
+        }
+        for code in [103, 304, 600] {
+            assert_eq!(
+                store_check(&[], code, &[("cache-control", "max-age=60")]),
+                Err(NotStorable::Status),
+                "{code}"
+            );
+        }
+        // Without explicit freshness only the heuristically cacheable
+        // codes are stored, or any with public.
         assert_eq!(
-            store_check(&[], 500, &[("cache-control", "max-age=60")]),
+            store_check(
+                &[],
+                599,
+                &[("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT")]
+            ),
             Err(NotStorable::Status)
+        );
+        assert_eq!(
+            store_check(
+                &[],
+                599,
+                &[
+                    ("cache-control", "public"),
+                    ("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT")
+                ]
+            ),
+            Ok(())
         );
         assert_eq!(
             store_check(&[], 200, &[("cache-control", "no-store, max-age=60")]),
@@ -801,5 +843,80 @@ mod tests {
         assert_eq!(out["cache-control"], "max-age=99");
         assert_eq!(out.get_all("x-a").iter().collect::<Vec<_>>(), ["3"]);
         assert_eq!(out["x-new"], "y");
+    }
+
+    #[test]
+    fn cdn_cache_control_replaces_cache_control_and_expires() {
+        let life = |resp: &[(&str, &str)]| {
+            let h = map(resp);
+            freshness_lifetime(
+                StatusCode::OK,
+                &h,
+                &CacheControl::for_response(&h),
+                t(0),
+                DAY,
+            )
+        };
+        let past = date(0);
+        let future = date(10_000);
+        assert_eq!(
+            life(&[
+                ("cdn-cache-control", "max-age=3600"),
+                ("expires", &past),
+                ("date", &date(5))
+            ]),
+            Duration::from_secs(3600)
+        );
+        // Targeted without a lifetime: Expires is ignored too.
+        assert_eq!(
+            life(&[
+                ("cdn-cache-control", "public"),
+                ("expires", &future),
+                ("date", &date(0))
+            ]),
+            Duration::ZERO
+        );
+        let h = map(&[
+            ("cache-control", "no-store"),
+            ("cdn-cache-control", "max-age=10000"),
+        ]);
+        let cc = CacheControl::for_response(&h);
+        let x = Exchange {
+            method: &Method::GET,
+            req_headers: &HeaderMap::new(),
+            req_cc: &CacheControl::default(),
+            status: StatusCode::OK,
+            resp_headers: &h,
+            resp_cc: &cc,
+            response_time: t(0),
+        };
+        assert_eq!(storable(&x, DAY), Ok(()));
+        let h = map(&[
+            ("cache-control", "max-age=10000"),
+            ("cdn-cache-control", "private"),
+            ("expires", &future),
+        ]);
+        let cc = CacheControl::for_response(&h);
+        assert_eq!(
+            storable(
+                &Exchange {
+                    resp_headers: &h,
+                    resp_cc: &cc,
+                    ..x
+                },
+                DAY
+            ),
+            Err(NotStorable::Private)
+        );
+        // Targeted with no freshness: Expires does not make it explicit.
+        let h = map(&[("cdn-cache-control", "foo"), ("expires", &future)]);
+        let cc = CacheControl::for_response(&h);
+        let x = Exchange {
+            status: StatusCode::from_u16(599).unwrap(),
+            resp_headers: &h,
+            resp_cc: &cc,
+            ..x
+        };
+        assert_eq!(storable(&x, DAY), Err(NotStorable::Status));
     }
 }

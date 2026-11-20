@@ -1039,7 +1039,7 @@ impl Fill {
             return Upstream::Resend(headers);
         }
         let headers = policy::merge_not_modified(&stored.headers, &parts.headers);
-        let cc = CacheControl::from_headers(&headers);
+        let cc = CacheControl::for_response(&headers);
         let freshness = self.freshness(stored.status, &headers, &cc);
         let obj = Arc::new(CachedObject::with_vary(
             stored.status,
@@ -1069,7 +1069,7 @@ impl Fill {
         if is_error_status(parts.status) {
             self.failure = Some(format!("fwd-status={}", parts.status.as_u16()));
         }
-        let resp_cc = CacheControl::from_headers(&parts.headers);
+        let resp_cc = CacheControl::for_response(&parts.headers);
         let exchange = Exchanged {
             method: &Method::GET,
             req_headers: &self.client_headers,
@@ -1079,6 +1079,17 @@ impl Fill {
             resp_cc: &resp_cc,
             response_time: self.shared.clock.now(),
         };
+        // A 5xx the origin made storable still does not replace a good
+        // stored copy: stale-if-error may answer with that copy instead,
+        // and the next fetch tries the origin again.
+        if is_error_status(parts.status)
+            && self
+                .stored
+                .as_ref()
+                .is_some_and(|s| !is_error_status(s.status))
+        {
+            return self.through(parts, body);
+        }
         if let Err(reason) = policy::storable(&exchange, self.policy.heuristic_max) {
             self.shared.observer.not_stored(reason);
             // The origin answered in full but no longer lets this be
@@ -1313,7 +1324,7 @@ impl Fill {
         let upstream_status = parts.status.as_u16();
         parts.headers.remove(header::CONTENT_LENGTH);
         parts.headers.remove(header::CONTENT_RANGE);
-        let cc = CacheControl::from_headers(&parts.headers);
+        let cc = CacheControl::for_response(&parts.headers);
         let freshness = self.freshness(StatusCode::OK, &parts.headers, &cc);
         let mut manifest_headers = parts.headers.clone();
         manifest_headers.insert(SLICES, layout.header());

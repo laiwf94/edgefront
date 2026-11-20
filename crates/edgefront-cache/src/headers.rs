@@ -7,9 +7,92 @@ use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 
 use crate::cache_control::parse_delta;
 
-/// Parses an HTTP-date in any of the three formats a recipient must accept.
+/// Parses an HTTP-date in any of the three formats a recipient must accept
+/// (RFC 9110 section 5.6.7). Day names, month names and `GMT` are matched
+/// in any case. An rfc850-date's two-digit year is read as the nearest
+/// year with those digits that is at most 50 years in the future, as the
+/// RFC requires, against the system clock.
 pub fn parse_http_date(value: &HeaderValue) -> Option<SystemTime> {
-    httpdate::parse_http_date(value.to_str().ok()?.trim()).ok()
+    parse_http_date_at(value.to_str().ok()?, SystemTime::now())
+}
+
+const DAYS: [&str; 7] = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// [`parse_http_date`] with `now` for the rfc850-date year.
+pub(crate) fn parse_http_date_at(text: &str, now: SystemTime) -> Option<SystemTime> {
+    let text = text.trim();
+    if !text.is_ascii() {
+        return None;
+    }
+    // Every alphabetic run in canonical case: day names (full or short),
+    // month names and GMT.
+    let mut canon = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_alphabetic() {
+            canon.push(char::from(bytes[i]));
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let word = &text[start..i];
+        let known = DAYS
+            .iter()
+            .flat_map(|d| [*d, &d[..3]])
+            .chain(MONTHS)
+            .chain(["GMT"])
+            .find(|k| k.eq_ignore_ascii_case(word));
+        canon.push_str(known.unwrap_or(word));
+    }
+    if let Some(imf) = rfc850_as_imf(&canon, now) {
+        return httpdate::parse_http_date(&imf).ok();
+    }
+    httpdate::parse_http_date(&canon).ok()
+}
+
+/// An rfc850-date (`Sunday, 06-Nov-94 08:49:37 GMT`) rewritten as an
+/// IMF-fixdate with its year resolved against `now`.
+fn rfc850_as_imf(s: &str, now: SystemTime) -> Option<String> {
+    let (day, rest) = s.split_once(", ")?;
+    let day = DAYS.iter().find(|d| **d == day)?;
+    let b = rest.as_bytes();
+    if b.len() != 22 || b[2] != b'-' || b[6] != b'-' || &rest[18..] != " GMT" {
+        return None;
+    }
+    let yy: u64 = rest.get(7..9)?.parse().ok()?;
+    let this_year = httpdate::fmt_http_date(now)
+        .get(12..16)?
+        .parse::<u64>()
+        .ok()?;
+    let mut year = this_year - this_year % 100 + yy;
+    if year > this_year + 50 {
+        year -= 100;
+    } else if year + 50 < this_year {
+        year += 100;
+    }
+    Some(format!(
+        "{}, {} {} {}{}",
+        &day[..3],
+        &rest[..2],
+        &rest[3..6],
+        year,
+        &rest[9..]
+    ))
 }
 
 /// The first value of a date header, if it parses.
@@ -23,10 +106,15 @@ pub fn http_date(t: SystemTime) -> HeaderValue {
 }
 
 /// The Age header in seconds; missing or invalid values count as zero.
+/// A field line holding a list (`7200, 0`) is read by its first member,
+/// as a list-based recipient would; later field lines are ignored.
 pub(crate) fn age_value(headers: &HeaderMap) -> u64 {
     headers
         .get(header::AGE)
-        .and_then(|v| parse_delta(v.as_bytes().trim_ascii()))
+        .and_then(|v| {
+            let first = v.as_bytes().split(|&b| b == b',').next()?;
+            parse_delta(first.trim_ascii())
+        })
         .unwrap_or(0)
 }
 
@@ -356,5 +444,60 @@ mod tests {
         strip_hop_by_hop(&mut h);
         let names: Vec<_> = h.keys().map(HeaderName::as_str).collect();
         assert_eq!(names, ["content-type"]);
+    }
+
+    #[test]
+    fn dates_in_any_case_and_rfc850_years_within_fifty_years() {
+        let at = |s: &str| parse_http_date_at(s, UNIX_EPOCH + Duration::from_secs(1_795_000_000));
+        let want = httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        for s in [
+            "SUN, 06 NOV 1994 08:49:37 gmt",
+            "sun, 06 nov 1994 08:49:37 GMT",
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "sunday, 06-nov-94 08:49:37 Gmt",
+            "Sun Nov  6 08:49:37 1994",
+        ] {
+            assert_eq!(at(s), Some(want), "{s}");
+        }
+        // 2026: 70 is 2070 (44 years ahead), 74 is 2074, 86 is 1986.
+        let year = |s: &str| at(s).map(|t| httpdate::fmt_http_date(t)[12..16].to_owned());
+        assert_eq!(
+            year("Saturday, 01-Feb-70 00:00:00 GMT").as_deref(),
+            Some("2070")
+        );
+        assert_eq!(
+            year("Thursday, 01-Feb-74 00:00:00 GMT").as_deref(),
+            Some("2074")
+        );
+        assert_eq!(
+            year("Saturday, 01-Feb-86 00:00:00 GMT").as_deref(),
+            Some("1986")
+        );
+        // The weekday must match the resolved date.
+        assert_eq!(at("Monday, 01-Feb-70 00:00:00 GMT"), None);
+        for bad in [
+            "Sunday, 06-Nov-94 08:49:37 UTC",
+            "Sunday 06-Nov-94 08:49:37 GMT",
+            "Someday, 06-Nov-94 08:49:37 GMT",
+            "Sunday, 06-Nov-9x 08:49:37 GMT",
+            "Sunday, 06 Nov 94 08:49:37 GMT",
+            "Sön, 06 Nov 1994 08:49:37 GMT",
+            "Xyz, 06 Nov 1994 08:49:37 GMT",
+        ] {
+            assert_eq!(at(bad), None, "{bad}");
+        }
+        // Near a century's end the window reaches into the next one.
+        let t2090 = httpdate::parse_http_date("Sun, 01 Jan 2090 00:00:00 GMT").unwrap();
+        let y = parse_http_date_at("Wednesday, 01-Jan-10 00:00:00 GMT", t2090)
+            .map(|t| httpdate::fmt_http_date(t)[12..16].to_owned());
+        assert_eq!(y.as_deref(), Some("2110"));
+    }
+
+    #[test]
+    fn age_lists_are_read_by_their_first_member() {
+        assert_eq!(age_value(&map(&[("age", "7200, 0")])), 7200);
+        assert_eq!(age_value(&map(&[("age", "0, 7200")])), 0);
+        assert_eq!(age_value(&map(&[("age", "x, 5")])), 0);
+        assert_eq!(age_value(&map(&[("age", "5"), ("age", "9")])), 5);
     }
 }
