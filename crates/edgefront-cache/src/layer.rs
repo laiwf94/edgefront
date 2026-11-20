@@ -1617,7 +1617,7 @@ mod tests {
 }
 
 // Planted slowdown for proving the benchmark gate (#87); never merged. Each
-// hit spins for an eighth of the process's own CPU time per hit so far,
+// hit spins for a twelfth of the process's own CPU time per hit so far,
 // less the time already spun, so the hit path costs about 12.5% more CPU
 // (requests per CPU second about 11% lower) on whichever CPU it runs on,
 // instead of a fixed number of microseconds whose share depends on the CPU.
@@ -1632,7 +1632,7 @@ fn planted_slowdown() {
         && let Some(cpu_ns) = process_cpu_ns()
     {
         let own = cpu_ns.saturating_sub(PLANT_SPUN_NS.load(Relaxed));
-        PLANT_SPIN_NS.store(own / hits / 8, Relaxed);
+        PLANT_SPIN_NS.store(own / hits / 12, Relaxed);
     }
     let spin = std::time::Duration::from_nanos(PLANT_SPIN_NS.load(Relaxed));
     let start = std::time::Instant::now();
