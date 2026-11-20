@@ -32,6 +32,8 @@
 //!    [`UpdateKind::Remove`] changes one source's set; one for a source
 //!    that has not yet sent a full set starts it from empty.
 
+pub mod file;
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
