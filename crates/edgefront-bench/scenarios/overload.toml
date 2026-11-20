@@ -1,0 +1,19 @@
+# Limiter week 8: overload mode under CPU saturation, in process. Four
+# workers each burn 200 us of CPU a request (20,000 a second together).
+# 100 good clients send 20 a second each and 200 abusive ones 90 a second
+# each, 20,000 a second in all, every one within its limit of 100 a
+# second. Without overload mode nothing is shed and the queue grows; with
+# it the busy time read every 100 ms scales the limit down and the abusive
+# clients are shed. `edgefront-bench overload --scenario THIS`.
+name = "overload"
+workers = 4
+service_us = 200
+duration_s = 20
+warmup_s = 5
+good_clients = 100
+good_rate = 20.0
+abusive_clients = 200
+abusive_rate = 90.0
+client_rate = 100
+sample_ms = 100
+dwell_ms = 2000

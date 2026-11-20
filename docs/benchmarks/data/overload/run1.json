@@ -1,0 +1,29 @@
+{
+  "scenario": "overload",
+  "runs": [
+    {
+      "overload": false,
+      "good_p50_ms": 13.502833,
+      "good_p99_ms": 20.573417,
+      "good_offered_rps": 2000.0,
+      "good_served_rps": 2000.0,
+      "abusive_offered_rps": 18000.0,
+      "abusive_served_rps": 18000.0,
+      "abusive_shed_rps": 0.0,
+      "level_changes": 0,
+      "final_level": "normal"
+    },
+    {
+      "overload": true,
+      "good_p50_ms": 0.222916,
+      "good_p99_ms": 0.23375,
+      "good_offered_rps": 2000.0,
+      "good_served_rps": 2000.0,
+      "abusive_offered_rps": 18000.0,
+      "abusive_served_rps": 10000.0,
+      "abusive_shed_rps": 8000.0,
+      "level_changes": 2,
+      "final_level": "elevated"
+    }
+  ]
+}

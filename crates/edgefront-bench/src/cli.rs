@@ -43,6 +43,9 @@
 //!     Replays a scenario's requests at their due times through the HTTP
 //!     limits in FILE and prints how many it should admit and refuse,
 //!     beside each run result's 2xx and 4xx counts.
+//! edgefront-bench overload --scenario FILE [--json FILE]
+//!     Overload mode under synthetic CPU saturation, in process: the good
+//!     clients' p50 and p99 and both kinds' goodput, with it off and on.
 //! edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
 //!     Memory per tracked client of libpacer's table (through diffdrive)
 //!     and edgefront-limiter's (through edgefront-difftest); prints a
@@ -72,6 +75,7 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
        edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
        edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
+       edgefront-bench overload --scenario FILE [--json FILE]
        edgefront-bench http-limits --scenario FILE --limits FILE [--host HOST] [--result FILE]... [--json FILE]
 ";
 
@@ -184,6 +188,7 @@ pub fn run(args: &[String]) -> Result<(), Failure> {
         "limiter" => limiter(rest),
         "l4" => l4(rest),
         "http-limits" => http_limits(rest),
+        "overload" => overload(rest),
         "memory" => memory(rest),
         "--help" | "help" => {
             print!("{USAGE}");
@@ -614,6 +619,23 @@ fn limiter(args: &[String]) -> Result<(), Failure> {
         scenario: s.name.clone(),
         threads: s.threads.clone(),
         series,
+    };
+    print!("{}", report.markdown());
+    write_json(flags.one("json")?, &report)
+}
+
+fn overload(args: &[String]) -> Result<(), Failure> {
+    let flags = Flags::parse(args, &["scenario", "json"], &[])?;
+    flags.no_positional()?;
+    let path = flags.required("scenario")?;
+    let s = crate::overload::Scenario::parse(&read_text(path)?)
+        .map_err(|e| failed(format!("{path}: {e}")))?;
+    let report = crate::overload::Report {
+        scenario: s.name.clone(),
+        runs: vec![
+            crate::overload::run(&s, false),
+            crate::overload::run(&s, true),
+        ],
     };
     print!("{}", report.markdown());
     write_json(flags.one("json")?, &report)

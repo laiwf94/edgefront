@@ -48,6 +48,7 @@ pub mod load;
 pub mod measure;
 pub mod memory;
 pub mod origin;
+pub mod overload;
 pub mod report;
 pub mod scenario;
 pub mod schema;
