@@ -44,9 +44,11 @@ use http::{HeaderValue, Method, Response, StatusCode};
 use super::headers::{self, RATELIMIT, RATELIMIT_POLICY};
 use super::key::{Key, KeySpec, View, host_part, under_prefix};
 use super::response_count::{Settle, StatusSet, settle};
+use crate::ban::BanList;
 use crate::clock::Clock;
 use crate::cost::{Cost, graphql_cost, header_cost};
 use crate::gcra::{Error, Rate};
+use crate::penalty::{PenaltyBox, PenaltyConfig};
 use crate::table::{FullPolicy, Table, TableConfig};
 
 /// The most rules one route may carry.
@@ -152,6 +154,17 @@ pub struct HttpRule {
     pub refusal: Refusal,
     /// What a request costs ([`crate::cost`]); 1 by default.
     pub cost: Cost,
+    /// The penalty box for keys that keep hitting this rule, if any.
+    pub penalty: Option<Penalty>,
+}
+
+/// A rule's penalty box: [`PenaltyConfig`] for boxing, and a ban for a
+/// key boxed `ban_after` times running, for `ban_ns`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Penalty {
+    pub boxing: PenaltyConfig,
+    pub ban_after: Option<u32>,
+    pub ban_ns: u64,
 }
 
 /// A rule's counters.
@@ -165,6 +178,8 @@ struct Counters {
     refunded: AtomicU64,
     table_full: AtomicU64,
     charged_after: AtomicU64,
+    boxed: AtomicU64,
+    banned: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -191,13 +206,18 @@ pub struct RuleStats {
     pub table_full: u64,
     /// Responses whose cost was charged after they arrived.
     pub charged_after: u64,
+    /// Requests refused by the penalty box, before the table.
+    pub boxed: u64,
+    /// Requests refused by a ban.
+    pub banned: u64,
     /// Keys the rule's table holds now.
     pub keys: u64,
 }
 
 struct Rule {
     spec: HttpRule,
-    table: Table,
+    penalty: Option<PenaltyBox>,
+    table: Arc<Table>,
     policy_item: String,
     counters: Counters,
 }
@@ -207,6 +227,9 @@ struct Rule {
 pub struct HttpLimiter {
     rules: Vec<Rule>,
     clock: Arc<dyn Clock>,
+    /// Bans by rule and key, set by penalty boxes and by hand; kept across
+    /// limiter rebuilds by handing the same list to the next one.
+    bans: Arc<BanList>,
 }
 
 impl fmt::Debug for HttpLimiter {
@@ -226,16 +249,48 @@ impl HttpLimiter {
             cfg.full_policy = spec.table_full;
             let table = Table::new(&cfg).map_err(|e| format!("http limit {}: {e}", spec.name))?;
             built.push(Rule {
+                penalty: spec.penalty.map(|p| PenaltyBox::new(p.boxing)),
                 policy_item: headers::policy_item(&spec.name, &spec.rate),
                 spec,
-                table,
+                table: Arc::new(table),
                 counters: Counters::default(),
             });
         }
         Ok(HttpLimiter {
             rules: built,
             clock,
+            bans: Arc::new(BanList::new(10_000_000, 1 << 20)),
         })
+    }
+
+    /// The same limiter keeping `bans`, such as the previous limiter's,
+    /// so a rebuild of the rules keeps every ban.
+    #[must_use]
+    pub fn with_bans(mut self, bans: Arc<BanList>) -> Self {
+        self.bans = bans;
+        self
+    }
+
+    /// Hands every rule's table to `overload`, which scales its rate with
+    /// the host's pressure from now on.
+    pub fn register_overload(&self, overload: &crate::overload::Overload) {
+        for r in &self.rules {
+            overload.register(Arc::clone(&r.table), r.spec.rate);
+        }
+    }
+
+    /// The bans, for the admin API and for saving.
+    pub fn bans(&self) -> &Arc<BanList> {
+        &self.bans
+    }
+
+    /// The ban key of `key` under the rule named `rule`.
+    pub fn ban_key(rule: &str, key: &Key) -> Vec<u8> {
+        let mut k = Vec::with_capacity(rule.len() + 1 + key.as_bytes().len());
+        k.extend_from_slice(rule.as_bytes());
+        k.push(0);
+        k.extend_from_slice(key.as_bytes());
+        k
     }
 
     /// A filter for each of `routes` routes that has rules. A rule naming
@@ -298,6 +353,8 @@ impl HttpLimiter {
                     refunded: get(&c.refunded),
                     table_full: get(&c.table_full),
                     charged_after: get(&c.charged_after),
+                    boxed: get(&c.boxed),
+                    banned: get(&c.banned),
                     keys: r.table.stats().entries,
                 }
             })
@@ -412,6 +469,28 @@ async fn decide(
             continue;
         };
         bump(&rule.counters.matched);
+        // Banned and boxed keys are refused before the table is touched.
+        if rule.penalty.is_some() || limiter.bans.any() {
+            let bk = HttpLimiter::ban_key(&rule.spec.name, &key);
+            let held = limiter
+                .bans
+                .is_banned(&bk, now)
+                .map(|b| (b.until_ns, &rule.counters.banned))
+                .or_else(|| {
+                    let p = rule.penalty.as_ref()?;
+                    p.check(key.as_bytes(), now)
+                        .map(|u| (u, &rule.counters.boxed))
+                });
+            if let Some((until, counter)) = held {
+                bump(counter);
+                for c in &charges {
+                    limiter.rules[c.rule]
+                        .table
+                        .refund(c.key.as_bytes(), now, c.cost);
+                }
+                return Decision::Respond(refusal(rule, until.saturating_sub(now).max(1)));
+            }
+        }
         // A cost charged after the response takes nothing now: the
         // request is refused only while the key is in debt.
         let cost = request_cost(&rule.spec.cost, &view);
@@ -499,6 +578,15 @@ async fn decide(
         }
         // Refused: no other rule keeps what it took for this request.
         bump(&rule.counters.refused);
+        if let (Some(pb), Some(pen)) = (&rule.penalty, rule.spec.penalty)
+            && let crate::penalty::Strike::Boxed { offence, .. } = pb.refused(key.as_bytes(), now)
+            && pen.ban_after.is_some_and(|n| offence >= n)
+        {
+            let bk = HttpLimiter::ban_key(&rule.spec.name, &key);
+            let _ = limiter
+                .bans
+                .ban(&bk, now.saturating_add(pen.ban_ns), "penalty");
+        }
         for c in &charges {
             limiter.rules[c.rule]
                 .table

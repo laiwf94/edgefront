@@ -13,6 +13,14 @@
 //! | `GET /client?addr=IP&listener=NAME` | one address's limits as tracked now, per listener |
 //! | `POST /reload` | `ok reloaded`, or `error <why>` with 409 |
 //! | `POST /drain` | `ok draining` |
+//! | `POST /ban?addr=IP&for=SECONDS&reason=WORD` | bans the address until then (`reason` defaults to `manual`): `ok banned` |
+//! | `POST /unban?addr=IP` | `ok unbanned`, or 404 when it was not banned |
+//! | `GET /bans` | one ban a line: `<address> <seconds left> <reason>` |
+//!
+//! Bans are checked at accept, before any limit, against the connecting
+//! peer's address, and kept across reloads; with `EDGEFRONT_BANS_FILE`
+//! set they are loaded from that file at start and saved to it on every
+//! change, so they survive a restart too.
 //!
 //! Anything else is `404 error unknown command`, and a method other than
 //! the one listed is `405`.
@@ -131,7 +139,80 @@ pub fn answer(
             d.drain("admin");
             text(StatusCode::OK, "ok draining\n")
         }),
+        "/ban" => want(Method::POST).unwrap_or_else(|| {
+            let addr = param(query, "addr").and_then(|a| a.parse::<std::net::IpAddr>().ok());
+            let secs = param(query, "for")
+                .and_then(|f| f.parse::<u64>().ok())
+                .filter(|&s| s > 0);
+            let (Some(addr), Some(secs)) = (addr, secs) else {
+                return text(
+                    StatusCode::BAD_REQUEST,
+                    "error addr (an IP address) and for (seconds) are required\n",
+                );
+            };
+            let reason = param(query, "reason").unwrap_or_else(|| "manual".into());
+            let until = d
+                .clock
+                .now_ns()
+                .saturating_add(secs.saturating_mul(1_000_000_000));
+            match d.bans.ban(&super::daemon::ban_key(addr), until, &reason) {
+                Ok(()) => {
+                    save_bans(d);
+                    text(StatusCode::OK, "ok banned\n")
+                }
+                Err(e) => text(StatusCode::BAD_REQUEST, format!("error {e}\n")),
+            }
+        }),
+        "/unban" => want(Method::POST).unwrap_or_else(|| {
+            match param(query, "addr").and_then(|a| a.parse::<std::net::IpAddr>().ok()) {
+                None => text(StatusCode::BAD_REQUEST, "error addr is required\n"),
+                Some(addr) if d.bans.unban(&super::daemon::ban_key(addr)) => {
+                    save_bans(d);
+                    text(StatusCode::OK, "ok unbanned\n")
+                }
+                Some(_) => text(StatusCode::NOT_FOUND, "error not banned\n"),
+            }
+        }),
+        "/bans" => want(Method::GET).unwrap_or_else(|| {
+            let now = d.clock.now_ns();
+            d.bans.sweep(now);
+            let mut out = String::new();
+            for (k, b) in d.bans.list() {
+                if b.until_ns <= now {
+                    continue;
+                }
+                let addr = match k.len() {
+                    4 => std::net::IpAddr::from(
+                        <[u8; 4]>::try_from(k.as_slice()).unwrap_or_default(),
+                    ),
+                    16 => std::net::IpAddr::from(
+                        <[u8; 16]>::try_from(k.as_slice()).unwrap_or_default(),
+                    ),
+                    _ => continue,
+                };
+                out.push_str(&format!(
+                    "{addr} {} {}\n",
+                    (b.until_ns - now).div_ceil(1_000_000_000),
+                    b.reason
+                ));
+            }
+            text(StatusCode::OK, out)
+        }),
         _ => text(StatusCode::NOT_FOUND, "error unknown command\n"),
+    }
+}
+
+/// Saves the bans to `EDGEFRONT_BANS_FILE`, if set, logging a failure.
+fn save_bans(d: &Daemon) {
+    if let Some(f) = &d.bans_file
+        && let Err(e) = d.bans.save(f, d.clock.now_ns(), d.wall_offset_ms)
+    {
+        drop(
+            d.log
+                .line(edgefront_limiter::LogLevel::Error, "bans not saved")
+                .str("file", &f.display().to_string())
+                .str("error", &e.to_string()),
+        );
     }
 }
 

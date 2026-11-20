@@ -132,6 +132,36 @@ pub struct HttpLimitConfig {
     /// `Content-Length`, no query, no header); 1 by default.
     #[serde(default)]
     pub cost_missing: Option<u64>,
+    #[serde(default)]
+    pub penalty: Option<PenaltyToml>,
+}
+
+/// A rule's `[http_limits.penalty]` as written.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PenaltyToml {
+    /// Refused in this many consecutive windows boxes the key; 3 by default.
+    #[serde(default)]
+    pub windows: Option<u32>,
+    /// The window, 1s by default.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// The first mitigation timeout.
+    pub timeout: String,
+    /// The longest a repeat offence doubles it to; 10 times `timeout` by default.
+    #[serde(default)]
+    pub max_timeout: Option<String>,
+    /// Clean this long after release, a key starts over; 10m by default.
+    #[serde(default)]
+    pub forget: Option<String>,
+    /// Keys tracked, 65536 by default.
+    #[serde(default)]
+    pub capacity: Option<usize>,
+    /// Boxed this many times running bans the key for `ban_for`.
+    #[serde(default)]
+    pub ban_after: Option<u32>,
+    #[serde(default)]
+    pub ban_for: Option<String>,
 }
 
 /// A document's `http_limits` array, ignoring every other section, so
@@ -304,7 +334,55 @@ impl HttpLimitConfig {
                     .into(),
             );
         }
+        let penalty = match &self.penalty {
+            None => None,
+            Some(p) => {
+                let d = |field: &str,
+                         v: &Option<String>,
+                         default: Duration|
+                 -> Result<Duration, String> {
+                    v.as_deref()
+                        .map(duration)
+                        .transpose()
+                        .map_err(|e| format!("penalty.{field}: {e}"))
+                        .map(|o| o.unwrap_or(default))
+                };
+                let timeout = duration(&p.timeout).map_err(|e| format!("penalty.timeout: {e}"))?;
+                let window = d("window", &p.window, Duration::from_secs(1))?;
+                let max_timeout = d("max_timeout", &p.max_timeout, timeout * 10)?;
+                let forget = d("forget", &p.forget, Duration::from_secs(600))?;
+                if timeout.is_zero() || window.is_zero() {
+                    return Err("penalty: timeout and window must be at least 1ms".into());
+                }
+                if max_timeout < timeout {
+                    return Err("penalty.max_timeout: shorter than timeout".into());
+                }
+                if p.windows == Some(0) || p.ban_after == Some(0) {
+                    return Err("penalty: windows and ban_after must be at least 1".into());
+                }
+                let ban_ns = match (&p.ban_after, &p.ban_for) {
+                    (Some(_), Some(f)) => duration(f)
+                        .map_err(|e| format!("penalty.ban_for: {e}"))?
+                        .as_nanos() as u64,
+                    (None, None) => 0,
+                    _ => return Err("penalty: ban_after and ban_for go together".into()),
+                };
+                Some(crate::http::layer::Penalty {
+                    boxing: crate::penalty::PenaltyConfig {
+                        windows: p.windows.unwrap_or(3),
+                        window_ns: window.as_nanos() as u64,
+                        timeout_ns: timeout.as_nanos() as u64,
+                        max_timeout_ns: max_timeout.as_nanos() as u64,
+                        forget_ns: forget.as_nanos() as u64,
+                        capacity: p.capacity.unwrap_or(65536).max(1),
+                    },
+                    ban_after: p.ban_after,
+                    ban_ns,
+                })
+            }
+        };
         Ok(HttpRule {
+            penalty,
             cost,
             name: self.name.clone(),
             routes: self.routes.clone(),

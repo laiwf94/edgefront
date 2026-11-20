@@ -408,6 +408,11 @@ fn parse_size(s: &[u8]) -> Option<u64> {
     scaled(v, mul, MAX_SIZE)
 }
 
+/// [`parse_duration`] for other modules' text.
+pub(crate) fn parse_duration_text(s: &str) -> Option<u64> {
+    parse_duration(s.as_bytes())
+}
+
 /// A duration in nanoseconds: digits with a required `ms`, `s`, `m` or `h`.
 fn parse_duration(s: &[u8]) -> Option<u64> {
     let (num, unit) = split_unit(s)?;

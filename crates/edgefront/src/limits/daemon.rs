@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use edgefront_limiter::ban::BanList;
 use edgefront_limiter::cidr::Swap;
 use edgefront_limiter::config::ListenerConfig;
 use edgefront_limiter::policy::AddressPolicy;
@@ -135,6 +136,24 @@ pub struct Daemon {
     accepting_tx: watch::Sender<bool>,
     /// True once drained: the worker threads stop.
     done_tx: watch::Sender<bool>,
+    /// Banned client addresses, kept across reloads, and the file they
+    /// are saved to (`EDGEFRONT_BANS_FILE`), with the Unix time in ms of
+    /// the clock's start so the file holds wall-clock ends.
+    pub bans: Arc<BanList>,
+    pub bans_file: Option<PathBuf>,
+    pub wall_offset_ms: i64,
+}
+
+/// The ban key of a client address: its 4 or 16 bytes, IPv4-mapped
+/// addresses as IPv4.
+pub fn ban_key(ip: std::net::IpAddr) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.octets().to_vec(),
+            None => v6.octets().to_vec(),
+        },
+    }
 }
 
 /// Reads the config at `path`: a `.toml` file as the TOML limiter section,
@@ -196,9 +215,24 @@ impl Daemon {
             .iter()
             .map(|l| Listener::new(l).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
+        let clock = Clock::new();
+        let wall_offset_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            - i64::try_from(clock.now_ns() / 1_000_000).unwrap_or(0);
+        let bans = Arc::new(BanList::new(10_000_000, 1 << 20));
+        let bans_file = std::env::var_os("EDGEFRONT_BANS_FILE").map(PathBuf::from);
+        if let Some(f) = &bans_file
+            && f.exists()
+        {
+            bans.load(f, clock.now_ns(), wall_offset_ms)?;
+        }
         Ok(Self {
             path,
-            clock: Clock::new(),
+            clock,
+            bans,
+            bans_file,
+            wall_offset_ms,
             log,
             config: Mutex::new(Arc::new(config)),
             policy: Arc::new(Swap::new(policy.map(Arc::new))),
@@ -354,6 +388,18 @@ impl Daemon {
     ) {
         let ctx = self.context();
         let now = self.clock.now_ns();
+        if self.bans.any() && self.bans.is_banned(&ban_key(peer.ip()), now).is_some() {
+            if listener.reject_log.allow(now).is_some() {
+                drop(
+                    ctx.log
+                        .line(LogLevel::Info, "conn rejected")
+                        .str("listener", listener.name())
+                        .str("peer", &peer.to_string())
+                        .str("reason", "banned"),
+                );
+            }
+            return;
+        }
         let Some(policy) = policy else {
             let Ok(permit) = conn::admit(&ctx, listener, peer.ip(), peer, now) else {
                 // Dropping the stream closes it with nothing read.

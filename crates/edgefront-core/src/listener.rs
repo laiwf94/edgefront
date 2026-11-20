@@ -75,6 +75,20 @@ pub struct ServerLimits {
     pub http2: Option<crate::h2::Settings>,
 }
 
+/// Per-connection quotas: once a connection has carried `max_requests`
+/// requests, or `max_bytes` bytes read and written, the request that
+/// reaches the quota is the last. Its HTTP/1.1 response says
+/// `Connection: close`, an HTTP/2 connection gets GOAWAY so the client
+/// opens a new one for its next streams, and requests already in flight
+/// finish. `None` sets no quota. A [`Handler`] gives its own with
+/// [`Handler::conn_quota`]; the limiter's
+/// `edgefront_limiter::conn_quota` reads these from its config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnQuota {
+    pub max_requests: Option<u64>,
+    pub max_bytes: Option<u64>,
+}
+
 impl Default for ServerLimits {
     /// steer's proxy listener: 10 seconds for the head, 120 seconds idle,
     /// 64 KiB of head, and 30 seconds to drain. hyper's default of 100
@@ -102,6 +116,11 @@ pub trait Handler: Send + Sync + 'static {
         req: Request<Incoming>,
         peer: SocketAddr,
     ) -> impl Future<Output = Response<Self::Body>> + Send;
+
+    /// The quota each connection to this handler gets; none by default.
+    fn conn_quota(&self) -> ConnQuota {
+        ConnQuota::default()
+    }
 }
 
 /// What happened while a listener ran.
@@ -333,6 +352,11 @@ struct Watch {
     idle_since: AtomicU64,
     head_since: AtomicU64,
     wake: Notify,
+    /// Requests started and bytes carried, for the connection quota.
+    requests: AtomicU64,
+    bytes: AtomicU64,
+    /// The quota is spent: finish what is in flight and close.
+    spent: std::sync::atomic::AtomicBool,
 }
 
 impl Watch {
@@ -350,6 +374,9 @@ impl Watch {
             // The first request's head timer runs from the accept.
             head_since: AtomicU64::new(1),
             wake: Notify::new(),
+            requests: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            spent: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -361,8 +388,21 @@ impl Watch {
         self.start + Duration::from_nanos(nanos)
     }
 
+    /// A request starts: whether it is the last the quota allows.
+    fn last_request(&self, quota: &ConnQuota) -> bool {
+        let n = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        let last = quota.max_requests.is_some_and(|m| n >= m)
+            || quota.max_bytes.is_some_and(|m| bytes >= m);
+        if last && !self.spent.swap(true, Ordering::Relaxed) {
+            self.wake.notify_one();
+        }
+        last
+    }
+
     /// Called for every successful read of `n` bytes.
     fn on_read(&self, n: usize) {
+        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
         if n == 0 || self.busy.load(Ordering::Relaxed) > 0 {
             return;
         }
@@ -446,7 +486,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.stream).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = polled {
+            this.watch.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        polled
     }
 
     fn poll_write_vectored(
@@ -454,7 +499,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = polled {
+            this.watch.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        polled
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -486,14 +536,23 @@ async fn connection<S, H: Handler>(
     let watch = Arc::new(Watch::with_h2(matches!(proto, Proto::Http2(_))));
     let service = {
         let watch = watch.clone();
+        let quota = handler.conn_quota();
+        let http1 = matches!(proto, Proto::Http1);
         service_fn(move |mut req: Request<Incoming>| {
+            let last = watch.last_request(&quota);
             let busy = Busy::new(watch.clone());
             if let Some(info) = &tls {
                 req.extensions_mut().insert(Arc::clone(info));
             }
             let handler = handler.clone();
             async move {
-                let resp = handler.call(req, peer).await;
+                let mut resp = handler.call(req, peer).await;
+                if last && http1 {
+                    resp.headers_mut().insert(
+                        http::header::CONNECTION,
+                        http::HeaderValue::from_static("close"),
+                    );
+                }
                 Ok::<_, Infallible>(resp.map(|body| HoldBody::new(body, busy)))
             }
         })
@@ -579,7 +638,14 @@ async fn drive<C: Served>(
                 stopping = true;
                 conn.as_mut().finish();
             }
-            () = watch.wake.notified() => {}
+            () = watch.wake.notified() => {
+                // The connection quota is spent: GOAWAY for HTTP/2, no
+                // more keep-alive for HTTP/1.1, after what is in flight.
+                if !stopping && watch.spent.load(Ordering::Relaxed) {
+                    stopping = true;
+                    conn.as_mut().finish();
+                }
+            }
             () = timer => {
                 if watch.deadline(limits).is_some_and(|at| at <= Instant::now()) {
                     tracing::debug!(peer = %peer, "connection timed out");

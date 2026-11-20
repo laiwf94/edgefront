@@ -460,3 +460,74 @@ fn the_match_reads_host_path_and_method() {
     assert_eq!(Action::Log.name(), "log");
     assert_eq!(Action::Block.name(), "block");
 }
+
+#[tokio::test]
+async fn a_key_over_its_limit_for_n_windows_is_boxed_then_banned() {
+    let (l, clock) = limiter(
+        r#"
+        [[http_limits]]
+        name = "api"
+        rate = "1/s burst 1"
+        key = ["header:x-key"]
+        [http_limits.penalty]
+        windows = 2
+        window = "1s"
+        timeout = "10s"
+        ban_after = 2
+        ban_for = "1h"
+        "#,
+    );
+    let f = l.route_filters(1).unwrap();
+    let up = Upstream::default();
+    let k = [("x-key", "abuser")];
+    // Second 0: one admitted, the rest refused; second 1 the same.
+    for sec in 0..2 {
+        assert_eq!(
+            send(&f, 0, &up, "GET", "/", &k).await.status(),
+            200,
+            "{sec}"
+        );
+        assert_eq!(send(&f, 0, &up, "GET", "/", &k).await.status(), 429);
+        clock.advance(SEC);
+    }
+    // Boxed at the end of second 1 for 10 s: refused without the table,
+    // even once its bucket has refilled.
+    let r = send(&f, 0, &up, "GET", "/", &k).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(hv(&r, "retry-after"), "9");
+    assert_eq!(l.stats()[0].boxed, 1);
+    let calls = up.calls();
+    clock.advance(8 * SEC);
+    assert_eq!(send(&f, 0, &up, "GET", "/", &k).await.status(), 429);
+    assert_eq!(up.calls(), calls);
+    // Released: admitted again.
+    clock.advance(SEC);
+    assert_eq!(send(&f, 0, &up, "GET", "/", &k).await.status(), 200);
+    // A second offence bans the key for an hour.
+    assert_eq!(send(&f, 0, &up, "GET", "/", &k).await.status(), 429);
+    clock.advance(SEC);
+    send(&f, 0, &up, "GET", "/", &k).await;
+    assert_eq!(send(&f, 0, &up, "GET", "/", &k).await.status(), 429);
+    assert_eq!(l.bans().len(), 1);
+    clock.advance(30 * 60 * SEC);
+    let r = send(&f, 0, &up, "GET", "/", &k).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(hv(&r, "retry-after"), "1800");
+    assert!(l.stats()[0].banned >= 1);
+    // Others were never affected, and a manual unban lifts it.
+    assert_eq!(
+        send(&f, 0, &up, "GET", "/", &[("x-key", "fine")])
+            .await
+            .status(),
+        200
+    );
+    let bk = l.bans().list()[0].0.clone();
+    assert!(bk.starts_with(b"api\0"));
+    assert!(l.bans().unban(&bk));
+    assert_eq!(send(&f, 0, &up, "GET", "/", &k).await.status(), 200);
+    // A rebuilt limiter keeps the bans it is given.
+    let rebuilt = HttpLimiter::new(l.rules().cloned().collect(), clock.clone())
+        .unwrap()
+        .with_bans(Arc::clone(l.bans()));
+    assert!(Arc::ptr_eq(rebuilt.bans(), l.bans()));
+}

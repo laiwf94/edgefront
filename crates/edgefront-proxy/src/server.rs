@@ -173,6 +173,8 @@ pub struct Proxy {
     reloading: Mutex<()>,
     /// Set by [`Proxy::drain`].
     draining: AtomicBool,
+    /// What each client connection may carry ([`Proxy::with_conn_quota`]).
+    conn_quota: edgefront_core::listener::ConnQuota,
 }
 
 /// One loaded configuration, never changed after it is built (steer's
@@ -634,7 +636,17 @@ impl Proxy {
             filters: RouteFilters::new(cfg.routes.len()),
             reloading: Mutex::new(()),
             draining: AtomicBool::new(false),
+            conn_quota: edgefront_core::listener::ConnQuota::default(),
         }
+    }
+
+    /// Closes each client connection gracefully once it has carried the
+    /// quota's requests or bytes (see
+    /// [`edgefront_core::listener::ConnQuota`]); none by default.
+    #[must_use]
+    pub fn with_conn_quota(mut self, quota: edgefront_core::listener::ConnQuota) -> Self {
+        self.conn_quota = quota;
+        self
     }
 
     /// Runs requests on each route through that route's filter in
@@ -1441,6 +1453,10 @@ impl reload::Service for Proxy {
 
 impl Handler for Proxy {
     type Body = Body;
+
+    fn conn_quota(&self) -> edgefront_core::listener::ConnQuota {
+        self.conn_quota
+    }
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         let h2 = req.version() == Version::HTTP_2;

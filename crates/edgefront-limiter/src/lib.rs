@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ban;
 pub mod burst;
 pub mod cidr;
 pub mod class;
@@ -13,6 +14,8 @@ pub mod client_addr;
 pub mod clock;
 pub mod config;
 pub mod conn;
+#[cfg(feature = "http")]
+pub mod conn_quota;
 pub mod cost;
 pub mod descriptor;
 pub mod gcra;
@@ -21,7 +24,10 @@ pub mod hotkey;
 pub mod http;
 pub mod key;
 pub mod lint;
+pub mod listener;
 pub mod multi;
+pub mod overload;
+pub mod penalty;
 pub mod policy;
 pub mod rate;
 pub mod shape;

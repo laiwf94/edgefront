@@ -13,7 +13,11 @@
 //! that does not build, or names a route the configuration does not have,
 //! is a bad file (exit 2). The rules are fixed for the life of the
 //! process: routes with filters cannot be reloaded, so a SIGHUP is logged
-//! as a failed reload and the running configuration keeps serving.
+//! as a failed reload and the running configuration keeps serving. The
+//! same file may set `[connection_quota]` (requests and bytes per client
+//! connection, closed with `Connection: close` or GOAWAY) and
+//! `[overload]` (limits scaled down while the host's pressure stall
+//! information shows CPU or memory pressure; Linux only).
 //!
 //! Exit codes follow the rest of the binary: 0 on success, 2 for bad usage,
 //! an unreadable or invalid file or bad settings, 1 when the proxy cannot
@@ -76,6 +80,73 @@ fn check(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// What a `--limits` file sets beside its rules.
+#[derive(Debug, Default)]
+pub struct Extras {
+    pub conn_quota: Option<edgefront_core::listener::ConnQuota>,
+    pub overload: Option<edgefront_limiter::overload::OverloadConfig>,
+}
+
+/// The `[connection_quota]` and `[overload]` sections of `path`.
+pub fn extras(path: &str) -> Result<Extras, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let q: edgefront_limiter::conn_quota::ConnQuotaSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    let o: edgefront_limiter::overload::OverloadSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    Ok(Extras {
+        conn_quota: q
+            .connection_quota
+            .map(|c| c.build())
+            .transpose()
+            .map_err(|e| format!("{path}: {e}"))?,
+        overload: o
+            .overload
+            .map(|c| c.build())
+            .transpose()
+            .map_err(|e| format!("{path}: {e}"))?,
+    })
+}
+
+/// Samples the host's pressure every second and moves `overload` with
+/// it, for as long as the runtime runs. Without pressure files (not
+/// Linux, or no PSI) it logs that overload mode cannot engage and stops.
+fn watch_pressure(overload: Arc<edgefront_limiter::overload::Overload>) {
+    use edgefront_limiter::overload::{LinuxSampler, Sampler};
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+        })
+        .map(|p| std::path::Path::new("/sys/fs/cgroup").join(p.trim_start_matches('/')))
+        .unwrap_or_else(|| "/sys/fs/cgroup".into());
+    let mut sampler = LinuxSampler::new(&cgroup, std::path::Path::new("/proc"));
+    if !sampler.available() {
+        tracing::warn!("no pressure stall information on this host: overload mode stays at normal");
+        return;
+    }
+    let clock = edgefront_limiter::clock::MonotonicClock::new();
+    tokio::spawn(async move {
+        use edgefront_limiter::clock::Clock;
+        let mut last = overload.level();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let p = sampler.sample();
+            let level = overload.update(p, clock.now_ns());
+            if level != last {
+                tracing::warn!(
+                    level = level.name(),
+                    cpu = p.cpu,
+                    memory = p.memory,
+                    "overload level changed"
+                );
+                last = level;
+            }
+        }
+    });
+}
+
 /// The HTTP limits in `path`, built and attached to `routes` routes.
 pub fn limits(path: &str, routes: usize) -> Result<(Arc<HttpLimiter>, RouteFilters), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
@@ -112,7 +183,8 @@ pub fn run(args: &[String]) -> ExitCode {
             None => Ok(()),
             Some(lp) => {
                 let config = Config::load(path).map_err(|e| format!("{path}: {e}"))?;
-                limits(lp, config.routes.len()).map(|_| ())
+                limits(lp, config.routes.len())?;
+                extras(lp).map(|_| ())
             }
         });
         return match checked {
@@ -164,8 +236,16 @@ pub fn run(args: &[String]) -> ExitCode {
     runtime.block_on(async {
         let mut proxy = Proxy::new(&loaded.config);
         if let Some(lp) = limits_path {
-            match limits(lp, loaded.config.routes.len()) {
-                Ok((limiter, filters)) => {
+            match limits(lp, loaded.config.routes.len()).and_then(|l| Ok((l, extras(lp)?))) {
+                Ok(((limiter, filters), extras)) => {
+                    if let Some(q) = extras.conn_quota {
+                        proxy = proxy.with_conn_quota(q);
+                    }
+                    if let Some(cfg) = extras.overload {
+                        let o = Arc::new(edgefront_limiter::overload::Overload::new(cfg));
+                        limiter.register_overload(&o);
+                        watch_pressure(o);
+                    }
                     tracing::info!(
                         rules = limiter.rules().count(),
                         routes = filters.filtered(),
