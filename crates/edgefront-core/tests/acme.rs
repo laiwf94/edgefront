@@ -122,10 +122,13 @@ fn state(name: &str) -> AccountStore {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http01_issues_and_the_account_is_reused() {
-    let port = free_port();
+    // Bound before Pebble starts and held: a port only probed free could
+    // be taken while Pebble's containers start (Docker publishes their
+    // ports on ephemeral host ports), and the bind below then fails.
+    let socket = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+    let port = socket.local_addr().unwrap().port();
     let p = Pebble::start(port, free_port(), 90 * 86_400);
     let responder = Http01::new();
-    let socket = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(serve(
         socket,
@@ -180,7 +183,9 @@ async fn http01_issues_and_the_account_is_reused() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_alpn01_issues_through_the_tls_listener() {
-    let port = free_port();
+    // Bound first and held, as in the HTTP-01 test.
+    let socket = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+    let port = socket.local_addr().unwrap().port();
     let p = Pebble::start(free_port(), port, 90 * 86_400);
     // A TLS listener with no certificate yet, waiting for ACME: only
     // acme-tls/1 handshakes for a name with a challenge get anywhere.
@@ -202,7 +207,6 @@ async fn tls_alpn01_issues_through_the_tls_listener() {
         alpn_challenges: Some(Arc::clone(&challenges)),
     };
     let store = Store::new(Arc::new(Snapshot::load_with(&tls, &shared).unwrap()));
-    let socket = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(serve_tls(
         socket,
