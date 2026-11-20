@@ -1,0 +1,9 @@
+hold_many: held some, not all
+log "reason=fd_exhausted": found
+connect pending: ok
+idle_cpu: idle
+refused pending: yes
+close_held: ok
+sleep: ok
+connect after: ok
+works after: yes

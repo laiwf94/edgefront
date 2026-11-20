@@ -50,7 +50,7 @@ fn every_class_is_in_the_module_docs() {
 fn pacers_example_and_a_bare_listener_are_clean() {
     let example = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../legacy/pacer/examples/pacerd.conf"
+        "/tests/data/pacer/examples/pacerd.conf"
     );
     let text = std::fs::read_to_string(example).unwrap();
     assert_eq!(lints(&text), []);
@@ -379,7 +379,7 @@ fn a_config_without_a_map_reports_line_zero_and_skips_written_out_lints() {
 
 #[test]
 fn every_accepted_corpus_file_lints_without_panicking_on_real_lines() {
-    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../legacy/pacer");
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/pacer");
     let mut stack = vec![std::path::PathBuf::from(root)];
     let mut accepted = 0;
     while let Some(dir) = stack.pop() {

@@ -6,7 +6,7 @@ A self-hosted application edge in one Rust binary. It brings three projects toge
 |---|---|---|
 | Cache | cachet | An HTTP caching reverse proxy in Rust, split into `edgefront-cache` and the root package and served by the `edgefront` binary |
 | Proxy | steer | A Go edge proxy and load balancer, ported to `edgefront-proxy` and `edgefront-core` and deleted from `legacy/` once the differential suite passed (see [Migrating from steer](#migrating-from-steer)) |
-| Limiter | pacer | A C rate limiter, under [legacy/pacer](legacy/pacer), being ported to `edgefront-limiter`; its algorithms are ported and make the same decisions as the C (see below) |
+| Limiter | pacer | A C rate limiter and TCP proxy, ported to `edgefront-limiter` and `edgefront limits`; the C was deleted in week 4, after the port gave the same answers and the benchmark below (see the migration note) |
 
 All three keep their full history. The plan for the next year, three tracks in parallel, is in [ROADMAP.md](ROADMAP.md) and the issues labelled `roadmap`.
 
@@ -19,7 +19,7 @@ All three keep their full history. The plan for the next year, three tracks in p
 | `crates/edgefront-proxy` | Routing, path cleaning, forwarding headers, request IDs and the HTTP/1.1 request path ported from steer |
 | `crates/edgefront-cache` | cachet's caching policy, storage and purge |
 | `crates/edgefront-limiter` | pacer's rate limiting algorithms |
-| `crates/edgefront-difftest` | Differential tests against steer (built from history), `legacy/pacer` and cachet 0.1 |
+| `crates/edgefront-difftest` | Differential tests against steer (built from history), pacer's recorded answers and cachet 0.1 |
 | `.` (`cachet`) | The cache node's runtime still to move into the crates, and the reference `cachet` binary |
 
 Which crate depends on which is in [docs/DESIGN.md](docs/DESIGN.md#crate-map).
@@ -161,7 +161,7 @@ if !d.allowed {
 }
 ```
 
-`edgefront-difftest` holds the port to libpacer through `legacy/pacer/tests/diffdrive.c`, a C driver that reads one operation per line and prints each decision with the full state after it. `make difftest-pacer` diffs 100 generated scripts of 10,000 operations against the Rust crate and prints the seed, step and replay command of the first difference. `crates/edgefront-difftest/tests/e2e_limiter_port.rs` runs one million of those operations in CI on every push, plus a worked example of per-key limits, retry times and an hourly quota that both sides must answer exactly. How the port was checked and where it deliberately differs from the C is in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
+`edgefront-difftest` holds the port to libpacer. libpacer's C driver read one operation per line and printed each decision with the full state after it; `edgefront-difftest pacer-rust-driver` answers the same protocol from the Rust crate. Before the C was deleted, its answers were recorded: the four golden transcripts and one million generated operations (by digest), and pacerd's config reader's answers for its whole corpus and 2,000 mutants. `make difftest-pacer` (`edgefront-difftest pacer-recorded`) holds the Rust crate to all of them, and `crates/edgefront-difftest/tests/e2e_limiter_port.rs` runs them in CI on every push, plus a worked example of per-key limits, retry times and an hourly quota answered exactly. How the port was checked and where it deliberately differs from the C is in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
 
 ### L4 limits
 
@@ -185,7 +185,7 @@ edgefront ctl limits -s /run/pacerd/admin.sock client 192.0.2.7
 
 `examples/l4_limits.sh` is pacer's live demo on edgefront: the same config and clients, checking the connection-rate limit and its recovery, a slowloris client cut off beside a steady one, and a drain that finishes a download in flight byte for byte. CI runs it, and `crates/edgefront/tests/e2e_l4_limits.rs` runs it under `make test`. How it maps onto pacerd, and the two places it differs, are in [docs/DESIGN.md](docs/DESIGN.md#running-the-data-path-edgefront-limits).
 
-Still to come from pacer: the published C-versus-Rust benchmark and the rest of `pacerctl` (week 4), after which `legacy/pacer` is removed.
+The C-versus-Rust benchmark of the port is in [docs/benchmarks/pacer-port.md](docs/benchmarks/pacer-port.md).
 
 ### Limiter config reference
 
@@ -396,9 +396,7 @@ HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Ob
 
 steer's differential suite still runs, against steer built from the last commit that had `legacy/steer` (`STEER_REV` in the Makefile; `make steer-src` extracts it into `target/steer-src`, which needs the commit's history and Go): `make difftest` diffs 10,000 generated configs and 100,000 generated requests between steer and the Rust crates, `make difftest-balancer` diffs the pick sequences of 1,000 seeded balancing scenarios of 10,000 requests each (health changes, ejections, priority spill and panic included) between steer's `balancer.LB` and `edgefront_proxy::balancer::Balancer`, `make difftest-resilience` diffs every ejection, multiplier, retry decision, backoff and budget balance on 5,000 generated failure traces and 5,000 request traces (every hundredth of 100,000 requests) between steer's outlier detector and retry code and `edgefront_proxy::outlier` and `edgefront_proxy::retry`, and `make e2e-steer` runs the end-to-end HTTP/1.1 cases against a live steer as well as the edgefront binary, and the end-to-end balancing run against steer's balancer. The difftest workflow runs all four on every push. The `failover-drill` job runs `examples/failover.sh` against edgefront and fails unless it keeps 100.00% of requests in all four phases with the resilience features on.
 
-The `difftest-pacer` job of the difftest workflow runs every pacer differential suite on each push to main: `make difftest-pacer`, the million-operation end-to-end test, `make difftest-pacer-config` and `make difftest-l4`. `make difftest-l4` runs pacer's 23 integration scenarios, written as traffic scripts in `tests/pacer_scripts`, against legacy pacerd and against `edgefront limits`, and diffs their accept, refuse and close outcomes and counters step by step (Linux only, as pacerd is; `make test` runs the scripts against edgefront alone).
-
-While `legacy/pacer` exists, its gate runs as well (format, lint, the tests under ASan+UBSan and TSan with coverage, short fuzzing, its demo and its image), and the pacer differential test needs only a C compiler: `make test` already runs a million operations through it, and `make difftest-pacer` runs ten times more from a clock seed. pacerd's config reader is diffed the same way: `make test` puts every file under legacy/pacer's `tests`, `examples` and `fuzz/corpus`, every string literal in its tests and 3,000 seeded mutants through `diffdrive config` and the Rust parser, comparing accept or reject, the error message and line, and every parsed value, and `make difftest-pacer-config` adds 2,000 mutants from a clock seed (`DIFFTEST_ARGS="--mutants N"` for more).
+The `difftest-pacer` job of the difftest workflow holds the pacer port to what libpacer and pacerd answered, recorded before legacy/pacer was deleted, on each push to main: `make difftest-pacer` checks one million operations and the golden transcripts, pacerd's config reader on its whole corpus and 2,000 mutants, and pacer's 23 integration scenarios (the traffic scripts in `tests/pacer_scripts`) against `edgefront limits`, each against pacerd's recorded transcript. `make test` runs all of these too.
 
 ## License
 

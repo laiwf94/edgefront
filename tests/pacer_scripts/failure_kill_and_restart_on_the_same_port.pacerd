@@ -1,0 +1,9 @@
+hold_many: held 8 of 8
+signal KILL: yes
+exit: exit signal 9
+held_closed: all closed
+close_held: ok
+start: ready
+connect a: ok
+works a: yes
+ctl ping: exit 0: ok pong

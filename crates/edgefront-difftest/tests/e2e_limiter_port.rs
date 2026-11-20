@@ -1,22 +1,20 @@
 //! End to end: the limiter port against libpacer, through the
-//! `edgefront-difftest` binary the way a person runs it.
+//! `edgefront-difftest` binary the way a person runs it. libpacer was
+//! deleted with legacy/pacer in week 4; its answers were recorded first.
 //!
 //! - A rate limiting story (an API key limit with an exact retry-after, a
-//!   lone limiter and an hourly window quota) gives the same answers from
-//!   the C driver and from edgefront-limiter, and the answers are the ones
-//!   worked out by hand below.
-//! - One million generated operations give identical decisions, retry
-//!   times and states from both. Set `EDGEFRONT_E2E_PACER_SEED` to run
-//!   them from another seed.
+//!   lone limiter and an hourly window quota) gives the answers worked out
+//!   by hand below, from the driver binary and from the interpreter.
+//! - One million generated operations give exactly libpacer's recorded
+//!   transcripts, decisions, retry times and states (`pacer-recorded`),
+//!   and so do pacerd's config reader's recorded answers; a changed answer
+//!   in the record is caught.
 //! - A divergence names its seed and step, and the replay command it
 //!   prints reproduces it exactly.
 
-use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use edgefront_difftest::PACER_DIFFDRIVE;
-use edgefront_difftest::driver;
-use edgefront_difftest::pacer::Script;
+use edgefront_difftest::pacer::{self, Script};
 
 const BIN: &str = env!("CARGO_BIN_EXE_edgefront-difftest");
 
@@ -125,19 +123,18 @@ const STORY: &[(&str, &str)] = &[
 ];
 
 #[test]
-fn the_rate_limiting_story_reads_the_same_from_c_and_rust() {
+fn the_rate_limiting_story_reads_as_worked_out() {
     let script: String = STORY.iter().map(|(op, _)| format!("{op}\n")).collect();
-    let c = driver::run(Path::new(PACER_DIFFDRIVE), &script).unwrap();
-    assert!(c.success(), "{}: {}", c.status, c.stderr);
+    let inline = pacer::transcript(&script).unwrap();
     let rust = rust_driver(&script);
     assert!(rust.status.success(), "{}", text(&rust.stderr));
     let rust = text(&rust.stdout);
-    let (c, rust): (Vec<&str>, Vec<&str>) = (c.lines().collect(), rust.lines().collect());
-    assert_eq!(c.len(), STORY.len());
+    let rust: Vec<&str> = rust.lines().collect();
+    assert_eq!(inline.len(), STORY.len());
     assert_eq!(rust.len(), STORY.len());
     for (n, (op, want)) in STORY.iter().enumerate() {
-        assert_eq!(c[n], *want, "C, step {}: {op}", n + 1);
-        assert_eq!(rust[n], *want, "Rust, step {}: {op}", n + 1);
+        assert_eq!(inline[n], *want, "interpreter, step {}: {op}", n + 1);
+        assert_eq!(rust[n], *want, "driver binary, step {}: {op}", n + 1);
     }
 }
 
@@ -150,8 +147,18 @@ fn field<'a>(report: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn one_million_operations_agree_with_libpacer() {
-    let seed = std::env::var("EDGEFRONT_E2E_PACER_SEED").unwrap_or_else(|_| "20261105".into());
+fn one_million_operations_give_libpacers_recorded_answers() {
+    let out = run(&["pacer-recorded"]);
+    let report = text(&out.stdout);
+    assert!(out.status.success(), "{report}\n{}", text(&out.stderr));
+    assert_eq!(field(&report, "golden transcripts"), "4 (212 lines)");
+    assert_eq!(field(&report, "recorded scripts"), "100 (1013182 lines)");
+    assert_eq!(field(&report, "config inputs"), "1739");
+    assert_eq!(field(&report, "config mutants"), "2000");
+    assert_eq!(field(&report, "differences"), "0");
+    // The same scripts through the driver binary: decisions both ways,
+    // retry times, refunds, evictions and quota counts are all among the
+    // answers the record holds.
     let out = run(&[
         "pacer",
         "--scripts",
@@ -159,23 +166,17 @@ fn one_million_operations_agree_with_libpacer() {
         "--ops",
         "10000",
         "--seed",
-        &seed,
+        "20261105",
+        "--",
+        BIN,
+        "pacer-rust-driver",
     ]);
     let report = text(&out.stdout);
-    assert!(
-        out.status.success(),
-        "{report}\n{}\nreplay this run with EDGEFRONT_E2E_PACER_SEED={seed}",
-        text(&out.stderr)
-    );
-    assert!(report.starts_with(&format!("seed {seed}\n")), "{report}");
-    assert_eq!(field(&report, "scripts"), "100");
-    assert_eq!(field(&report, "divergences"), "0");
+    assert!(out.status.success(), "{report}");
     let operations = field(&report, "operations");
     let (count, outcomes) = operations.split_once(' ').unwrap();
     let count: usize = count.parse().unwrap();
-    assert!(count >= 1_000_000, "{report}");
-    // Decisions both ways, retry times, refunds, evictions and quota
-    // counts were all among the compared answers.
+    assert_eq!(count, 1_013_182, "{report}");
     for outcome in [
         "gcra take rc=1 ",
         "gcra take rc=0 ",
@@ -196,14 +197,81 @@ fn one_million_operations_agree_with_libpacer() {
     }
 }
 
-/// The C driver, forging the first denied keyed decision (a table take or
+/// Copies the recorded answers to a scratch directory, changes one line
+/// with `edit`, and returns the report of checking against the copy.
+fn check_changed(file: &str, edit: impl Fn(&str) -> String) -> (Vec<String>, Vec<String>) {
+    let src = pacer::recorded_dir();
+    let dst = std::env::temp_dir().join(format!("pacer-recorded-{}-{file}", std::process::id()));
+    let copy = |rel: &str| {
+        let to = dst.join(rel);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(src.join(rel), to).unwrap();
+    };
+    for rel in [
+        "recorded/algorithms.sha256",
+        "recorded/config-answers.jsonl",
+        "recorded/config-literals.jsonl",
+        "recorded/config-mutants.sha256",
+        "fuzz/config.dict",
+    ] {
+        copy(rel);
+    }
+    for dir in ["tests", "examples", "fuzz/corpus"] {
+        let mut stack = vec![src.join(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    copy(&p.strip_prefix(&src).unwrap().to_string_lossy());
+                }
+            }
+        }
+    }
+    let path = dst.join("recorded").join(file);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, edit(&text)).unwrap();
+    let algo = pacer::check_recorded(&dst, Some(3)).unwrap().mismatches;
+    let cfg = edgefront_difftest::pacer_config::check_recorded(&dst)
+        .unwrap()
+        .mismatches;
+    std::fs::remove_dir_all(&dst).unwrap();
+    (algo, cfg)
+}
+
+#[test]
+fn a_changed_recorded_answer_is_caught() {
+    // A script's digest off by one digit.
+    let (algo, cfg) = check_changed("algorithms.sha256", |t| {
+        let (first, rest) = t.split_once('\n').unwrap();
+        let flipped = if first.ends_with('0') { "1" } else { "0" };
+        format!("{}{flipped}\n{rest}", &first[..first.len() - 1])
+    });
+    assert_eq!(algo.len(), 1, "{algo:?}");
+    assert!(algo[0].starts_with("seed 20261105: "), "{algo:?}");
+    assert!(cfg.is_empty());
+    // A config answer changed.
+    let (algo, cfg) = check_changed("config-answers.jsonl", |t| {
+        t.replacen("workers=2 ", "workers=3 ", 1)
+    });
+    assert!(algo.is_empty());
+    assert_eq!(cfg.len(), 1, "{cfg:?}");
+    assert!(cfg[0].contains("pacerd:    ok | workers=3 "), "{cfg:?}");
+    // A mutant's digest changed.
+    let (_, cfg) = check_changed("config-mutants.sha256", |t| t.replacen(" ", " f", 1));
+    assert_eq!(cfg.len(), 1, "{cfg:?}");
+    assert!(cfg[0].starts_with("mutant 1: "), "{cfg:?}");
+}
+
+/// The driver, forging the first denied keyed decision (a table take or
 /// hold) after line 3,000 whose retry time ends in 7: a bug that depends
 /// only on the script, as a real one would.
-const FORGING: &str = "\"$1\" | awk 'NR > 3000 && !done && /^rc=0 granted=0 remaining=0 retry=[0-9]*7$/ \
+const FORGING: &str = "\"$1\" pacer-rust-driver | awk 'NR > 3000 && !done && /^rc=0 granted=0 remaining=0 retry=[0-9]*7$/ \
                        { print \"rc=1 granted=1 remaining=0 retry=0\"; done = 1; next } { print }'";
 
 fn forging_driver_args() -> [&'static str; 5] {
-    ["sh", "-c", FORGING, "sh", PACER_DIFFDRIVE]
+    ["sh", "-c", FORGING, "sh", BIN]
 }
 
 #[test]
@@ -225,7 +293,7 @@ fn a_divergence_replays_from_the_command_it_prints() {
     assert!(step > 3000, "{report}");
 
     // The operation at that step is the one the seed generates, and the
-    // C side shows the forged answer.
+    // driver's side shows the forged answer.
     let op = &Script::generate(seed, 5000).lines[step - 1];
     let verb = op.split(' ').nth(2).unwrap_or_default();
     assert!(
@@ -234,7 +302,7 @@ fn a_divergence_replays_from_the_command_it_prints() {
     );
     assert!(report.contains(&format!("  {step:>7}  {op}\n")), "{report}");
     assert!(
-        report.contains("     C    -> rc=1 granted=1 remaining=0 retry=0\n"),
+        report.contains("   driver -> rc=1 granted=1 remaining=0 retry=0\n"),
         "{report}"
     );
 
@@ -250,6 +318,7 @@ fn a_divergence_replays_from_the_command_it_prints() {
     let replay = report
         .lines()
         .find_map(|l| l.strip_prefix("replay: edgefront-difftest "))
+        .and_then(|l| l.strip_suffix(" -- DRIVER [ARGS...]"))
         .unwrap_or_else(|| panic!("{report}"));
     let mut replay_args: Vec<&str> = replay.split(' ').collect();
     assert_eq!(
@@ -264,7 +333,9 @@ fn a_divergence_replays_from_the_command_it_prints() {
             "5000"
         ]
     );
-    let honest = run(&replay_args);
+    let mut honest_args = replay_args.clone();
+    honest_args.extend(["--", BIN, "pacer-rust-driver"]);
+    let honest = run(&honest_args);
     replay_args.push("--");
     replay_args.extend(forging_driver_args());
     let again = run(&replay_args);
@@ -272,7 +343,7 @@ fn a_divergence_replays_from_the_command_it_prints() {
     assert_eq!(field(&again, "scripts"), "1", "{again}");
     assert_eq!(field(&again, "first divergence"), first, "{again}");
 
-    // Against the real C driver the same script agrees.
+    // Against the honest driver the same script agrees.
     assert!(honest.status.success(), "{}", text(&honest.stdout));
     assert_eq!(field(&text(&honest.stdout), "divergences"), "0");
 }

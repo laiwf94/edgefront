@@ -1,0 +1,14 @@
+config: ok
+signal HUP: yes
+log "error=\"workers cannot change without a restart\"": found
+config: ok
+signal HUP: yes
+log "listener life: table_size cannot change": found
+config: ok
+signal HUP: yes
+log "listener life: listen cannot change": found
+config: ok
+signal HUP: yes
+log "error=\"line 2: listener life: missing }\"": found
+connect a: ok
+works a: yes

@@ -1,0 +1,7 @@
+connect a: ok
+works a: yes
+mark t: ok
+signal TERM: yes
+exit t: exit 0 time=ok
+log "msg=\"drain timeout\" worker=0 closing=1": found
+log "reason=drain_timeout": found

@@ -1,0 +1,5 @@
+churn: yes
+stats: open=0 closed=accepted:yes refused>0:yes accepted+refused=1200
+signal TERM: yes
+exit: exit 0
+no_log "client table lost a hold": absent

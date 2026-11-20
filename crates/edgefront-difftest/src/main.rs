@@ -49,22 +49,30 @@
 //! command, and exits 1. `resilience-trace` prints the query a seed
 //! generates, to feed a driver by hand.
 //!
-//! `pacer` diffs edgefront-limiter against libpacer: it generates `--scripts`
-//! scripts of `--ops` random operations (default 100 of 10,000), runs each
-//! through the C driver this crate built (or `DRIVER ARGS...`) and through
+//! `pacer-recorded` holds edgefront-limiter to libpacer's recorded answers:
+//! the golden transcripts and the hundred 10,000-operation scripts of the
+//! end-to-end test (by digest), pacerd's config reader's answers for every
+//! input of the corpus and 2,000 mutants. libpacer and pacerd were deleted
+//! with legacy/pacer in week 4, after recording them. It exits 1 on a
+//! difference, naming it.
+//!
+//! `pacer` diffs edgefront-limiter against a driver of libpacer's protocol,
+//! `DRIVER ARGS...`: it generates `--scripts` scripts of `--ops` random
+//! operations (default 100 of 10,000), runs each through the driver and
 //! the Rust crate, and stops at the first divergence, which it prints with
 //! the script's seed, the step and a replay command. It exits 1 on a
 //! divergence. `pacer-script` prints the script a seed generates, to feed
-//! a driver by hand, and `pacer-rust-driver` serves the pacer protocol from
-//! edgefront-limiter, like the C driver.
+//! a driver by hand, and `pacer-rust-driver` serves the protocol from
+//! edgefront-limiter (`pacer-rust-driver config [PATH]` is the C driver's
+//! parse mode, from the Rust reader).
 //!
-//! `pacer-config` diffs pacerd's config reader against edgefront-limiter's:
-//! every config in legacy/pacer and `--mutants` seeded mutants of them
-//! (default 2,000) go through `diffdrive config` (or `DRIVER ARGS...
-//! config`) and the Rust parser, and every input on which the accept or
-//! reject, the error message and line, or a parsed value differ is
-//! printed. It exits 1 on a divergence. `pacer-config-mutant` writes the
-//! mutant a seed gives to stdout, to replay one.
+//! `pacer-config` diffs pacerd's config reader against edgefront-limiter's
+//! through a driver's parse mode (`DRIVER ARGS... config`): every config
+//! pacer shipped and `--mutants` seeded mutants of them (default 2,000),
+//! printing every input on which the accept or reject, the error message
+//! and line, or a parsed value differ. It exits 1 on a divergence.
+//! `pacer-config-mutant` writes the mutant a seed gives to stdout, to
+//! replay one.
 //!
 //! `cache` replays a request log against two cache binaries, cachet 0.1
 //! (`REFERENCE`) and the binary under test (`CANDIDATE`), on one logical
@@ -99,10 +107,11 @@ const USAGE: &str = "usage:
   edgefront-difftest balancer-scenario [--requests N] [--seed N]
   edgefront-difftest resilience [--traces N] [--steps N] [--requests N] [--long N] [--seed N] -- DRIVER [ARGS...]
   edgefront-difftest resilience-trace (outlier [--steps N] | retry [--requests N] [--long N]) [--seed N]
-  edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] [-- DRIVER [ARGS...]]
+  edgefront-difftest pacer-recorded
+  edgefront-difftest pacer [--scripts N] [--ops N] [--seed N] -- DRIVER [ARGS...]
   edgefront-difftest pacer-script [--ops N] [--seed N]
-  edgefront-difftest pacer-rust-driver
-  edgefront-difftest pacer-config [--mutants N] [--seed N] [-- DRIVER [ARGS...]]
+  edgefront-difftest pacer-rust-driver [config [PATH]]
+  edgefront-difftest pacer-config [--mutants N] [--seed N] -- DRIVER [ARGS...]
   edgefront-difftest pacer-config-mutant [--seed N]
   edgefront-difftest cache [--log FILE | --requests N --seed N] [--faketime LIB] [--dir DIR] [--keep N] -- REFERENCE CANDIDATE
   edgefront-difftest cache-record [--requests N] [--seed N]
@@ -160,9 +169,11 @@ fn main() -> ExitCode {
             }
         }
         Some("pacer") => match parse_pacer(&args[1..], true) {
-            Ok((plan, driver)) => run_pacer(plan, &driver),
+            Ok((plan, Some(driver))) => run_pacer(plan, &driver),
+            Ok((_, None)) => usage(NO_DRIVER),
             Err(e) => usage(&e),
         },
+        Some("pacer-recorded") if args.len() == 1 => run_pacer_recorded(),
         Some("pacer-script") => match parse_pacer(&args[1..], false) {
             Ok((plan, _)) => {
                 print!("{}", Script::generate(plan.seed, plan.ops).text());
@@ -183,8 +194,36 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("pacer-rust-driver") if args.get(1).map(String::as_str) == Some("config") => {
+            // The C driver's parse mode, from edgefront-limiter: the file
+            // named, or stdin.
+            let input = match args.get(2..) {
+                Some([path]) => pacer_config::Input {
+                    name: path.clone(),
+                    source: pacer_config::Source::File(path.into()),
+                },
+                Some([]) => {
+                    let mut buf = Vec::new();
+                    if let Err(e) = io::Read::read_to_end(&mut io::stdin().lock(), &mut buf) {
+                        eprintln!("pacer-rust-driver: {e}");
+                        return ExitCode::from(1);
+                    }
+                    pacer_config::Input {
+                        name: "stdin".into(),
+                        source: pacer_config::Source::Bytes(buf),
+                    }
+                }
+                _ => return usage("pacer-rust-driver config [PATH]"),
+            };
+            // A reader that has gone away is not an error, as in the C.
+            let _ = io::stdout()
+                .lock()
+                .write_all(pacer_config::rust_answer(&input).as_bytes());
+            ExitCode::SUCCESS
+        }
         Some("pacer-config") => match parse_pacer_config(&args[1..], true) {
-            Ok((plan, driver)) => run_pacer_config(plan, &driver),
+            Ok((plan, Some(driver))) => run_pacer_config(plan, &driver),
+            Ok((_, None)) => usage(NO_DRIVER),
             Err(e) => usage(&e),
         },
         Some("pacer-config-mutant") => match parse_pacer_config(&args[1..], false) {
@@ -285,15 +324,56 @@ fn run_loadgen(o: &drill::LoadOptions, format: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Why `pacer` and `pacer-config` need a driver now.
+const NO_DRIVER: &str = "libpacer's C driver was deleted with legacy/pacer: give -- DRIVER [ARGS...], or run pacer-recorded to check against libpacer's recorded answers";
+
+/// `pacer-recorded`: edgefront-limiter against libpacer's and pacerd's
+/// recorded answers.
+fn run_pacer_recorded() -> ExitCode {
+    let started = Instant::now();
+    let algo = match pacer::check_recorded(&pacer::recorded_dir(), None) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("edgefront-difftest: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match pacer_config::check_recorded(&pacer_config::pacer_root()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("edgefront-difftest: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "golden transcripts: {} ({} lines)\nrecorded scripts: {} ({} lines)\nconfig inputs: {}\nconfig mutants: {}",
+        algo.goldens, algo.golden_lines, algo.scripts, algo.lines, cfg.inputs, cfg.mutants
+    );
+    let mismatches: Vec<&String> = algo.mismatches.iter().chain(&cfg.mismatches).collect();
+    for m in &mismatches {
+        println!("{m}");
+    }
+    println!(
+        "differences: {}\ntime: {:.1}s",
+        mismatches.len(),
+        started.elapsed().as_secs_f64()
+    );
+    if mismatches.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 fn parse_pacer_config(
     args: &[String],
     driver: bool,
-) -> Result<(pacer_config::Plan, DriverCommand), String> {
+) -> Result<(pacer_config::Plan, Option<DriverCommand>), String> {
     let mut plan = pacer_config::Plan {
         mutants: 2_000,
         seed: clock_seed(),
     };
-    let mut command = DriverCommand::c_driver();
+    let mut command = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if arg == "--" && driver {
@@ -301,10 +381,10 @@ fn parse_pacer_config(
             let Some((program, args)) = rest.split_first() else {
                 return Err("no driver command after --".into());
             };
-            command = DriverCommand {
+            command = Some(DriverCommand {
                 program: program.into(),
                 args: args.to_vec(),
-            };
+            });
             break;
         }
         let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
@@ -496,13 +576,16 @@ fn run_resilience(plan: resilience::Plan, driver: &[String]) -> ExitCode {
     }
 }
 
-fn parse_pacer(args: &[String], driver: bool) -> Result<(pacer::Plan, DriverCommand), String> {
+fn parse_pacer(
+    args: &[String],
+    driver: bool,
+) -> Result<(pacer::Plan, Option<DriverCommand>), String> {
     let mut plan = pacer::Plan {
         scripts: 100,
         ops: 10_000,
         seed: clock_seed(),
     };
-    let mut command = DriverCommand::c_driver();
+    let mut command = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if arg == "--" && driver {
@@ -510,10 +593,10 @@ fn parse_pacer(args: &[String], driver: bool) -> Result<(pacer::Plan, DriverComm
             let Some((program, args)) = rest.split_first() else {
                 return Err("no driver command after --".into());
             };
-            command = DriverCommand {
+            command = Some(DriverCommand {
                 program: program.into(),
                 args: args.to_vec(),
-            };
+            });
             break;
         }
         let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;

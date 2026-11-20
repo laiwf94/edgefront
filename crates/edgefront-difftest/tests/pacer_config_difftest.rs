@@ -1,6 +1,9 @@
-//! pacerd's config reader against edgefront-limiter's: every config in
-//! legacy/pacer through both parsers, the golden parse-mode transcripts,
-//! and the diff against drivers that answer wrongly or fail.
+//! pacerd's config reader against edgefront-limiter's: every config pacer
+//! shipped through the reader, the golden parse-mode transcripts, and the
+//! diff against drivers that answer wrongly or fail. Until legacy/pacer was
+//! deleted the driver was libpacer's C driver in parse mode; it is now
+//! `edgefront-difftest pacer-rust-driver config`, and pacerd's own answers
+//! are held by `pacer_config::check_recorded` (tests/e2e_limiter_port.rs).
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -8,7 +11,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use edgefront_difftest::PACER_DIFFDRIVE;
 use edgefront_difftest::pacer::DriverCommand;
 use edgefront_difftest::pacer_config::{
     self, CORPUS_DIRS, Input, Plan, Source, c_answer, corpus, error_line, pacer_root, rust_answer,
@@ -16,15 +18,20 @@ use edgefront_difftest::pacer_config::{
 
 const BIN: &str = env!("CARGO_BIN_EXE_edgefront-difftest");
 
-/// The C driver behind a shell pipeline, such as a sed program that
+/// The driver: this crate's binary in the C driver's parse mode.
+fn rust_driver() -> DriverCommand {
+    DriverCommand::rust(BIN)
+}
+
+/// The driver behind a shell pipeline, such as a sed program that
 /// rewrites its answer.
 fn piped(filter: &str) -> DriverCommand {
     DriverCommand {
         program: "sh".into(),
         args: vec![
             "-c".into(),
-            format!("\"$0\" \"$@\" | {filter}"),
-            PACER_DIFFDRIVE.into(),
+            format!("\"$0\" pacer-rust-driver \"$@\" | {filter}"),
+            BIN.into(),
         ],
     }
 }
@@ -56,9 +63,10 @@ fn every_file_in_tests_examples_and_the_fuzz_corpus_agrees() {
         })
         .collect();
     assert_eq!(files, want, "the corpus must hold every file");
-    assert!(files.len() >= 40, "{} files", files.len());
+    // pacer's data files: its example, fuzz corpus and diffdrive goldens.
+    assert!(files.len() >= 27, "{} files", files.len());
 
-    let driver = DriverCommand::c_driver();
+    let driver = rust_driver();
     let mut accepted = Vec::new();
     let mut lines = BTreeSet::new();
     for input in inputs
@@ -84,7 +92,7 @@ fn every_file_in_tests_examples_and_the_fuzz_corpus_agrees() {
     ] {
         assert!(accepted.iter().any(|a| a == name), "{name} in {accepted:?}");
     }
-    // C sources and op scripts are rejected, at more than one line.
+    // Scripts and op files are rejected, at more than one line.
     assert!(lines.len() > 1, "{lines:?}");
 }
 
@@ -119,12 +127,12 @@ fn the_literals_include_the_parser_tests_configs() {
 }
 
 #[test]
-fn the_whole_corpus_and_mutants_agree_with_c() {
+fn the_whole_corpus_and_mutants_agree_through_the_driver_binary() {
     let plan = Plan {
         mutants: 3_000,
         seed: 20_261_107,
     };
-    let report = pacer_config::run(&DriverCommand::c_driver(), &pacer_root(), plan).unwrap();
+    let report = pacer_config::run(&rust_driver(), &pacer_root(), plan).unwrap();
     assert!(report.divergences.is_empty(), "{report}");
     assert_eq!(report.mutants, 3_000);
     assert!(report.literals > 1_000, "{report}");
@@ -156,7 +164,7 @@ fn the_rust_side_prints_the_golden_parse_transcripts() {
         };
         assert_eq!(rust_answer(&file), want, "{}", conf.display());
         assert_eq!(rust_answer(&bytes), want, "{}", conf.display());
-        let c = DriverCommand::c_driver();
+        let c = rust_driver();
         assert_eq!(c_answer(&c, &file).unwrap(), want, "{}", conf.display());
         assert_eq!(c_answer(&c, &bytes).unwrap(), want, "{}", conf.display());
         checked += 1;
@@ -166,7 +174,7 @@ fn the_rust_side_prints_the_golden_parse_transcripts() {
 
 #[test]
 fn oversized_and_nul_inputs_agree() {
-    let c = DriverCommand::c_driver();
+    let c = rust_driver();
     let mut big = b"workers 1\n".repeat((1 << 20) / 10);
     big.extend_from_slice(b"listener a {\n listen 127.0.0.1:1\n upstream 127.0.0.1:2\n}\n");
     let mut cases = vec![
@@ -226,10 +234,7 @@ fn a_wrong_error_line_is_reported_with_both_lines() {
     };
     assert_eq!(c_answer(&driver, &replay).unwrap(), mutant.c);
     assert_eq!(rust_answer(&replay), mutant.rust);
-    assert_eq!(
-        c_answer(&DriverCommand::c_driver(), &replay).unwrap(),
-        mutant.rust
-    );
+    assert_eq!(c_answer(&rust_driver(), &replay).unwrap(), mutant.rust);
 }
 
 #[test]
@@ -282,7 +287,8 @@ fn a_failing_or_silent_driver_is_an_error_not_a_divergence() {
 #[test]
 fn the_cli_runs_replays_and_rejects_bad_options() {
     let out = Command::new(BIN)
-        .args(["pacer-config", "--mutants", "200", "--seed", "5"])
+        .args(["pacer-config", "--mutants", "200", "--seed", "5", "--", BIN])
+        .arg("pacer-rust-driver")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -303,7 +309,7 @@ fn the_cli_runs_replays_and_rejects_bad_options() {
             "-c",
         ])
         .arg(format!(
-            "\"{PACER_DIFFDRIVE}\" \"$@\" | sed 's/workers=4 /workers=5 /'"
+            "\"{BIN}\" pacer-rust-driver \"$@\" | sed 's/workers=4 /workers=5 /'"
         ))
         .arg("sh")
         .output()
@@ -326,8 +332,8 @@ fn the_cli_runs_replays_and_rejects_bad_options() {
     assert_ne!(mutant("12"), mutant("13"));
 
     // The mutant goes to the driver unchanged.
-    let mut child = Command::new(PACER_DIFFDRIVE)
-        .arg("config")
+    let mut child = Command::new(BIN)
+        .args(["pacer-rust-driver", "config"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -350,6 +356,7 @@ fn the_cli_runs_replays_and_rejects_bad_options() {
         &["pacer-config", "--mutants", "x"],
         &["pacer-config", "--bogus", "1"],
         &["pacer-config", "--"],
+        &["pacer-config"],
         &["pacer-config-mutant", "--mutants", "3"],
     ] {
         let out = Command::new(BIN).args(args).output().unwrap();

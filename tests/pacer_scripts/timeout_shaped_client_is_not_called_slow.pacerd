@@ -1,0 +1,5 @@
+connect a: ok
+send a: yes
+shutdown a: yes
+recv_reply a: count=2048
+log_count "slow_client": 0

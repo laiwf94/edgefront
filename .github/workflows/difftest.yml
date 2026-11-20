@@ -45,24 +45,14 @@ jobs:
       - name: End to end - HTTP/1.1 and balancing against a live steer
         run: make e2e-steer
 
-  # Every differential suite of the pacer port, weeks 1 to 3: libpacer's
-  # algorithms (100 scripts of 10,000 operations, and the million-operation
-  # end-to-end test with its replay check), pacerd's config reader (every
-  # config in legacy/pacer and 2,000 mutants) and pacerd's data path (the
-  # 23 it_*.c scenarios against pacerd and edgefront limits). legacy/pacer
-  # is deleted only after this job has passed on main; the deleting pull
-  # request links that run.
+  # The pacer port against what libpacer and pacerd answered, recorded
+  # before legacy/pacer was deleted: algorithms, config reader and the 23
+  # data-path scenarios (`make difftest-pacer`).
   difftest-pacer:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Algorithms - diff 100 scripts of 10,000 operations against libpacer
+      - name: Algorithms, config reader and data path against libpacer's and pacerd's recorded answers
         run: make difftest-pacer
-      - name: Algorithms - one million operations end to end, with replay
-        run: cargo test --release --locked -p edgefront-difftest --test e2e_limiter_port
-      - name: Config reader - every pacerd.conf in legacy/pacer and 2,000 mutants
-        run: make difftest-pacer-config
-      - name: Data path - pacer's 23 integration scenarios against pacerd and edgefront limits
-        run: make difftest-l4

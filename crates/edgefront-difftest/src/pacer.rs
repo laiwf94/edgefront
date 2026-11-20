@@ -1,13 +1,19 @@
 //! Diffs edgefront-limiter against libpacer.
 //!
-//! `legacy/pacer/tests/diffdrive.c` reads one operation per line on stdin,
-//! applies it to libpacer and prints exactly one line per operation; its
-//! header documents the protocol. [`Interpreter`] is the same protocol
-//! served by edgefront-limiter, written to print byte-identical lines, so
-//! the two can be compared line by line with no FFI.
+//! libpacer's driver, `diffdrive.c` (deleted with legacy/pacer in week 4),
+//! read one operation per line on stdin, applied it to libpacer and
+//! printed exactly one line per operation. [`Interpreter`] is the same
+//! protocol served by edgefront-limiter, written to print byte-identical
+//! lines, so the two could be compared line by line with no FFI.
+//!
+//! What libpacer answered is kept: [`check_recorded`] holds the
+//! interpreter to libpacer's recorded transcripts, the four golden
+//! transcripts and the SHA-256 of each of the one hundred 10,000-operation
+//! scripts the end-to-end test ran (1,013,182 lines), recorded from the C
+//! driver before it was deleted.
 //!
 //! [`run`] generates seeded scripts of random operations (see
-//! [`generate`]), feeds each one to the C driver and to an [`Interpreter`],
+//! [`generate`]), feeds each one to a driver and to an [`Interpreter`],
 //! and stops at the first line where the transcripts differ. That line is
 //! reported with the script's seed, the step number, the operation, both
 //! answers and the steps leading up to it, so a divergence found in CI can
@@ -601,7 +607,8 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> io::Result<Result<(
     Ok(Ok(()))
 }
 
-/// The program that plays libpacer: the C driver, or a stand-in in tests.
+/// A program that speaks the driver protocol: `edgefront-difftest
+/// pacer-rust-driver`, or a stand-in in tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverCommand {
     pub program: PathBuf,
@@ -609,11 +616,12 @@ pub struct DriverCommand {
 }
 
 impl DriverCommand {
-    /// The C driver this crate's build script compiled.
-    pub fn c_driver() -> Self {
+    /// `program pacer-rust-driver`: this crate's binary serving the
+    /// protocol from edgefront-limiter.
+    pub fn rust(program: impl Into<PathBuf>) -> Self {
         Self {
-            program: PathBuf::from(crate::PACER_DIFFDRIVE),
-            args: Vec::new(),
+            program: program.into(),
+            args: vec!["pacer-rust-driver".into()],
         }
     }
 
@@ -649,7 +657,7 @@ pub struct Divergence {
     /// The 1-based step: the operation's line in the script.
     pub step: usize,
     pub op: String,
-    /// What the C driver printed, or `None` if it printed nothing.
+    /// What the driver printed, or `None` if it printed nothing.
     pub c: Option<String>,
     /// What edgefront-limiter printed, or `None` if it printed nothing.
     pub rust: Option<String>,
@@ -672,17 +680,17 @@ impl fmt::Display for Divergence {
             }
         }
         writeln!(f, "  {:>7}  {}", self.step, self.op)?;
-        writeln!(f, "     C    -> {}", show(&self.c))?;
+        writeln!(f, "   driver -> {}", show(&self.c))?;
         writeln!(f, "     Rust -> {}", show(&self.rust))?;
         if let Some(note) = &self.note {
             writeln!(f, "  {note}")?;
         }
         if let Some(failure) = &self.driver_failure {
-            writeln!(f, "  the C driver failed: {failure}")?;
+            writeln!(f, "  the driver failed: {failure}")?;
         }
         write!(
             f,
-            "replay: edgefront-difftest pacer --seed {} --scripts 1 --ops {}\n\
+            "replay: edgefront-difftest pacer --seed {} --scripts 1 --ops {} -- DRIVER [ARGS...]\n\
              script: edgefront-difftest pacer-script --seed {} --ops {}",
             self.seed, self.ops, self.seed, self.ops
         )
@@ -741,7 +749,7 @@ fn outcome(op: &str, answer: &str) -> String {
     }
 }
 
-/// Compares the answers to `ops` from the C driver and from Rust, and
+/// Compares the answers to `ops` from the driver and from Rust, and
 /// returns the first step where they differ, or where a table's invariant
 /// check failed on either side.
 pub fn compare(
@@ -786,7 +794,7 @@ pub fn compare(
             op: "(end of script)".into(),
             c: Some(c_lines[ops.len()].to_owned()),
             rust: None,
-            note: Some("the C driver printed more lines than there are operations".into()),
+            note: Some("the driver printed more lines than there are operations".into()),
             before: Vec::new(),
             driver_failure: failure,
         });
@@ -799,7 +807,7 @@ pub fn compare(
             op: ops.last().cloned().unwrap_or_default(),
             c: c_lines.last().map(|s| (*s).to_owned()),
             rust: rust.last().cloned(),
-            note: Some("every answer matched, but the C driver did not exit cleanly".into()),
+            note: Some("every answer matched, but the driver did not exit cleanly".into()),
             before: Vec::new(),
             driver_failure: Some(failure),
         });
@@ -836,9 +844,117 @@ pub fn run(driver: &DriverCommand, plan: Plan) -> io::Result<Report> {
     Ok(report)
 }
 
-/// [`run`] against the C driver this crate built.
-pub fn run_c(plan: Plan) -> io::Result<Report> {
-    run(&DriverCommand::c_driver(), plan)
+/// Where libpacer's recorded answers are kept: beside the copy of pacer's
+/// data files the limiter's tests read.
+pub fn recorded_dir() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../edgefront-limiter/tests/data/pacer")
+}
+
+/// Operations per recorded script.
+pub const RECORDED_OPS: usize = 10_000;
+
+/// What [`check_recorded`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedReport {
+    /// Golden transcripts checked, and their lines.
+    pub goldens: usize,
+    pub golden_lines: usize,
+    /// Recorded scripts checked, and their lines.
+    pub scripts: usize,
+    pub lines: usize,
+    /// Every difference, as a line saying where.
+    pub mismatches: Vec<String>,
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(b).iter().fold(String::new(), |mut s, x| {
+        let _ = write!(s, "{x:02x}");
+        s
+    })
+}
+
+/// The interpreter's transcript of `script` as the C driver printed it:
+/// one line per answer, each ending in a newline.
+pub fn transcript_text(script: &str) -> Result<String, ScriptError> {
+    let mut out = String::new();
+    for l in transcript(script)? {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Holds edgefront-limiter to libpacer's recorded answers under `dir`
+/// ([`recorded_dir`]): each golden transcript in `tests/diffdrive`
+/// (`NAME.ops` and libpacer's `NAME.out`) line for line, and each script
+/// of `recorded/algorithms.sha256` (a seed and the SHA-256 of libpacer's
+/// transcript of `Script::generate(seed, RECORDED_OPS)`) by digest. When
+/// `limit` is given, only the first that many scripts are checked.
+pub fn check_recorded(dir: &std::path::Path, limit: Option<usize>) -> io::Result<RecordedReport> {
+    let mut r = RecordedReport::default();
+    let goldens = dir.join("tests/diffdrive");
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&goldens)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "ops"))
+        .collect();
+    names.sort();
+    for ops in names {
+        let want = std::fs::read_to_string(ops.with_extension("out"))?;
+        let script = std::fs::read_to_string(&ops)?;
+        let name = ops
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // A golden may end with a malformed line the C refused; the Rust
+        // side refuses it too, after the same answers.
+        let mut it = Interpreter::new();
+        let mut got = Vec::new();
+        for line in script.lines() {
+            match it.line(line) {
+                Ok(a) => got.extend(a),
+                Err(_) => break,
+            }
+        }
+        r.goldens += 1;
+        r.golden_lines += got.len();
+        for (i, (g, w)) in got.iter().zip(want.lines()).enumerate() {
+            if g != w {
+                r.mismatches.push(format!(
+                    "{name} line {}: libpacer {w:?}, edgefront {g:?}",
+                    i + 1
+                ));
+                break;
+            }
+        }
+        if got.len() != want.lines().count() {
+            r.mismatches.push(format!(
+                "{name}: libpacer printed {} lines, edgefront {}",
+                want.lines().count(),
+                got.len()
+            ));
+        }
+    }
+    let digests = std::fs::read_to_string(dir.join("recorded/algorithms.sha256"))?;
+    for line in digests.lines().take(limit.unwrap_or(usize::MAX)) {
+        let Some((seed, want)) = line.split_once(' ') else {
+            return Err(io::Error::other(format!("bad digest line {line:?}")));
+        };
+        let seed: u64 = seed
+            .parse()
+            .map_err(|_| io::Error::other(format!("bad seed in {line:?}")))?;
+        let text = transcript_text(&Script::generate(seed, RECORDED_OPS).text())
+            .map_err(|e| io::Error::other(format!("seed {seed}: {e}")))?;
+        r.scripts += 1;
+        r.lines += text.lines().count();
+        if sha256_hex(text.as_bytes()) != want {
+            r.mismatches.push(format!(
+                "seed {seed}: the transcript differs from libpacer's; replay with `edgefront-difftest pacer-script --seed {seed} --ops {RECORDED_OPS}`"
+            ));
+        }
+    }
+    Ok(r)
 }
 
 #[cfg(test)]
@@ -1087,12 +1203,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("     C    -> now=99\n     Rust -> now=10\n"),
+            text.contains("   driver -> now=99\n     Rust -> now=10\n"),
             "{text}"
         );
         assert!(
             text.ends_with(
-                "replay: edgefront-difftest pacer --seed 9 --scripts 1 --ops 12\n\
+                "replay: edgefront-difftest pacer --seed 9 --scripts 1 --ops 12 -- DRIVER [ARGS...]\n\
                  script: edgefront-difftest pacer-script --seed 9 --ops 12"
             ),
             "{text}"
@@ -1108,9 +1224,9 @@ mod tests {
         assert_eq!((d.step, d.c.as_deref()), (2, None));
         assert_eq!(d.driver_failure.as_deref(), Some("exit status: 1: boom"));
         let text = d.to_string();
-        assert!(text.contains("C    -> (nothing)"), "{text}");
+        assert!(text.contains("driver -> (nothing)"), "{text}");
         assert!(
-            text.contains("the C driver failed: exit status: 1: boom"),
+            text.contains("the driver failed: exit status: 1: boom"),
             "{text}"
         );
 

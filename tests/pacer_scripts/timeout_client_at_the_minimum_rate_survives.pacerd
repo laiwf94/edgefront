@@ -1,0 +1,6 @@
+connect a: ok
+trickle a: started
+join a: sent all
+shutdown a: yes
+recv_reply a: count=1280
+log_count "slow_client": 0

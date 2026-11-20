@@ -1,22 +1,29 @@
-//! The pacer driver built by this crate's build script: the golden
-//! transcripts under legacy/pacer/tests/diffdrive, the one-line-per-operation
+//! The pacer driver protocol, as `edgefront-difftest pacer-rust-driver`
+//! serves it: libpacer's golden transcripts (kept from legacy/pacer's
+//! tests/diffdrive, recorded from the C driver), the one-line-per-operation
 //! contract the differential runner depends on, and its handling of
-//! malformed scripts.
+//! malformed scripts. Until legacy/pacer was deleted these ran against the
+//! C driver; the Rust driver answers them the same.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use edgefront_difftest::{PACER_DIFFDRIVE, driver};
+use edgefront_difftest::driver;
 use edgefront_limiter::Rate;
 
 const HASH_KEY: &str = "0102030405060708090a0b0c0d0e0f10";
 
 fn golden_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../legacy/pacer/tests/diffdrive")
+    edgefront_difftest::pacer::recorded_dir().join("tests/diffdrive")
 }
 
 fn run(script: &str) -> driver::Transcript {
-    driver::run(Path::new(PACER_DIFFDRIVE), script).expect("run the pacer driver")
+    driver::run_with_args(
+        Path::new(env!("CARGO_BIN_EXE_edgefront-difftest")),
+        &["pacer-rust-driver".to_string()],
+        script,
+    )
+    .expect("run the pacer driver")
 }
 
 /// Lines that are operations: not blank and not comments.

@@ -36,8 +36,8 @@ fn the_limiter_config_demo_passes_every_step() {
 }
 
 /// examples/limiter/pacerd.conf is pacer's own example, kept beside the
-/// new config so the demo outlives legacy/pacer; while legacy/pacer is in
-/// the tree, the two must not drift apart.
+/// new config so the demo outlived legacy/pacer; the copy of pacer's files
+/// the limiter's tests read must not drift from it.
 #[test]
 fn the_example_pacerd_conf_reads_as_pacers() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -46,7 +46,7 @@ fn the_example_pacerd_conf_reads_as_pacers() {
     )))
     .unwrap();
     let pacers = edgefront_limiter::config::read_pacerd(std::path::Path::new(&format!(
-        "{root}/legacy/pacer/examples/pacerd.conf"
+        "{root}/crates/edgefront-limiter/tests/data/pacer/examples/pacerd.conf"
     )))
     .unwrap();
     assert_eq!(ours, pacers);

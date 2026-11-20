@@ -1,0 +1,10 @@
+download_bg d: started
+sleep: ok
+signal TERM: yes
+log "msg=draining reason=SIGTERM": found
+refused_now: refused
+join d: bytes=4194304 hash=ok
+exit: exit 0
+log "reason=done bytes_up=0 bytes_down=4194304": found
+log "msg=drained": found
+no_log "drain timeout": absent

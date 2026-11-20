@@ -1,0 +1,4 @@
+connect a: ok
+send a: yes
+recv_eof a: bytes=0 time=ok
+log "reason=idle_timeout bytes_up=5 bytes_down=0": found
