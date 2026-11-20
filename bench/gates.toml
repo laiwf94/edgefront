@@ -55,6 +55,14 @@ tolerance = 0.05
 # Fixed ceilings, about 10% above the sizes on 20 Nov 2026 (x86_64 release
 # build on the runner): the binary was 7,905,712 bytes and the image
 # 13,807,092. Raising one is a decision a pull request states.
+#
+# binary_bytes raised in #255 (the legacy/pacer deletion, the first pull
+# request the gate judged after the commits below went to main): the
+# binary was 9,228,328 bytes on the runner. The week's growth, measured on
+# an arm64 release build: `edgefront limits` and `edgefront ctl limits`
+# (pacerd's data path, its admin API and client, #85 and #88) added about
+# 0.65 MB, and the proxy's TLS listener and upstream TLS (#86) about 0.54
+# MB. The new ceiling is again about 10% above.
 [ceilings]
-binary_bytes = 8700000
+binary_bytes = 10150000
 image_bytes = 15200000
