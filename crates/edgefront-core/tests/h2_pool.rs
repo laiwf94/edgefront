@@ -33,15 +33,24 @@ struct Counting {
     peers: Mutex<HashSet<SocketAddr>>,
     now: AtomicUsize,
     peak: AtomicUsize,
+    /// Requests wait until this many are in flight at once (0: no wait).
+    gate: usize,
+    open: tokio::sync::Notify,
 }
 
 impl Counting {
     fn new(hold: Duration) -> Arc<Counting> {
+        Counting::gated(hold, 0)
+    }
+
+    fn gated(hold: Duration, gate: usize) -> Arc<Counting> {
         Arc::new(Counting {
             hold,
             peers: Mutex::new(HashSet::new()),
             now: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            gate,
+            open: tokio::sync::Notify::new(),
         })
     }
 
@@ -61,6 +70,14 @@ impl Handler for Counting {
         self.peers.lock().unwrap().insert(peer);
         let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(n, Ordering::SeqCst);
+        if self.gate > 0 {
+            let opened = self.open.notified();
+            if self.peak.load(Ordering::SeqCst) >= self.gate {
+                self.open.notify_waiters();
+            } else {
+                opened.await;
+            }
+        }
         tokio::time::sleep(self.hold).await;
         self.now.fetch_sub(1, Ordering::SeqCst);
         let text = format!("{:?} {}", req.version(), req.uri().path());
@@ -126,7 +143,9 @@ async fn one_connection_carries_100_concurrent_streams() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn ten_thousand_streams_use_at_most_four_connections() {
-    let handler = Counting::new(Duration::from_millis(20));
+    // Every request waits until 1,000 are in flight at once, well past the
+    // 400 that four connections of 100 streams hold before overflowing.
+    let handler = Counting::gated(Duration::from_millis(1), 1000);
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 1000).await;
     let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
     let mut tasks = Vec::new();
@@ -153,7 +172,7 @@ async fn ten_thousand_streams_use_at_most_four_connections() {
     assert!((1..=4).contains(&conns), "{conns} connections");
     assert!(pool.opened() <= 4, "{} opened", pool.opened());
     // The cap is per origin and streams overflowed onto open connections.
-    assert!(handler.peak.load(Ordering::SeqCst) > 400);
+    assert!(handler.peak.load(Ordering::SeqCst) >= 1000);
 }
 
 #[tokio::test]
