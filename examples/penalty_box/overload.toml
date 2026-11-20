@@ -1,0 +1,13 @@
+# A short run of crates/edgefront-bench/scenarios/overload.toml.
+name = "overload-demo"
+workers = 4
+service_us = 200
+duration_s = 8
+warmup_s = 3
+good_clients = 100
+good_rate = 20.0
+abusive_clients = 200
+abusive_rate = 90.0
+client_rate = 100
+sample_ms = 100
+dwell_ms = 2000

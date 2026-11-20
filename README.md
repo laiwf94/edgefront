@@ -285,6 +285,16 @@ Week 7 adds the pieces a real policy needs, all in edgefront-limiter:
 
 `crates/edgefront-limiter/tests/e2e_descriptors.rs` runs nested descriptors with replaces and shared wildcards, five limits decided together, the three costs through the proxy's filter phases and a burst held 200 ms apart.
 
+### Penalty box, bans and overload mode
+
+- **Penalty box** (`penalty`): an HTTP rule with `[http_limits.penalty]` (`windows`, `window`, `timeout`, `max_timeout`, `forget`) boxes a key refused in that many windows running. A boxed key is refused before its limit's table is looked at, in 16 to 23 ns at p50 and 23 to 56 ns at p99. A repeat offence doubles the timeout, and `ban_after` with `ban_for` bans a key boxed that many times.
+- **Bans** (`ban::BanList`): exact ends checked against the clock, swept by an expiry wheel, saved to a file and loaded again (`save`, `load`). `edgefront limits` checks bans at accept. Its admin API adds `POST /ban?addr=IP&for=SECONDS`, `POST /unban?addr=IP` and `GET /bans`, the bans survive a reload, and with `EDGEFRONT_BANS_FILE` they survive a restart.
+- **Listener-wide rates** (`listener::ListenerLimits`): connections a second, requests a second and requests in flight for a whole entry point, one CAS each.
+- **Overload mode** (`overload`): `[overload]` in the `--limits` file samples Linux's pressure stall information (`cpu.pressure`, `memory.pressure`, `memory.current` against `memory.max`) every second. It steps the limits down to a half or a quarter as CPU or memory pressure passes its thresholds, and back up after a dwell with hysteresis. Under synthetic CPU saturation, overload mode held the good clients' p99 to 0.23 to 0.25 ms against 20 to 225 ms without it ([docs/benchmarks/overload.md](docs/benchmarks/overload.md)).
+- **Connection quotas** (`conn_quota`): `[connection_quota] max_requests` and `max_bytes` close an HTTP/1.1 keep-alive connection with `Connection: close`, or an HTTP/2 one with GOAWAY, after its quota.
+
+`examples/penalty_box.sh` runs a boxed client, its ban, a connection quota, a ban through `edgefront limits` that survives a reload and expires on time, and overload mode. CI runs it.
+
 ### Migrating from pacer
 
 pacer is fully ported, and `legacy/pacer` is deleted (commit 54a2d6f). Its history stays reachable: `git log -- legacy/pacer` lists every commit that touched it in this repository, and `git log ff1d5f6^2` lists its own 36 commits from before the merge; `git checkout 54a2d6f^ -- legacy/pacer` brings the C back to build it. To move a pacerd deployment to `edgefront limits`:

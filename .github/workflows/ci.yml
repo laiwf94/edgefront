@@ -184,6 +184,8 @@ jobs:
         run: examples/l4_limits.sh
       - name: HTTP limits demo (edgefront proxy --limits)
         run: examples/http_limits.sh
+      - name: Penalty box, bans and overload demo
+        run: examples/penalty_box.sh
 
   # steer's failover drill against edgefront: 100.00% of requests in all
   # four phases with the resilience features on, and every fault showing
