@@ -27,3 +27,17 @@ path = "fuzz_targets/limiter_config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "forwarded"
+path = "fuzz_targets/forwarded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cidr_list"
+path = "fuzz_targets/cidr_list.rs"
+test = false
+doc = false
+bench = false

@@ -103,6 +103,8 @@ jobs:
           - { crate: edgefront-core, target: base_url }
           - { crate: edgefront-core, target: bearer_token }
           - { crate: edgefront-limiter, target: limiter_config, secs: 1800, timeout: 50 }
+          - { crate: edgefront-limiter, target: forwarded, secs: 1800, timeout: 50 }
+          - { crate: edgefront-limiter, target: cidr_list, secs: 1800, timeout: 50 }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
