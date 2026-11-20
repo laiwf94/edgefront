@@ -119,6 +119,7 @@ use crate::balancer::rng::{Rng, SplitMix64};
 use crate::balancer::{Balancer, Options};
 use crate::endpoint::{Endpoint, InFlight};
 use crate::forwarded;
+use crate::grpc;
 use crate::health::{self, Checker};
 use crate::outlier::Detector;
 use crate::path::RequestTarget;
@@ -939,7 +940,18 @@ impl Proxy {
         let length = request_length(&headers, &incoming, parts.version);
         fwd.apply(&mut headers);
 
-        let deadline = cluster.timeout.map(|t| started + t);
+        // A gRPC call's own deadline bounds it too, and the endpoint is
+        // told the time left.
+        let call_deadline = grpc::timeout(&headers).map(|t| started + t);
+        let deadline = match (cluster.timeout.map(|t| started + t), call_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if call_deadline.is_some()
+            && let Some(at) = deadline
+        {
+            grpc::set_timeout(&mut headers, at.saturating_duration_since(Instant::now()));
+        }
         let mut tried = Vec::new();
         let upstream_target = target.upstream_target();
         let exchange_fut = async {
@@ -1432,7 +1444,11 @@ impl Handler for Proxy {
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
         let h2 = req.version() == Version::HTTP_2;
+        let grpc = grpc::is_grpc(req.headers());
         let mut resp = self.handle(req, peer).await;
+        if grpc && let Some(Answered(message)) = resp.extensions_mut().remove::<Answered>() {
+            resp = grpc::trailers_only(resp, message);
+        }
         // HTTP/2 has no `Connection` header; the listener's GOAWAY ends
         // such a connection when the drain stops it.
         if self.draining() && !h2 {
@@ -1566,6 +1582,11 @@ fn go_bad_request(reason: Option<&'static str>) -> Response<Body> {
     resp
 }
 
+/// Marks a response the proxy wrote itself, with its message, so a gRPC
+/// call gets it as a gRPC status instead.
+#[derive(Clone, Copy)]
+struct Answered(&'static str);
+
 /// One of steer's JSON errors.
 fn error(
     id: &HeaderValue,
@@ -1581,6 +1602,7 @@ fn error(
     );
     let mut resp = Response::new(body::full(text));
     *resp.status_mut() = status;
+    resp.extensions_mut().insert(Answered(message));
     let h = resp.headers_mut();
     h.insert(reqid::HEADER, id.clone());
     h.insert(

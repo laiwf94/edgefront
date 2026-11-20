@@ -10,6 +10,7 @@ pub mod balancer;
 pub mod endpoint;
 pub mod fakeupstream;
 pub mod forwarded;
+pub mod grpc;
 pub mod health;
 pub mod outlier;
 pub mod path;
