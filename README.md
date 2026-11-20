@@ -255,6 +255,18 @@ content_type = "application/json"
 
 `examples/http_limits.sh` runs both rules above against a small upstream and checks every step (CI runs it; `crates/edgefront/tests/e2e_http_limits.rs` runs it against the test build). Measured on this Mac ([docs/benchmarks/http-limits.md](docs/benchmarks/http-limits.md)): limiting adds 0.71 to 0.75 µs at p99 per request in the proxy pipeline, and at 50,000 requests per second over 100,000 paths the limited proxy admitted 900,475 requests where a replay of the schedule through the same rules admits 900,472, in the two runs whose requests arrived on time.
 
+### Several limits, descriptors, costs and hot keys
+
+Week 7 adds the pieces a real policy needs, all in edgefront-limiter:
+
+- **All or nothing** (`multi::take_all`): a request checked against up to 16 limits, shared buckets or table keys, takes from every one or from none; a refusal refunds what the earlier limits took. Held by a proptest of 16 threads on five limits each.
+- **Envoy descriptors** (`descriptor`): `DescriptorConfig::load` reads envoyproxy/ratelimit's YAML unchanged (domains, nested `key`/`value` descriptors, wildcard values, `unlimited`, `replaces`, `shadow_mode`, `share_threshold`, `detailed_metric`), with the service's own error messages, and `DescriptorLimiter::should_rate_limit` decides with its fixed windows. Every `GetLimit` case of the service's `config_test.go` for its basic and wildcard configs gives the same answer.
+- **Costs** (`cost`): an HTTP rule can charge `cost = "request_bytes"` (the `Content-Length`), `"graphql"` (a query's complexity, fields times their `first`/`last`/`limit`, from a GET's `query`), `"response_header:x-cost"` (booked after the response, so the key waits off the debt) or a fixed number, with `cost_missing` for requests that say nothing.
+- **Hot keys** (`hotkey::HotTable`): sampled counts find the keys taking a large share of decisions and give each a sub-bucket per thread, rebalanced every millisecond, so one popular key no longer serialises every core: 115 to 279 million decisions a second on 16 threads against 17 to 22 million on one bucket ([docs/benchmarks/hot-key.md](docs/benchmarks/hot-key.md)).
+- **NGINX bursts** (`burst::LimitReq`): `limit_req`'s `rate`, `burst`, `delay=N` and `nodelay` with NGINX's own millisecond arithmetic, so a request over the rate is held until its turn instead of refused.
+
+`crates/edgefront-limiter/tests/e2e_descriptors.rs` runs nested descriptors with replaces and shared wildcards, five limits decided together, the three costs through the proxy's filter phases and a burst held 200 ms apart.
+
 ### Migrating from pacer
 
 pacer is fully ported, and `legacy/pacer` is deleted (commit 54a2d6f). Its history stays reachable: `git log -- legacy/pacer` lists every commit that touched it in this repository, and `git log ff1d5f6^2` lists its own 36 commits from before the merge; `git checkout 54a2d6f^ -- legacy/pacer` brings the C back to build it. To move a pacerd deployment to `edgefront limits`:
