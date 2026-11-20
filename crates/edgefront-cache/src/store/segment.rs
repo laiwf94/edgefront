@@ -213,11 +213,34 @@ impl SegmentStore {
         let replay_from: BTreeMap<u64, u64> = match snapshot {
             Some(snap) => {
                 store.warm = true;
-                for (n, seg) in &snap.segments {
-                    index.segments.insert(*n, *seg);
+                // The snapshot's own live counts stand; entries go straight
+                // in, since a snapshot holds each key once.
+                index.segments = snap.segments.clone();
+                index.map.reserve(snap.entries.len());
+                // Size each surrogate key's set once instead of growing it.
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for (_, loc) in &snap.entries {
+                    for tag in &loc.tags {
+                        *counts.entry(tag).or_default() += 1;
+                    }
+                }
+                for (tag, n) in counts {
+                    index.tags.insert(tag.into(), HashSet::with_capacity(n));
                 }
                 for (key, loc) in snap.entries {
-                    index_put(&mut index, key, loc);
+                    for tag in &loc.tags {
+                        index
+                            .tags
+                            .entry(tag.clone())
+                            .or_default()
+                            .insert(key.clone());
+                    }
+                    index.live += loc.frame;
+                    if let Some(old) = index.map.insert(key, loc) {
+                        // A damaged snapshot naming a key twice: undo the
+                        // first one's count.
+                        index.live -= old.frame;
+                    }
                 }
                 on_disk
                     .iter()

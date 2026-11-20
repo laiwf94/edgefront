@@ -129,6 +129,8 @@ impl Snapshot {
             return None;
         }
         let mut entries = Vec::with_capacity(count);
+        // Most objects share a few surrogate keys: one allocation each.
+        let mut interned: HashMap<&str, Arc<str>> = HashMap::new();
         for _ in 0..count {
             let key: Key = r.str16()?.into();
             let segment = r.u64()?;
@@ -137,7 +139,9 @@ impl Snapshot {
             let ntags = r.u16()? as usize;
             let mut tags = Vec::with_capacity(ntags.min(64));
             for _ in 0..ntags {
-                tags.push(Arc::<str>::from(r.str16()?));
+                let tag = r.str16()?;
+                let shared = interned.entry(tag).or_insert_with(|| Arc::from(tag));
+                tags.push(shared.clone());
             }
             let seg = segments.get(&segment)?;
             if offset.checked_add(frame)? > seg.len {
