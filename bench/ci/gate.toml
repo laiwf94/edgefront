@@ -1,4 +1,4 @@
-# Slowdown branch for proving the ten-run benchmark gate; never merged (#87).
+# Slowdown branch for proving the ten-run benchmark gate; a twelfth, try 2; never merged (#87).
 # The regression gate's scenario: the hit path. 20 seconds of 1 and 4 KiB
 # hits against edgefront on one CPU, run ten times per pull request beside
 # ten runs of its base commit (see bench/gates.toml). 8-second runs were
