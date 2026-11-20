@@ -50,7 +50,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
-          node-version: "22.21.0"
+          node-version: "24.11.1"
       - name: Check out the suite at the pinned commit
         run: |
           mkdir -p target/conformance/cache-tests

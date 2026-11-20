@@ -275,6 +275,47 @@ async fn stale_if_error_covers_origin_5xx() {
 }
 
 #[tokio::test]
+async fn a_5xx_with_explicit_freshness_is_cached_but_never_replaces_a_good_copy() {
+    // On its own, a 503 the origin says is fresh is stored and reused.
+    let o = TestOrigin::start(handler(|_, _| {
+        reply(503, &[("cache-control", "max-age=60")], "down")
+    }))
+    .await;
+    let h = harness(&[o.addr], |_, _| {});
+    o.use_clock(&h.clock);
+    assert_eq!(h.get("/down", &[]).await.status, 503);
+    let got = h.get("/down", &[]).await;
+    assert_eq!(got.status, 503);
+    assert_eq!(got.body, "down");
+    assert!(
+        got.cache_status().starts_with("test-node; hit"),
+        "{}",
+        got.cache_status()
+    );
+    assert_eq!(o.hits(), 1);
+
+    // Behind a good stale copy, the same 503 leaves the copy in place, so
+    // stale-if-error keeps answering with it and the origin is asked again.
+    let (o, _) = versioned("max-age=10, stale-if-error=60").await;
+    let h = harness(&[o.addr], |_, _| {});
+    o.use_clock(&h.clock);
+    h.get("/doc", &[]).await;
+    o.set_handler(handler(|_, _| {
+        reply(503, &[("cache-control", "max-age=60")], "down")
+    }));
+    h.clock.advance(15 * SECOND);
+    for _ in 0..2 {
+        let got = h.get("/doc", &[]).await;
+        assert_eq!(got.body, "body v1");
+        assert!(
+            got.cache_status()
+                .contains("fwd-status=503; detail=stale-if-error")
+        );
+    }
+    assert_eq!(o.hits(), 3);
+}
+
+#[tokio::test]
 async fn stale_if_error_from_the_request() {
     let (o, _) = versioned("max-age=10").await;
     let h = harness(&[o.addr], |_, _| {});

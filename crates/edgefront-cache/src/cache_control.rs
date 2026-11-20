@@ -5,11 +5,25 @@
 //! arguments, stray whitespace, empty list members and unknown directives.
 //! When a directive appears twice, the first occurrence wins (RFC 9111
 //! section 4.2.1 allows that or treating the response as stale).
+//!
+//! A response's directives for this cache come from `CDN-Cache-Control`
+//! (RFC 9213) when it is present and valid, and from `Cache-Control`
+//! otherwise ([`CacheControl::for_response`]). The targeted field is a
+//! Structured Fields dictionary (RFC 9651); one that does not parse is
+//! ignored as a whole, and a directive whose value has the wrong type is
+//! ignored on its own.
 
 use http::header::{self, HeaderMap, HeaderValue};
 
-/// The value used when delta-seconds overflows (RFC 9111 section 1.2.2).
-pub const DELTA_SECONDS_MAX: u64 = 1 << 31;
+/// The value used when delta-seconds overflows (RFC 9111 section 1.2.2):
+/// at least 2^31, or the greatest integer the cache can conveniently
+/// represent. 2^32 - 1, so an Age just under 2^31 with a `max-age` of
+/// 2^32 - 1 is still fresh, and lifetimes stay well inside `SystemTime`.
+pub const DELTA_SECONDS_MAX: u64 = u32::MAX as u64;
+
+/// The targeted cache-control field for CDN caches (RFC 9213).
+pub const CDN_CACHE_CONTROL: header::HeaderName =
+    header::HeaderName::from_static("cdn-cache-control");
 
 /// Parsed Cache-Control directives. Request-only and response-only
 /// directives share one type because their names do not collide.
@@ -32,6 +46,9 @@ pub struct CacheControl {
     pub private: bool,
     pub public: bool,
     pub immutable: bool,
+    /// Set when these directives came from `CDN-Cache-Control`, which also
+    /// makes this cache ignore `Expires` (RFC 9213 section 2.2).
+    pub targeted: bool,
 }
 
 impl CacheControl {
@@ -94,7 +111,8 @@ fn set_once(slot: &mut Option<u64>, value: Option<u64>) {
     }
 }
 
-/// Parses delta-seconds: one or more ASCII digits, clamped to 2^31.
+/// Parses delta-seconds: one or more ASCII digits, clamped to
+/// [`DELTA_SECONDS_MAX`].
 pub fn parse_delta(arg: &[u8]) -> Option<u64> {
     if arg.is_empty() || !arg.iter().all(u8::is_ascii_digit) {
         return None;
@@ -169,6 +187,53 @@ fn for_each_directive(value: &[u8], mut f: impl FnMut(&[u8], Option<&[u8]>)) {
 }
 
 impl CacheControl {
+    /// The directives a response gives this cache: `CDN-Cache-Control` when
+    /// it is present and parses as a dictionary, otherwise `Cache-Control`.
+    pub fn for_response(headers: &HeaderMap) -> Self {
+        Self::targeted(headers).unwrap_or_else(|| Self::from_headers(headers))
+    }
+
+    /// The directives in `CDN-Cache-Control`, if present and valid.
+    pub fn targeted(headers: &HeaderMap) -> Option<Self> {
+        let mut lines = headers.get_all(CDN_CACHE_CONTROL).iter().peekable();
+        lines.peek()?;
+        let mut joined = Vec::new();
+        for (i, line) in lines.enumerate() {
+            if i > 0 {
+                joined.extend_from_slice(b", ");
+            }
+            joined.extend_from_slice(line.as_bytes());
+        }
+        let members = sf_dictionary(&joined)?;
+        let mut cc = CacheControl {
+            targeted: true,
+            ..CacheControl::default()
+        };
+        for (name, value) in &members {
+            match (name.as_slice(), value) {
+                (
+                    b"max-age" | b"s-maxage" | b"stale-while-revalidate" | b"stale-if-error",
+                    SfValue::Integer(n),
+                ) => {
+                    if let Ok(n) = u64::try_from(*n) {
+                        cc.apply(name, Some(n.to_string().as_bytes()));
+                    }
+                }
+                (b"no-cache" | b"private", SfValue::True | SfValue::String) => cc.apply(name, None),
+                (name, SfValue::True)
+                    if !matches!(
+                        name,
+                        b"max-age" | b"s-maxage" | b"stale-while-revalidate" | b"stale-if-error"
+                    ) =>
+                {
+                    cc.apply(name, None);
+                }
+                _ => {}
+            }
+        }
+        Some(cc)
+    }
+
     /// Parses the Cache-Control field lines of a header map.
     pub fn from_headers(headers: &HeaderMap) -> Self {
         CacheControl::parse(
@@ -187,6 +252,237 @@ fn is_ows(b: u8) -> bool {
 /// token characters from RFC 9110 section 5.6.2.
 pub fn is_tchar(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// A dictionary member's value, reduced to what directives need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SfValue {
+    Integer(i64),
+    True,
+    String,
+    /// Any other item or an inner list: a decimal, token, byte sequence,
+    /// `?0`, a date or a display string.
+    Other,
+}
+
+/// Parses a Structured Fields dictionary (RFC 9651 section 4.2.2) into its
+/// members in order, a repeated key keeping the last value. `None` when the
+/// field is not a valid dictionary.
+fn sf_dictionary(input: &[u8]) -> Option<Vec<(Vec<u8>, SfValue)>> {
+    let mut p = SfParser { s: input, i: 0 };
+    p.skip_sp();
+    let mut members: Vec<(Vec<u8>, SfValue)> = Vec::new();
+    while !p.done() {
+        let key = p.key()?;
+        let value = if p.eat(b'=') {
+            if p.peek() == Some(b'(') {
+                p.inner_list()?;
+                SfValue::Other
+            } else {
+                p.bare_item()?
+            }
+        } else {
+            SfValue::True
+        };
+        p.params()?;
+        match members.iter_mut().find(|(k, _)| *k == key) {
+            Some(m) => m.1 = value,
+            None => members.push((key, value)),
+        }
+        p.skip_ows();
+        if p.done() {
+            break;
+        }
+        if !p.eat(b',') {
+            return None;
+        }
+        p.skip_ows();
+        if p.done() {
+            return None;
+        }
+    }
+    p.skip_sp();
+    p.done().then_some(members)
+}
+
+struct SfParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl SfParser<'_> {
+    fn done(&self) -> bool {
+        self.i >= self.s.len()
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.i).copied()
+    }
+
+    fn eat(&mut self, b: u8) -> bool {
+        let hit = self.peek() == Some(b);
+        if hit {
+            self.i += 1;
+        }
+        hit
+    }
+
+    fn skip_sp(&mut self) {
+        while self.eat(b' ') {}
+    }
+
+    fn skip_ows(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t')) {
+            self.i += 1;
+        }
+    }
+
+    fn key(&mut self) -> Option<Vec<u8>> {
+        let start = self.i;
+        match self.peek() {
+            Some(b'a'..=b'z' | b'*') => self.i += 1,
+            _ => return None,
+        }
+        while matches!(
+            self.peek(),
+            Some(b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'*')
+        ) {
+            self.i += 1;
+        }
+        Some(self.s[start..self.i].to_vec())
+    }
+
+    fn params(&mut self) -> Option<()> {
+        while self.eat(b';') {
+            self.skip_sp();
+            self.key()?;
+            if self.eat(b'=') {
+                self.bare_item()?;
+            }
+        }
+        Some(())
+    }
+
+    fn inner_list(&mut self) -> Option<()> {
+        if !self.eat(b'(') {
+            return None;
+        }
+        loop {
+            self.skip_sp();
+            if self.eat(b')') {
+                return self.params();
+            }
+            self.bare_item()?;
+            self.params()?;
+            if !matches!(self.peek(), Some(b' ' | b')')) {
+                return None;
+            }
+        }
+    }
+
+    fn bare_item(&mut self) -> Option<SfValue> {
+        match self.peek()? {
+            b'-' | b'0'..=b'9' => self.number(),
+            b'"' => self.string(),
+            b'?' => {
+                self.i += 1;
+                match self.peek() {
+                    Some(b'1') => {
+                        self.i += 1;
+                        Some(SfValue::True)
+                    }
+                    Some(b'0') => {
+                        self.i += 1;
+                        Some(SfValue::Other)
+                    }
+                    _ => None,
+                }
+            }
+            b':' => {
+                self.i += 1;
+                while matches!(self.peek(), Some(b) if b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+                {
+                    self.i += 1;
+                }
+                self.eat(b':').then_some(SfValue::Other)
+            }
+            b'@' => {
+                self.i += 1;
+                match self.number()? {
+                    SfValue::Integer(_) => Some(SfValue::Other),
+                    _ => None,
+                }
+            }
+            b'%' => {
+                self.i += 1;
+                self.string().map(|_| SfValue::Other)
+            }
+            b if b.is_ascii_alphabetic() || b == b'*' => {
+                self.i += 1;
+                while matches!(self.peek(), Some(b) if is_tchar(b) || b == b':' || b == b'/') {
+                    self.i += 1;
+                }
+                Some(SfValue::Other)
+            }
+            _ => None,
+        }
+    }
+
+    fn number(&mut self) -> Option<SfValue> {
+        let negative = self.eat(b'-');
+        let start = self.i;
+        let mut dot = None;
+        while let Some(b) = self.peek() {
+            if b.is_ascii_digit() {
+                self.i += 1;
+            } else if b == b'.' && dot.is_none() && self.i > start {
+                dot = Some(self.i);
+                self.i += 1;
+            } else {
+                break;
+            }
+            if dot.is_none() && self.i - start > 15 {
+                return None;
+            }
+        }
+        let digits = &self.s[start..self.i];
+        if digits.is_empty() || !digits[0].is_ascii_digit() {
+            return None;
+        }
+        match dot {
+            None => {
+                let n: i64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+                Some(SfValue::Integer(if negative { -n } else { n }))
+            }
+            Some(d) => {
+                let (int, frac) = (d - start, self.i - d - 1);
+                (int <= 12 && (1..=3).contains(&frac)).then_some(SfValue::Other)
+            }
+        }
+    }
+
+    fn string(&mut self) -> Option<SfValue> {
+        if !self.eat(b'"') {
+            return None;
+        }
+        loop {
+            match self.peek()? {
+                b'"' => {
+                    self.i += 1;
+                    return Some(SfValue::String);
+                }
+                b'\\' => {
+                    self.i += 1;
+                    match self.peek()? {
+                        b'"' | b'\\' => self.i += 1,
+                        _ => return None,
+                    }
+                }
+                0x20..=0x7e => self.i += 1,
+                _ => return None,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -285,13 +581,15 @@ mod tests {
     }
 
     #[test]
-    fn overflow_clamps_to_two_to_the_31() {
+    fn overflow_clamps_to_two_to_the_32_less_one() {
         assert_eq!(
             cc("max-age=99999999999999999999999").max_age,
             Some(DELTA_SECONDS_MAX)
         );
-        assert_eq!(cc("max-age=2147483648").max_age, Some(DELTA_SECONDS_MAX));
-        assert_eq!(cc("max-age=2147483647").max_age, Some(2_147_483_647));
+        assert_eq!(cc("max-age=4294967296").max_age, Some(DELTA_SECONDS_MAX));
+        assert_eq!(cc("max-age=4294967295").max_age, Some(4_294_967_295));
+        assert_eq!(cc("max-age=2147483648").max_age, Some(2_147_483_648));
+        const { assert!(DELTA_SECONDS_MAX >= 1 << 31) };
     }
 
     #[test]
@@ -341,5 +639,80 @@ mod tests {
         let cc = CacheControl::from_headers(&h);
         assert_eq!(cc.max_age, Some(5));
         assert!(cc.public);
+    }
+
+    fn targeted(values: &[&str]) -> Option<CacheControl> {
+        let mut h = HeaderMap::new();
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        for v in values {
+            h.append(CDN_CACHE_CONTROL, HeaderValue::from_str(v).unwrap());
+        }
+        CacheControl::targeted(&h)
+    }
+
+    #[test]
+    fn cdn_cache_control_replaces_cache_control_when_valid() {
+        let c = targeted(&["max-age=3600"]).unwrap();
+        assert!(c.targeted && !c.no_store);
+        assert_eq!(c.max_age, Some(3600));
+        // Several lines are one dictionary; a repeated key keeps the last.
+        let c = targeted(&["max-age=1, private", "max-age=7;x=1, s-maxage=9"]).unwrap();
+        assert_eq!((c.max_age, c.s_maxage, c.private), (Some(7), Some(9), true));
+        // Unknown members and parameters are allowed; flags are booleans.
+        let c = targeted(&["foobar, no-store, must-revalidate=?1, public=?0"]).unwrap();
+        assert!(c.no_store && c.must_revalidate && !c.public);
+        // Qualified private and no-cache count as the unqualified forms.
+        let c = targeted(&["private=\"set-cookie\", no-cache=\"x\""]).unwrap();
+        assert!(c.private && c.no_cache);
+        // A wrong-typed value drops only its directive.
+        let c = targeted(&["max-age=\"10000\", s-maxage=1.5, stale-if-error, no-store=5"]).unwrap();
+        assert_eq!(
+            (c.max_age, c.s_maxage, c.stale_if_error),
+            (None, None, None)
+        );
+        assert!(!c.no_store);
+        assert_eq!(targeted(&["max-age=-1"]).unwrap().max_age, None);
+        assert_eq!(
+            targeted(&["max-age=99999999999"]).unwrap().max_age,
+            Some(DELTA_SECONDS_MAX)
+        );
+        // Every item type parses.
+        let c = targeted(&[
+            "a=tok/en:x, b=:aGk=:, c=@1700000000, d=%\"x\", e=(1 \"two\" ?1);p, f=12.345, g=\"q\\\"\", max-age=5",
+        ])
+        .unwrap();
+        assert_eq!(c.max_age, Some(5));
+        // Absent, or not a dictionary: none, and Cache-Control applies.
+        assert_eq!(targeted(&[]), None);
+        for bad in [
+            "max-age=10000, &&&&&",
+            "MaX-aGe=3600",
+            "max-age=1,",
+            "max-age =1",
+            "max-age=1 2",
+            "a=\"unterminated",
+            "a=\"bad\\escape\"",
+            "a=1.2345",
+            "a=1234567890123.4",
+            "a=1234567890123456",
+            "a=?2",
+            "a=(1 2",
+            "a=(1;)",
+            "a=:bad",
+            "a=@x",
+            "a=-",
+            "a=",
+            "a;=1",
+            ", a",
+        ] {
+            assert_eq!(targeted(&[bad]), None, "{bad}");
+        }
+        let mut h = HeaderMap::new();
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        h.insert(CDN_CACHE_CONTROL, HeaderValue::from_static("max-age=1, &"));
+        let c = CacheControl::for_response(&h);
+        assert!(c.no_store && !c.targeted);
+        h.insert(CDN_CACHE_CONTROL, HeaderValue::from_static("max-age=1"));
+        assert!(!CacheControl::for_response(&h).no_store);
     }
 }
