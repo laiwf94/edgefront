@@ -648,6 +648,49 @@ impl Table {
         Ok(d)
     }
 
+    /// [`Table::take`], also returning how long until the key's bucket is
+    /// full again, in nanoseconds rounded up: 0 for a full bucket. That is
+    /// the reset time an HTTP `RateLimit` header reports, read under the
+    /// same lock as the decision so the two agree.
+    pub fn take_reset(&self, key: &[u8], now_ns: u64, cost: u64) -> Result<(Decision, u64), Error> {
+        check_key(key)?;
+        let (iv, tol) = self.rate();
+        if cost > tol / iv {
+            return Err(Error::CostExceedsBurst);
+        }
+        let (hash, mut s) = self.lock(key);
+        let now = s.now(now_ns);
+        let e = s
+            .find_or_insert(self.policy, now, hash, key)
+            .ok_or(Error::TableFull)?;
+        let mut d = Decision::default();
+        if let Some(next) = step::take(e.tat, now, cost, iv, tol, &mut d) {
+            e.tat = next;
+        }
+        Ok((d, step::ns_ceil(e.tat.saturating_sub(now))))
+    }
+
+    /// [`crate::Gcra::book`] for one key: book `cost` tokens that may not
+    /// be available yet, going into debt, with `retry_after_ns` saying
+    /// when they are due. A request that waits instead of being refused
+    /// books its token and sleeps until then, so waiting requests are
+    /// served in the order they asked. A cost above the burst is lowered
+    /// to the burst.
+    pub fn book(&self, key: &[u8], now_ns: u64, cost: u64) -> Result<Decision, Error> {
+        check_key(key)?;
+        let (iv, tol) = self.rate();
+        let (hash, mut s) = self.lock(key);
+        let now = s.now(now_ns);
+        let e = s
+            .find_or_insert(self.policy, now, hash, key)
+            .ok_or(Error::TableFull)?;
+        let mut d = Decision::default();
+        if let Some((_, next)) = step::book(e.tat, now, cost, iv, tol, &mut d) {
+            e.tat = next;
+        }
+        Ok(d)
+    }
+
     /// Hand back unused tokens for `key`. Unknown and invalid keys are
     /// ignored: an evicted key is already at a full bucket.
     pub fn refund(&self, key: &[u8], now_ns: u64, tokens: u64) {
@@ -1833,5 +1876,37 @@ mod tests {
             st.inserts,
             st.entries + st.removals + st.reclaims + st.evictions
         );
+    }
+
+    #[test]
+    fn take_reset_reports_the_time_to_a_full_bucket() {
+        let rate = Rate::new(1, SEC, 3);
+        let t = Table::new(&TableConfig::new(16, rate)).unwrap();
+        let now = 5 * SEC;
+        let (d, reset) = t.take_reset(b"k", now, 0).unwrap();
+        assert_eq!((d.remaining, reset), (3, 0));
+        let (d, reset) = t.take_reset(b"k", now, 2).unwrap();
+        assert_eq!((d.allowed, d.remaining, reset), (true, 1, 2 * SEC));
+        let (d, reset) = t.take_reset(b"k", now + SEC / 2, 2).unwrap();
+        assert!(!d.allowed);
+        assert_eq!((d.retry_after_ns, reset), (SEC / 2, 3 * SEC / 2));
+        assert_eq!(t.take_reset(b"k", now, 4), Err(Error::CostExceedsBurst));
+        assert_eq!(t.take_reset(b"", now, 1), Err(Error::InvalidKey));
+    }
+
+    #[test]
+    fn book_goes_into_debt_in_order() {
+        let rate = Rate::new(10, SEC, 1);
+        let t = Table::new(&TableConfig::new(16, rate)).unwrap();
+        let now = SEC;
+        assert_eq!(t.book(b"k", now, 1).unwrap().retry_after_ns, 0);
+        let second = t.book(b"k", now, 1).unwrap();
+        assert!(second.allowed);
+        assert_eq!(second.retry_after_ns, SEC / 10);
+        assert_eq!(t.book(b"k", now, 1).unwrap().retry_after_ns, SEC / 5);
+        assert!(!t.take(b"k", now + SEC / 5 - 1, 1).unwrap().allowed);
+        t.refund(b"k", now, 1);
+        assert!(t.take(b"k", now + SEC / 5, 1).unwrap().allowed);
+        assert_eq!(t.book(b"", now, 1), Err(Error::InvalidKey));
     }
 }

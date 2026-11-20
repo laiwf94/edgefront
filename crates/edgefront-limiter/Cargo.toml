@@ -7,10 +7,24 @@ license = "MIT"
 description = "Lock-free rate limiting primitives for edgefront, ported from libpacer."
 publish = false
 
+[features]
+default = ["http"]
+# The HTTP limiter layer for the proxy pipeline (`http` module). Without it
+# the crate is the algorithms alone, depending only on serde.
+http = ["dep:edgefront-core", "dep:edgefront-proxy", "dep:http", "dep:tokio", "dep:tracing"]
+
 [dependencies]
 serde.workspace = true
+edgefront-core = { workspace = true, optional = true }
+edgefront-proxy = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
 criterion.workspace = true
 toml = { workspace = true, features = ["display"] }

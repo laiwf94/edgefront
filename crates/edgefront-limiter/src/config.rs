@@ -1180,6 +1180,10 @@ struct RawConfig {
     #[serde(default, skip_serializing)]
     #[serde(rename = "address_policy")]
     _address_policy: Option<de::IgnoredAny>,
+    /// Read on its own by [`http_limits::HttpLimitsSection`].
+    #[serde(default, skip_serializing)]
+    #[serde(rename = "http_limits")]
+    _http_limits: Option<de::IgnoredAny>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1337,6 +1341,7 @@ impl LimiterConfig {
             log_level: text(self.log_level.as_str().to_owned()),
             listeners: Vec::new(),
             _address_policy: None,
+            _http_limits: None,
         };
         for (i, l) in self.listeners.iter().enumerate() {
             let at = |m: String| format!("listeners[{i}].{m}");
@@ -1530,6 +1535,8 @@ impl<'de> Deserialize<'de> for LimiterConfig {
 }
 
 pub mod address_policy;
+#[cfg(feature = "http")]
+pub mod http_limits;
 
 pub use address_policy::AddressPolicyConfig;
 

@@ -397,10 +397,17 @@ dependencies = [
 name = "edgefront-limiter"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
+ "edgefront-core",
+ "edgefront-proxy",
+ "http",
+ "http-body-util",
  "proptest",
  "serde",
+ "tokio",
  "toml",
+ "tracing",
 ]
 
 [[package]]

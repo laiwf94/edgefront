@@ -23,6 +23,12 @@
 //! | `wide-ipv6-prefix` | per-client limits group IPv6 clients by a prefix shorter than /48, so whole sites share one limit |
 //! | `upstream-loop` | the upstream is a listener's own address, so connections loop back into the limiter |
 //! | `quota-unreachable` | `per_ip_conn_rate` admits no more than `per_ip_conn_quota` in the quota's window, so the quota never refuses anyone |
+//! | `http-key-never-matches` | an `[[http_limits]]` rule's key or match can never hold together with its `path_prefix`, so the rule never applies |
+//! | `http-key-host-header` | an HTTP rule keys on `header:host`, which HTTP/2 requests do not carry |
+//! | `http-count-own-status` | an HTTP rule counts its own refusal status, which only upstream answers can have |
+//! | `http-delay-unused` | an HTTP rule sets `max_delay` without the delay action |
+//!
+//! The `http-*` classes come from `config::http_limits::lint`.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -62,11 +68,15 @@ pub enum Class {
     WideIpv6Prefix,
     UpstreamLoop,
     QuotaUnreachable,
+    HttpKeyNeverMatches,
+    HttpKeyHostHeader,
+    HttpCountOwnStatus,
+    HttpDelayUnused,
 }
 
 impl Class {
     /// Every class, in the order of the table in the module docs.
-    pub const ALL: [Class; 11] = [
+    pub const ALL: [Class; 15] = [
         Class::BurstBelowRead,
         Class::ListenOverlap,
         Class::TableBelowMaxConns,
@@ -78,6 +88,10 @@ impl Class {
         Class::WideIpv6Prefix,
         Class::UpstreamLoop,
         Class::QuotaUnreachable,
+        Class::HttpKeyNeverMatches,
+        Class::HttpKeyHostHeader,
+        Class::HttpCountOwnStatus,
+        Class::HttpDelayUnused,
     ];
 
     /// The class's name, as `edgefront check` prints it and `--allow`
@@ -95,6 +109,10 @@ impl Class {
             Class::WideIpv6Prefix => "wide-ipv6-prefix",
             Class::UpstreamLoop => "upstream-loop",
             Class::QuotaUnreachable => "quota-unreachable",
+            Class::HttpKeyNeverMatches => "http-key-never-matches",
+            Class::HttpKeyHostHeader => "http-key-host-header",
+            Class::HttpCountOwnStatus => "http-count-own-status",
+            Class::HttpDelayUnused => "http-delay-unused",
         }
     }
 

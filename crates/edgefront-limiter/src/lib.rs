@@ -13,6 +13,8 @@ pub mod clock;
 pub mod config;
 pub mod conn;
 pub mod gcra;
+#[cfg(feature = "http")]
+pub mod http;
 pub mod key;
 pub mod lint;
 pub mod policy;

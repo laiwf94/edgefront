@@ -30,6 +30,17 @@
 //! ```
 //!
 //! A section that does not build is a config that does not parse (exit 2).
+//!
+//! A TOML config's `[[http_limits]]` rules are built and linted too, after
+//! a line with their count (`http_limits: 2 rules`); their findings name
+//! the rule's line:
+//!
+//! ```text
+//! limits.toml:7: warning[http-key-never-matches]: http limit login: key path_prefix:/admin lies outside ...
+//! ```
+//!
+//! A TOML file with HTTP rules and no `listeners` is an HTTP-only config,
+//! as `edgefront proxy --limits` reads it, and is checked as that alone.
 //! `--allow CLASS` drops the findings of one class, and may be repeated.
 //!
 //! `--print` writes the config instead, as the TOML limiter section that
@@ -159,6 +170,30 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
     };
+    let http = match http_section(path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("edgefront: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut found: Vec<(usize, String)> = Vec::new();
+    if let Some(h) = &http {
+        println!(
+            "http_limits: {} rule{}",
+            h.rules,
+            if h.rules == 1 { "" } else { "s" }
+        );
+        found.extend(
+            h.lints
+                .iter()
+                .filter(|(_, l)| !allowed.contains(&l.class))
+                .map(|(line, l)| (*line, l.to_string())),
+        );
+        if !h.listeners {
+            return verdict(path, &found);
+        }
+    }
     let (cfg, map) = match load(path) {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -174,12 +209,20 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let found: Vec<_> = lint(&cfg, &map)
-        .into_iter()
-        .filter(|l| !allowed.contains(&l.class))
-        .collect();
-    for l in &found {
-        println!("{path}:{}: {l}", l.line);
+    found.extend(
+        lint(&cfg, &map)
+            .into_iter()
+            .filter(|l| !allowed.contains(&l.class))
+            .map(|l| (l.line, l.to_string())),
+    );
+    found.sort_by_key(|(line, _)| *line);
+    verdict(path, &found)
+}
+
+/// Prints the findings and the verdict line.
+fn verdict(path: &str, found: &[(usize, String)]) -> ExitCode {
+    for (line, l) in found {
+        println!("{path}:{line}: {l}");
     }
     match found.len() {
         0 => {
@@ -195,4 +238,48 @@ pub fn run(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// What `edgefront check` found in a TOML file's `[[http_limits]]`.
+struct HttpCheck {
+    rules: usize,
+    /// Each finding with the line of its rule's `[[http_limits]]`.
+    lints: Vec<(usize, edgefront_limiter::config::http_limits::HttpLint)>,
+    /// Whether the file also has a limiter section.
+    listeners: bool,
+}
+
+/// The HTTP rules of the TOML file at `path`, built and linted; `None`
+/// for a pacerd.conf or a TOML file without the section.
+fn http_section(path: &str) -> Result<Option<HttpCheck>, String> {
+    use edgefront_limiter::config::http_limits::{self, HttpLimitsSection};
+    if !path.ends_with(".toml") {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let section: HttpLimitsSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    if section.http_limits.is_empty() {
+        return Ok(None);
+    }
+    let rules = http_limits::build(&section.http_limits).map_err(|e| format!("{path}: {e}"))?;
+    // Each rule's line: the n-th `[[http_limits]]` header.
+    let heads: Vec<usize> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == "[[http_limits]]")
+        .map(|(i, _)| i + 1)
+        .collect();
+    let lints = http_limits::lint_configs(&section.http_limits, &rules)
+        .into_iter()
+        .map(|l| (heads.get(l.rule).copied().unwrap_or(0), l))
+        .collect();
+    let listeners = DeTable::parse(&text)
+        .map(|t| t.get_ref().contains_key("listeners"))
+        .unwrap_or(false);
+    Ok(Some(HttpCheck {
+        rules: rules.len(),
+        lints,
+        listeners,
+    }))
 }

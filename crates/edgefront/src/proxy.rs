@@ -3,9 +3,17 @@
 //! steer's admin API on `admin_listen`.
 //!
 //! ```text
-//! edgefront proxy --config <file>
-//! edgefront proxy --check-config <file>
+//! edgefront proxy --config <file> [--limits <file.toml>]
+//! edgefront proxy --check-config <file> [--limits <file.toml>]
 //! ```
+//!
+//! `--limits` reads the `[[http_limits]]` section of a TOML limiter config
+//! (see [`edgefront_limiter::config::http_limits`]) and attaches each rule
+//! to its routes, numbered as the proxy configuration lists them. A rule
+//! that does not build, or names a route the configuration does not have,
+//! is a bad file (exit 2). The rules are fixed for the life of the
+//! process: routes with filters cannot be reloaded, so a SIGHUP is logged
+//! as a failed reload and the running configuration keeps serving.
 //!
 //! Exit codes follow the rest of the binary: 0 on success, 2 for bad usage,
 //! an unreadable or invalid file or bad settings, 1 when the proxy cannot
@@ -43,13 +51,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use edgefront_core::config::Config;
+use edgefront_core::filter::RouteFilters;
 use edgefront_core::reload::{self, Settings, Signals};
 use edgefront_core::tls::Snapshot;
+use edgefront_limiter::clock::MonotonicClock;
+use edgefront_limiter::config::http_limits::{self, HttpLimitsSection};
+use edgefront_limiter::http::HttpLimiter;
 use edgefront_proxy::server::Proxy;
 use tracing_subscriber::EnvFilter;
 
-const USAGE: &str =
-    "usage: edgefront proxy --config <file>\n       edgefront proxy --check-config <file>\n";
+const USAGE: &str = "usage: edgefront proxy --config <file> [--limits <file.toml>]\n       edgefront proxy --check-config <file> [--limits <file.toml>]\n";
 
 /// The environment prefix of the binary's settings, as `STEER` was
 /// steer's.
@@ -65,18 +76,46 @@ fn check(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The HTTP limits in `path`, built and attached to `routes` routes.
+pub fn limits(path: &str, routes: usize) -> Result<(Arc<HttpLimiter>, RouteFilters), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let section: HttpLimitsSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    let rules = http_limits::build(&section.http_limits).map_err(|e| format!("{path}: {e}"))?;
+    let limiter = HttpLimiter::new(rules, Arc::new(MonotonicClock::new()))
+        .map_err(|e| format!("{path}: {e}"))?;
+    let limiter = Arc::new(limiter);
+    let filters = limiter
+        .route_filters(routes)
+        .map_err(|e| format!("{path}: {e}"))?;
+    Ok((limiter, filters))
+}
+
 /// Runs `edgefront proxy` with the arguments after `proxy`.
 pub fn run(args: &[String]) -> ExitCode {
-    let (check_only, path) = match args {
-        [flag, path] if flag == "--config" => (false, path.as_str()),
-        [flag, path] if flag == "--check-config" => (true, path.as_str()),
+    let (check_only, path, limits_path) = match args {
+        [flag, path] if flag == "--config" => (false, path.as_str(), None),
+        [flag, path] if flag == "--check-config" => (true, path.as_str(), None),
+        [flag, path, l, lp] if flag == "--config" && l == "--limits" => {
+            (false, path.as_str(), Some(lp.as_str()))
+        }
+        [flag, path, l, lp] if flag == "--check-config" && l == "--limits" => {
+            (true, path.as_str(), Some(lp.as_str()))
+        }
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
     };
     if check_only {
-        return match check(path) {
+        let checked = check(path).and_then(|()| match limits_path {
+            None => Ok(()),
+            Some(lp) => {
+                let config = Config::load(path).map_err(|e| format!("{path}: {e}"))?;
+                limits(lp, config.routes.len()).map(|_| ())
+            }
+        });
+        return match checked {
             Ok(()) => {
                 println!("{path}: ok");
                 ExitCode::SUCCESS
@@ -123,7 +162,24 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     };
     runtime.block_on(async {
-        let proxy = Arc::new(Proxy::new(&loaded.config));
+        let mut proxy = Proxy::new(&loaded.config);
+        if let Some(lp) = limits_path {
+            match limits(lp, loaded.config.routes.len()) {
+                Ok((limiter, filters)) => {
+                    tracing::info!(
+                        rules = limiter.rules().count(),
+                        routes = filters.filtered(),
+                        "http limits loaded"
+                    );
+                    proxy = proxy.with_filters(filters);
+                }
+                Err(e) => {
+                    eprintln!("edgefront: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let proxy = Arc::new(proxy);
         let served = reload::run(
             loaded,
             path.to_owned(),

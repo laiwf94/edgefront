@@ -368,3 +368,87 @@ fn print_writes_the_config_as_toml_that_reads_back_the_same() {
             .contains("admin_socket: the path is not UTF-8")
     );
 }
+
+const HTTP_RULES: &str = "\
+[[http_limits]]
+name = \"login\"
+rate = \"5/min burst 5\"
+key = [\"header:x-user\"]
+count = [401, 403]
+[http_limits.match]
+path = \"/login\"
+
+[[http_limits]]
+name = \"never\"
+rate = \"1/s\"
+key = [\"path_prefix:/admin\", \"header:host\"]
+max_delay = \"1s\"
+[http_limits.match]
+path_prefix = \"/api\"
+";
+
+#[test]
+fn http_rules_are_built_and_linted() {
+    let dir = Scratch::new("http");
+    let path = dir.write("limits.toml", HTTP_RULES);
+    let out = edgefront(&["check", &path]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout,
+        format!(
+            "http_limits: 2 rules\n\
+             {path}:9: warning[http-key-never-matches]: http limit never: key path_prefix:/admin lies outside match.path_prefix /api, so no request has the key and the rule never applies\n\
+             {path}:9: warning[http-key-host-header]: http limit never: key header:host finds nothing in HTTP/2 requests, which carry :authority; the host selector reads both\n\
+             {path}:9: warning[http-delay-unused]: http limit never: max_delay is set but the action is block, so it never delays\n\
+             {path}: 3 warnings\n"
+        )
+    );
+    let out = edgefront(&[
+        "check",
+        "--allow",
+        "http-key-never-matches",
+        "--allow",
+        "http-key-host-header",
+        "--allow",
+        "http-delay-unused",
+        &path,
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("http_limits: 2 rules\n{path}: ok\n")
+    );
+
+    // Beside a limiter section, both are checked and the findings sorted
+    // by line.
+    let both = format!(
+        "[[listeners]]\nname = \"a\"\nlisten = \"0.0.0.0:80\"\nupstream = \"10.0.0.1:80\"\nmax_conns = 100\nper_ip_max_conns = 100\n{HTTP_RULES}"
+    );
+    let path = dir.write("both.toml", &both);
+    let stdout = String::from_utf8(edgefront(&["check", &path]).stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "http_limits: 2 rules");
+    assert!(
+        lines[1].contains(":6: warning[per-ip-cap-unreachable]"),
+        "{stdout}"
+    );
+    assert!(
+        lines[2].contains(":15: warning[http-key-never-matches]"),
+        "{stdout}"
+    );
+    assert_eq!(*lines.last().unwrap(), format!("{path}: 4 warnings"));
+
+    // A rule that does not build is a config that does not parse.
+    let bad = dir.write(
+        "bad.toml",
+        "[[http_limits]]\nname = \"x\"\nrate = \"1/s\"\nkey = [\"ip\"]\n",
+    );
+    let out = edgefront(&["check", &bad]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("http_limits[0].key[0]: unknown key selector \"ip\"")
+    );
+}
