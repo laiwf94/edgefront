@@ -50,9 +50,10 @@ fuzz_target!(|data: &[u8]| {
         assert!(r.malformed.is_none());
         return;
     }
-    let named = entries.iter().filter_map(|e| e.as_ref().ok()).any(|a| {
-        edgefront_limiter::cidr::canonical(*a) == r.client
-    });
+    let named = entries
+        .iter()
+        .filter_map(|e| e.as_ref().ok())
+        .any(|a| edgefront_limiter::cidr::canonical(*a) == r.client);
     assert!(r.client == edgefront_limiter::cidr::canonical(peer) || named);
     if r.malformed.is_some() {
         assert!(trusted.contains(r.client));
