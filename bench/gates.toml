@@ -86,6 +86,31 @@ tolerance = 0.05
 # (pacerd's data path, its admin API and client, #85 and #88) added about
 # 0.65 MB, and the proxy's TLS listener and upstream TLS (#86) about 0.54
 # MB. The new ceiling is again about 10% above.
+#
+# binary_bytes raised again in #257: main's binary was 10,409,136 bytes on
+# the runner (at 3069b36), 2.6% over the ceiling above, so every pull
+# request failed the gate on size whatever it changed. Measured on the
+# runner (x86_64, the gate's own release build) at each commit that grew
+# it since the 9,228,328 the last raise was set from (5a4646e), by the
+# throwaway size-probe workflow of 20 Nov 2026 (Actions run 44761791868):
+#
+#   +686,920  ACME in edgefront proxy (32a6b0d, #89): the client and
+#             challenge responders of a921814 and f6be2bf were linked in
+#             only once the renewal loop used them
+#   +212,000  address policy in edgefront limits (d1e5769, #91): the CIDR
+#             tree, classes and trusted-proxy walk of d6a79e8 to c327675
+#             were linked in once the limiter config read them
+#   +123,296  slice caching (6466daf, #90)
+#    +71,224  the segment store (e2339bf, #90)
+#    +48,152  streaming fill (298fe3c, #90)
+#    +28,464  f78566c to 507b874, not split further (the slice reader fix)
+#    +14,920  multi-range responses (c40626f, #90)
+#     +9,328  index snapshot loading (04ff789, #90)
+#    -13,496  a921814 and f6be2bf before their code was linked in
+#
+# 1,180,808 bytes in all. The new ceiling is again about 10% above. ACME is
+# the largest part; putting it behind a cargo feature would take back
+# about 0.69 MB if a smaller default binary is ever wanted.
 [ceilings]
-binary_bytes = 10150000
+binary_bytes = 11450000
 image_bytes = 15200000
