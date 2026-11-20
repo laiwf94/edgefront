@@ -84,19 +84,23 @@ jobs:
           done
           cat target/bench/smoke/report.md >> "$GITHUB_STEP_SUMMARY"
 
-  # The regression gate (bench/gates.toml): the gate scenario five times
-  # against edgefront on one CPU, judged with a Mann-Whitney U test and the
-  # measured tolerances. On a CPU model whose committed samples are steady
-  # enough (committed_models), against those; on any other, against the
-  # baseline's commit built and run here, interleaved with the candidate.
-  # Pull requests and manual runs only: about four minutes, seven when the
-  # baseline is measured too.
+  # The regression gate (bench/gates.toml): the gate scenario `runs` (9)
+  # times against edgefront on one CPU, judged with a Mann-Whitney U test
+  # and the measured tolerances. On a CPU model whose committed samples are
+  # steady enough (committed_models), against those; on any other, against
+  # the change's base commit built and run here, interleaved with the
+  # candidate: the pull request's base, or for a manual run the branch's
+  # merge base with main (on main itself, the parent). Pull requests and
+  # manual runs only: about ten minutes.
   gate:
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The merge base with main, for a manual run on a branch.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build edgefront and the harness
@@ -111,13 +115,22 @@ jobs:
         run: |
           cpu=$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)
           echo "CPU_MODEL=$cpu" >> "$GITHUB_ENV"
-          read -r plan commit <<<"$(target/bench-images/edgefront-bench gate --config bench/gates.toml --machine "$cpu" --plan)"
+          read -r plan commit runs <<<"$(target/bench-images/edgefront-bench gate --config bench/gates.toml --machine "$cpu" --plan)"
           [[ "${{ inputs.measure }}" == true ]] && plan=measure
           [[ "${{ inputs.record }}" == true ]] && plan=committed
+          if [[ $plan == measure ]]; then
+            if [[ "${{ github.event_name }}" == pull_request ]]; then
+              commit=${{ github.event.pull_request.base.sha }}
+            else
+              commit=$(git merge-base HEAD origin/main)
+              [[ $commit == "$(git rev-parse HEAD)" ]] && commit=$(git rev-parse HEAD^)
+            fi
+          fi
           echo "PLAN=$plan" >> "$GITHUB_ENV"
           echo "BASE_COMMIT=$commit" >> "$GITHUB_ENV"
-          echo "$cpu: $plan $commit"
-      # The baseline's commit, built in the same target directory (the
+          echo "RUNS=$runs" >> "$GITHUB_ENV"
+          echo "$cpu: $plan against $commit, $runs runs a side"
+      # The base commit, built in the same target directory (the
       # dependencies are reused; the candidate's binaries are copied out)
       # and imaged as a second target, edgefront-base.
       - name: Build the baseline commit
@@ -129,7 +142,7 @@ jobs:
           mkdir -p target/baseline-images
           cp target/release/edgefront target/baseline-images/
           docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront-base:local target/baseline-images
-      - name: Five gate runs
+      - name: Gate runs
         run: |
           mkdir -p target/bench-targets
           cp -r bench/targets/edgefront target/bench-targets/
@@ -139,9 +152,10 @@ jobs:
             sed -i 's|edgefront-bench/edgefront:local|edgefront-bench/edgefront-base:local|' target/bench-targets/edgefront-base/target.toml
             targets=edgefront,edgefront-base
           fi
-          # With two targets, --repeat alternates them run by run.
+          # With two targets, --repeat alternates them run by run, the
+          # first swapping every round.
           target/bench-images/edgefront-bench run --scenario bench/ci/gate.toml --targets "$targets" \
-            --targets-dir target/bench-targets --target-cpus 1 --repeat 5 --out target/bench/gate --run gate
+            --targets-dir target/bench-targets --target-cpus 1 --repeat "$RUNS" --out target/bench/gate --run gate
       - name: Record a baseline
         if: inputs.record
         run: |

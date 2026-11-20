@@ -2,14 +2,18 @@
 # pull requests by .github/workflows/bench.yml.
 #
 # Each pull request runs `scenario` against `target` `runs` times on a
-# GitHub-hosted runner and compares each metric with the committed
-# `baseline`, recorded the same way from main. A metric fails when a
-# one-sided Mann-Whitney U test gives p < p_value AND its median is worse by
-# more than its tolerance. Sizes have fixed ceilings.
+# GitHub-hosted runner and compares each metric with the same scenario run
+# as many times on its base commit, alternating on the same runner (or, on
+# a model in committed_models, with the committed `baseline`, recorded from
+# `baseline_commit`). A metric fails when a one-sided Mann-Whitney U test
+# gives p < p_value AND its median is worse by more than its tolerance.
+# Sizes have fixed ceilings.
 scenario = "bench/ci/gate.toml"
 target = "edgefront"
 target_cpus = 1
-runs = 5
+# Nine a side, not the five the gate started with: see "Runs per side"
+# below.
+runs = 9
 p_value = 0.01
 baseline = "bench/baseline/gate.json"
 baseline_commit = "0f4230eb560a25a1e5e06d27b6a9d206d949de1b"
@@ -32,14 +36,27 @@ committed_models = []
 #   failed at p99 +6.8% (p = 0.0077). Committed samples are too noisy on
 #   every model, so committed_models is empty and bench/baseline/gate.json is
 #   the record of these runs, not what a pull request is judged against.
-# - Same runner. So the gate builds baseline_commit and
-#   alternates five of its runs with five of the candidate's. Four unchanged
+# - Same runner. So the gate built baseline_commit and
+#   alternated five of its runs with five of the candidate's. Four unchanged
 #   runs of that (Xeon 6973P, EPYC 7763, two EPYC 9V74) differed by p99 -1.5 to
 #   +2.2% and requests per CPU s -7.6 to +0.8%, none of them significant (lowest
 #   p = 0.21), and all passed.
 #
 # The tolerances are the issue's 5%: a change fails only when it is both
 # significant and over 5%, and the measured noise did neither at once.
+#
+# Runs per side. With five a side the exact test cannot go below p = 1/252,
+# and p < 0.01 needs 24 of the 25 candidate-baseline pairs worse, so one
+# run a noisy neighbour spoils hides a real regression. A branch spinning
+# 3 us per hit failed only two of three tries that way: 11.8% and 7.9%
+# worse at p = 0.004, then 8.6% worse at p = 0.016 (#87). With nine a side
+# p < 0.01 needs 67 of 81 pairs, so up to 14 may go the wrong way; the
+# job takes about ten minutes instead of six. The proxy's p99 gate runs
+# nine a side for the same reason. The runs alternate, the first side
+# swapping every round, so a steady drift in the runner favours neither.
+# The comparison is with the change's own base commit, not baseline_commit,
+# so a pull request answers for its own diff and not for everything merged
+# since the gate was set.
 
 # Response-time p99 at a fixed 2,000 requests per second.
 [metrics.p99_ms]

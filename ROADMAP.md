@@ -183,7 +183,7 @@ Weeks 49 to 52: HTTP/3 to origins, docs site, multi-region soak and 1.0; final b
 
 ## Benchmark targets
 
-One harness (`edgefront-bench`, cache weeks 3 and 4) measures all three tracks against the leaders; reports land in `docs/benchmarks/` in weeks 4, 13, 25, 36 and 49, and the CI gate fails a pull request that regresses a target.
+One harness (`edgefront-bench`, cache weeks 3 and 4) measures all three tracks against the leaders; reports land in `docs/benchmarks/` in weeks 4, 13, 25, 36 and 49, and the CI gate fails a pull request that regresses a target. The gates compare nine alternating runs a side against the change's base commit on the same runner, at p < 0.01 and a 5% tolerance. Week 4 planned five a side for the cache gate; on hosted runners five missed a real 8.6% slowdown at p = 0.016, so it runs nine, as the proxy's p99 gate already did (#87).
 
 | Target | Compared with | First measured | Gate from |
 |---|---|---|---|

@@ -1,20 +1,22 @@
 //! The benchmark regression gate.
 //!
-//! A pull request runs the gate scenario `runs` times (5) and compares
-//! each metric's samples with the baseline's: the same scenario run on the
-//! commit named by `baseline_commit`. On a CPU model listed in
+//! A pull request runs the gate scenario `runs` times (9) and compares
+//! each metric's samples with the baseline's. On a CPU model listed in
 //! `committed_models` those are the samples committed in
-//! `bench/baseline/gate.json`; on any other model (today, every model,
-//! because the runners' noise ruled the committed samples out) CI builds
-//! the baseline commit and alternates its runs with the candidate's on the
-//! same runner, and records them with [`Baseline::record_target`]. A
-//! metric regresses when both hold:
+//! `bench/baseline/gate.json`, recorded from `baseline_commit`. On any
+//! other model (today, every model, because the runners' noise ruled the
+//! committed samples out) CI builds the commit the change is based on and
+//! alternates its runs with the candidate's on the same runner, the first
+//! side swapping every round, and records them with
+//! [`Baseline::record_target`]. A metric regresses when both hold:
 //!
 //! - **It is significant.** A one-sided Mann-Whitney U test says the
 //!   candidate's samples are worse than the baseline's at `p < p_value`
-//!   (0.01). With 5 samples a side the exact test reaches that only when
-//!   every candidate sample is worse than every baseline sample but at
-//!   most one pair: one noisy run cannot fail a pull request.
+//!   (0.01). With 9 samples a side the exact test reaches that when at
+//!   least 67 of the 81 candidate-baseline pairs are worse: a few runs a
+//!   noisy runner spoils cannot hide a real regression, and no single run
+//!   can make one. (With 5 a side it took 24 of 25 pairs, and one spoiled
+//!   run hid a real 8.6% slowdown.)
 //! - **It is large.** The candidate's median is worse than the baseline's
 //!   by more than the metric's `tolerance`, 5% (`bench/gates.toml` records
 //!   the noise measured on the CI runners that set it).
@@ -86,8 +88,9 @@ pub struct GateConfig {
     pub p_value: f64,
     /// The committed baseline.
     pub baseline: String,
-    /// The commit the baseline was recorded from, which the gate builds and
-    /// runs beside a candidate on a CPU model outside `committed_models`.
+    /// The commit the committed samples were recorded from. On a CPU model
+    /// outside `committed_models` the workflow builds the change's own base
+    /// commit instead and runs it beside the candidate.
     pub baseline_commit: String,
     /// The metrics, by name (see [`metric`]).
     pub metrics: BTreeMap<String, MetricRule>,
@@ -97,7 +100,7 @@ pub struct GateConfig {
     /// The CPU models whose committed baseline samples a pull request is
     /// judged against directly: those whose measured run-to-run noise is
     /// within the tolerances. On any other model the gate runs the
-    /// baseline's commit on the same runner, interleaved with the
+    /// change's base commit on the same runner, interleaved with the
     /// candidate, and judges against that ([`GateConfig::plan`]).
     #[serde(default)]
     pub committed_models: Vec<String>,
@@ -173,10 +176,16 @@ impl GateConfig {
         }
     }
 
-    /// The plan line `edgefront-bench gate --plan` prints: the plan, then
-    /// the baseline commit.
+    /// The plan line `edgefront-bench gate --plan` prints: the plan, the
+    /// baseline commit and the runs per side, which the workflow passes to
+    /// `run --repeat` so the count lives in one place.
     pub fn plan_line(&self, machine: &str) -> String {
-        format!("{} {}", self.plan(machine), self.baseline_commit)
+        format!(
+            "{} {} {}",
+            self.plan(machine),
+            self.baseline_commit,
+            self.runs
+        )
     }
 
     /// Reads `path`.
@@ -788,6 +797,20 @@ mod tests {
         // Two out of order: P(U >= 23) = 4 / 252.
         let p = mann_whitney_greater(&[5.5, 6.5, 8.0, 9.0, 10.0], &[1.0, 2.0, 3.0, 4.0, 7.0]);
         assert!((p - 4.0 / 252.0).abs() < 1e-12, "{p}");
+        // Nine against nine, the gate's runs: complete separation is
+        // 1 / C(18, 9); 14 pairs out of order (U = 67) is still under 0.01,
+        // P = 456 / 48,620, and 15 (U = 66) is not, 594 / 48,620.
+        let base: Vec<f64> = (1..=9).map(f64::from).collect();
+        let mut cand: Vec<f64> = (10..=18).map(f64::from).collect();
+        let p = mann_whitney_greater(&cand, &base);
+        assert!((p - 1.0 / 48_620.0).abs() < 1e-12, "{p}");
+        cand[0] = 1.5; // above one baseline run: 8 pairs out of order
+        cand[1] = 3.5; // above three: 6 more
+        let p = mann_whitney_greater(&cand, &base);
+        assert!((p - 456.0 / 48_620.0).abs() < 1e-12, "{p}");
+        cand[1] = 2.5;
+        let p = mann_whitney_greater(&cand, &base);
+        assert!((p - 594.0 / 48_620.0).abs() < 1e-12, "{p}");
         // All tied: no evidence either way.
         assert_eq!(mann_whitney_greater(&[1.0; 5], &[1.0; 5]), 1.0);
         assert_eq!(mann_whitney_greater(&[], &[1.0]), 1.0);
@@ -892,7 +915,7 @@ mod tests {
         assert_eq!(GateConfig::from_toml(CONFIG).unwrap().plan(CPU), "measure");
         assert_eq!(
             config.plan_line("other"),
-            "measure 0f4230eb560a25a1e5e06d27b6a9d206d949de1b"
+            "measure 0f4230eb560a25a1e5e06d27b6a9d206d949de1b 5"
         );
         // The baseline commit's runs, under their own target name.
         let mut base = Baseline::new(&config);

@@ -19,8 +19,8 @@
 //!                      [--binary FILE] [--baseline FILE] [--verdict FILE] [--summary FILE]
 //!     Judges repeated gate runs against the committed baseline for the
 //!     CPU model they ran on; exit 1 on a regression. With --plan, prints
-//!     `committed` or `measure`: how that CPU model is judged. See
-//!     [`crate::gate`].
+//!     `committed` or `measure` (how that CPU model is judged), the
+//!     baseline commit and the runs per side. See [`crate::gate`].
 //! edgefront-bench baseline --config bench/gates.toml --results DIR... --machine CPU
 //!                          --commit SHA [--out FILE]
 //!     Records one CPU model's baseline from the pooled results (of --target,
@@ -315,7 +315,7 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
         // Repeats take turns across the targets, so a drift in the
         // machine during the run lands on all of them alike.
         for round in 1..=repeat {
-            for target in &targets {
+            for target in round_order(&targets, round) {
                 eprintln!(
                     "edgefront-bench: {} against {}{} ({:.0} s)",
                     scenario.name,
@@ -349,6 +349,21 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
         file.display()
     );
     Ok(())
+}
+
+/// The targets in the order round `round` (from 1) runs them: as given in
+/// odd rounds and reversed in even ones. Two targets then run ABBAAB..., so
+/// neither always goes first, and a machine that drifts steadily (warming
+/// up, a neighbour starting) favours neither side.
+pub fn round_order<T>(targets: &[T], round: usize) -> impl Iterator<Item = &T> {
+    let reverse = round.is_multiple_of(2);
+    (0..targets.len()).map(move |i| {
+        if reverse {
+            &targets[targets.len() - 1 - i]
+        } else {
+            &targets[i]
+        }
+    })
 }
 
 /// One line about a result.
@@ -863,6 +878,22 @@ mod tests {
             matches!(&err, Failure::Failed(m) if m.contains("cannot listen")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn repeats_alternate_which_target_goes_first() {
+        let order: Vec<&str> = (1..=4)
+            .flat_map(|round| round_order(&["this", "base"], round).copied())
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "this", "base", "base", "this", "this", "base", "base", "this"
+            ]
+        );
+        let one: Vec<_> = round_order(&[1], 2).copied().collect();
+        assert_eq!(one, [1]);
+        assert_eq!(round_order::<u8>(&[], 1).count(), 0);
     }
 
     #[test]
