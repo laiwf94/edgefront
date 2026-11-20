@@ -470,6 +470,23 @@ A purge is signed and sent to every peer. Peers check the signature before parsi
 
 Malformed requests get 400, oversized heads 431, long targets 414, oversized bodies 413, and request loops 508. Malformed origin responses become 502 and are never stored.
 
+## Tiered caching
+
+With `[tier]`, nodes find each other with SWIM over HMAC-signed UDP and spread the keys between them by weighted rendezvous hashing. A miss on a node that does not own the key goes to its owner, and `[[tier.shields]]` sends the owners' misses on to a shield. Each object then reaches the origin once however many nodes are asked for it. A key that gets hot on a node (`hot_rate`, 50 requests a second by default) is kept there too.
+
+```toml
+[tier]
+gossip_listen = "10.0.0.1:7946"
+seeds = ["10.0.0.2:7946"]     # one live member is enough to join
+weight = 1.0                  # this node's share of the keys
+hot_rate = 50
+[[tier.shields]]
+path_prefix = "/"
+nodes = ["shield-1"]
+```
+
+It needs `CACHET_CLUSTER_SECRET`. `examples/tiered.sh` starts five edges and a shield and prints the origin's request counts: 20 concurrent requests for one cold URL over the five edges make one origin request, and 1,000 requests for 200 objects make 200. After an edge is killed with SIGKILL, the others notice within about 2 s, and its keys are fetched again from the shield. In `tests/tier.rs`, with ten nodes, a Zipf 1.0 trace offloads 97.5% of requests (82.7% without tiers), and killing a node moves only its own keys, under 10% of them. `/metrics` counts owner and shield fetches, fallbacks, hot promotions and demotions, and members. See [docs/DESIGN.md](docs/DESIGN.md#tiers-owners-a-shield-and-hot-keys-over-swim).
+
 ## How fast the hit path is
 
 On an Apple Silicon laptop (16 cores) that was also running other work (load average around 70), so read these as lower bounds. Reproduce with `cargo bench` and `examples/load.sh`.

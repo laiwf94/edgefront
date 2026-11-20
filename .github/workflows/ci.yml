@@ -188,6 +188,8 @@ jobs:
         run: examples/penalty_box.sh
       - name: Shadow mode and policy replay demo
         run: examples/shadow_replay.sh
+      - name: Tiered caching demo (five edges and a shield)
+        run: examples/tiered.sh
 
   # steer's failover drill against edgefront: 100.00% of requests in all
   # four phases with the resilience features on, and every fault showing
