@@ -308,6 +308,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

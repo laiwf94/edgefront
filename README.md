@@ -120,6 +120,24 @@ The failover drill keeps its 100.00% table over HTTPS with mutual TLS.
 
 `/metrics` adds `edgefront_acme_certificate_expiry_seconds` and `edgefront_acme_renewals_total{result}`. A failed renewal is retried with backoff from 5 minutes to 6 hours. `crates/edgefront-core/tests/acme.rs` and `crates/edgefront/tests/e2e_acme_mtls.rs` issue against Pebble in Docker. The end-to-end test issues the proxy's certificate over TLS-ALPN-01, and then a client that trusts only Pebble's root and presents a certificate reaches a mutual-TLS upstream through it.
 
+### HTTP/2 and gRPC
+
+An `http2` block turns on HTTP/2 towards clients: a TLS listener offers `h2` before `http/1.1` over ALPN, and with `"cleartext": true` a plain listener also takes prior-knowledge HTTP/2 (h2c) on the same port as HTTP/1.1.
+
+```json
+"http2": {"max_concurrent_streams": 100, "initial_stream_window": 1048576,
+          "initial_connection_window": 4194304, "max_frame_size": 16384,
+          "max_header_list_size": 65536, "cleartext": false, "adaptive_window": false}
+```
+
+Those are the defaults; a reload cannot change the block. h2spec passes all 146 cases against the TLS listener.
+
+A cluster's `protocol` chooses the version spoken to its endpoints: `http1` (the default), `http2` (prior knowledge in cleartext, `h2` over ALPN with TLS), or `auto` (HTTP/2 where the endpoint speaks it, HTTP/1.1 where it does not, decided before a request is sent and remembered for five minutes). HTTP/2 upstreams share a pool of at most three connections per endpoint, 100 streams each before another opens. Its windows start at 1 MiB a stream and grow with the measured bandwidth-delay product up to 16 MiB. A stream the endpoint refused unprocessed (GOAWAY or `REFUSED_STREAM`) may be retried whatever its method. Health checks speak HTTP/1.1.
+
+gRPC (`content-type: application/grpc...`) needs `protocol` `http2` or `auto`. Messages, trailers and statuses pass through as sent, `grpc-timeout` bounds the call together with the cluster's `timeout`, and the endpoint is sent the time left. When the proxy answers a gRPC call itself, the answer is a gRPC status: no route is `UNIMPLEMENTED`, an unreachable or failing endpoint `UNAVAILABLE`, and a timeout `DEADLINE_EXCEEDED`.
+
+On this Mac (16-core arm64), the release build added a 45 to 57 µs p50 to a loopback HTTP/2 call over three runs of `crates/edgefront/tests/e2e_h2_grpc.rs`. That test also runs all four gRPC call types through the binary, and a page with 60 assets over one TLS connection.
+
 ### Migrating from steer
 
 steer is fully ported, and `legacy/steer` is deleted. Its history stays reachable: `git log -- legacy/steer` lists every commit that touched it in this repository, and `git log c57a076^2` lists its own 23 commits from before the merge. `make steer-src` extracts it at its last commit. To move a steer deployment to `edgefront proxy`:

@@ -9,8 +9,8 @@
 //! once the connection limit is reached the request joins the least busy
 //! connection anyway, where h2 holds it until the origin's own
 //! `SETTINGS_MAX_CONCURRENT_STREAMS` lets it open. So 10,000 concurrent
-//! streams to one origin with the defaults (100 streams a connection, 4
-//! connections) use 4 connections, never more.
+//! streams to one origin with the defaults (100 streams a connection, 3
+//! connections) use 3 connections, never more.
 //!
 //! A stream counts as in flight until its response body has been read to
 //! the end or dropped ([`PoolBody`]).
@@ -83,12 +83,12 @@ pub struct PoolLimits {
 }
 
 impl Default for PoolLimits {
-    /// Four connections of 100 streams per origin, 90 seconds idle (the
+    /// Three connections of 100 streams per origin, 90 seconds idle (the
     /// HTTP/1.1 client's idle timeout), a one-second connect and two
     /// resends of a refused stream.
     fn default() -> Self {
         PoolLimits {
-            max_connections: 4,
+            max_connections: 3,
             max_streams_per_connection: 100,
             idle_timeout: Duration::from_secs(90),
             connect_timeout: Duration::from_secs(1),
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn defaults_and_names() {
         let l = PoolLimits::default();
-        assert_eq!(l.max_connections, 4);
+        assert_eq!(l.max_connections, 3);
         assert_eq!(l.max_streams_per_connection, 100);
         assert_eq!(l.idle_timeout, Duration::from_secs(90));
         for (e, name) in [

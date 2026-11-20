@@ -142,9 +142,9 @@ async fn one_connection_carries_100_concurrent_streams() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn ten_thousand_streams_use_at_most_four_connections() {
+async fn ten_thousand_streams_use_under_four_connections() {
     // Every request waits until 1,000 are in flight at once, well past the
-    // 400 that four connections of 100 streams hold before overflowing.
+    // 300 that three connections of 100 streams hold before overflowing.
     let handler = Counting::gated(Duration::from_millis(1), 1000);
     let (addr, _stop) = h2c_server(Arc::clone(&handler), 1000).await;
     let pool: Pool<Full<Bytes>> = Pool::new(PoolLimits::default(), Settings::default());
@@ -169,8 +169,8 @@ async fn ten_thousand_streams_use_at_most_four_connections() {
         "10,000 streams: {conns} connections, at most {} requests at once",
         handler.peak.load(Ordering::SeqCst)
     );
-    assert!((1..=4).contains(&conns), "{conns} connections");
-    assert!(pool.opened() <= 4, "{} opened", pool.opened());
+    assert!((1..4).contains(&conns), "{conns} connections");
+    assert!(pool.opened() < 4, "{} opened", pool.opened());
     // The cap is per origin and streams overflowed onto open connections.
     assert!(handler.peak.load(Ordering::SeqCst) >= 1000);
 }
