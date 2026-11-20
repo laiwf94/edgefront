@@ -35,7 +35,7 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
 use edgefront_core::clock::Clock;
@@ -57,7 +57,9 @@ pub type EjectFn = Box<dyn Fn(&Endpoint, &str, Instant) + Send + Sync>;
 /// threads.
 pub struct Detector {
     cfg: OutlierDetection,
-    eps: Vec<Endpoint>,
+    /// Replaced whole by [`Detector::set_endpoints`] when discovery
+    /// changes the cluster.
+    eps: RwLock<Arc<[Endpoint]>>,
     clock: Arc<dyn Clock>,
     on_eject: Option<EjectFn>,
     /// Serialises ejection decisions so the cap holds. It also keeps the
@@ -76,7 +78,7 @@ impl fmt::Debug for Detector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Detector")
             .field("cfg", &self.cfg)
-            .field("endpoints", &self.eps.len())
+            .field("endpoints", &self.endpoints().len())
             .finish_non_exhaustive()
     }
 }
@@ -93,7 +95,7 @@ impl Detector {
         let samples = Mutex::new(Vec::with_capacity(eps.len()));
         Detector {
             cfg,
-            eps,
+            eps: RwLock::new(eps.into()),
             clock,
             on_eject,
             samples,
@@ -106,8 +108,16 @@ impl Detector {
     }
 
     /// The endpoints it watches.
-    pub fn endpoints(&self) -> &[Endpoint] {
-        &self.eps
+    pub fn endpoints(&self) -> Arc<[Endpoint]> {
+        Arc::clone(&self.eps.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Watches `eps` from now on, as when discovery adds or removes
+    /// endpoints. Endpoints that stay keep their state, which lives in
+    /// each [`Endpoint`]; the running interval carries on.
+    pub fn set_endpoints(&self, eps: impl Into<Arc<[Endpoint]>>) {
+        let _decide = self.lock();
+        *self.eps.write().unwrap_or_else(PoisonError::into_inner) = eps.into();
     }
 
     /// Records the outcome of one attempt against `ep`. A gateway failure
@@ -136,7 +146,8 @@ impl Detector {
         let now = self.clock.now();
         let enabled = self.cfg.success_rate_minimum_hosts > 0;
         let volume = u64::from(self.cfg.success_rate_request_volume).max(1);
-        for (index, ep) in self.eps.iter().enumerate() {
+        let eps = self.endpoints();
+        for (index, ep) in eps.iter().enumerate() {
             ep.state.decay(now, self.cfg.base_ejection_time);
             let (ok, failed) = ep.state.take_interval();
             if !enabled || ep.state.ejected(now) {
@@ -175,7 +186,7 @@ impl Detector {
             if !self.can_eject(now) {
                 return;
             }
-            self.eject(&self.eps[s.index], now, REASON_SUCCESS_RATE);
+            self.eject(&eps[s.index], now, REASON_SUCCESS_RATE);
         }
     }
 
@@ -197,11 +208,12 @@ impl Detector {
     /// Callers hold the decision lock.
     fn can_eject(&self, now: Instant) -> bool {
         let percent = usize::from(self.cfg.max_ejection_percent);
-        let mut limit = self.eps.len() * percent / 100;
+        let eps = self.endpoints();
+        let mut limit = eps.len() * percent / 100;
         if percent > 0 && limit < 1 {
             limit = 1;
         }
-        let ejected = self.eps.iter().filter(|ep| ep.state.ejected(now)).count();
+        let ejected = eps.iter().filter(|ep| ep.state.ejected(now)).count();
         ejected < limit
     }
 

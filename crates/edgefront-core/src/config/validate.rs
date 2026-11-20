@@ -9,8 +9,9 @@ use std::time::Duration;
 use super::raw::{self, RawCluster, RawConfig, RawHttp2, RawTls};
 use super::{
     Acme, AcmeChallenge, Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config,
-    ConfigError, Endpoint, FieldError, HealthCheck, Http2, IpPrefix, Ocsp, OutlierDetection,
-    Policy, Retry, Route, Tls, TlsVersion, UpstreamProtocol, UpstreamTls, defaults, go, limits,
+    ConfigError, Discovery, DiscoverySource, Endpoint, FieldError, HealthCheck, Http2, IpPrefix,
+    Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion, UpstreamProtocol, UpstreamTls,
+    defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -521,7 +522,11 @@ impl Validator {
         }
 
         let raw_endpoints = rc.endpoints.as_deref().unwrap_or_default();
-        if raw_endpoints.is_empty() {
+        let discovery = rc
+            .discovery
+            .as_ref()
+            .map(|d| self.discovery(&format!("{path}.discovery"), d));
+        if raw_endpoints.is_empty() && discovery.is_none() {
             self.add(
                 format!("{path}.endpoints"),
                 "at least one endpoint is required",
@@ -642,6 +647,75 @@ impl Validator {
                     UpstreamProtocol::Http1
                 }
             },
+            discovery,
+        }
+    }
+
+    fn discovery(&mut self, path: &str, d: &raw::RawDiscovery) -> Discovery {
+        let raw_sources = d.sources.as_deref().unwrap_or_default();
+        if raw_sources.is_empty() {
+            self.add(format!("{path}.sources"), "at least one source is required");
+        }
+        if raw_sources.len() > limits::MAX_DISCOVERY_SOURCES {
+            self.add(
+                format!("{path}.sources"),
+                format!("at most {} sources", limits::MAX_DISCOVERY_SOURCES),
+            );
+        }
+        let mut sources = Vec::new();
+        for (i, rs) in raw_sources.iter().enumerate() {
+            let at = format!("{path}.sources[{i}]");
+            let set = [!rs.dns.is_empty(), !rs.srv.is_empty(), !rs.file.is_empty()]
+                .iter()
+                .filter(|s| **s)
+                .count();
+            if set != 1 {
+                self.add(at, "must name exactly one of dns, srv or file");
+                continue;
+            }
+            let source = if !rs.dns.is_empty() {
+                if let Err(e) = check_dns_target(&rs.dns) {
+                    self.add(format!("{at}.dns"), e);
+                }
+                DiscoverySource::Dns(rs.dns.clone())
+            } else if !rs.srv.is_empty() {
+                if !valid_srv_name(rs.srv.trim_end_matches('.')) {
+                    self.add(
+                        format!("{at}.srv"),
+                        format!(
+                            "{} is not a DNS name: labels of 1 to 63 characters from A-Z a-z 0-9 _ -",
+                            go::quote(&rs.srv)
+                        ),
+                    );
+                }
+                DiscoverySource::Srv(rs.srv.clone())
+            } else {
+                DiscoverySource::File(rs.file.clone())
+            };
+            if sources.contains(&source) {
+                self.add(format!("{path}.sources[{i}]"), "is listed twice");
+            }
+            sources.push(source);
+        }
+        let mut dns_servers = Vec::new();
+        for (i, a) in d
+            .dns_servers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            match a.parse::<std::net::SocketAddr>() {
+                Ok(sa) if sa.port() != 0 => dns_servers.push(sa),
+                _ => self.add(
+                    format!("{path}.dns_servers[{i}]"),
+                    format!("{} is not ip:port", go::quote(a)),
+                ),
+            }
+        }
+        Discovery {
+            sources,
+            dns_servers,
         }
     }
 
@@ -1075,6 +1149,27 @@ fn check_endpoint_address(addr: &str) -> Result<(), String> {
 }
 
 /// A DNS name made of letters, digits and hyphens.
+/// A `dns` source: a host name and a nonzero port.
+fn check_dns_target(t: &str) -> Result<(), String> {
+    let (host, port) =
+        go::split_host_port(t).map_err(|_| format!("{} is not host:port", go::quote(t)))?;
+    check_port(port, false)?;
+    check_hostname(host.trim_end_matches('.'))
+}
+
+/// An SRV name such as `_http._tcp.api.internal`: host name labels that
+/// may also hold underscores, at most 253 characters in all.
+fn valid_srv_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+}
+
 fn check_hostname(h: &str) -> Result<(), String> {
     if h.is_empty() || h.len() > 253 {
         return Err(format!("host {} must be 1 to 253 characters", go::quote(h)));

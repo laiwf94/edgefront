@@ -315,6 +315,18 @@ raw_struct!(RawCluster, "an object" {
     allowed_clients: Option<Vec<String>>,
     tls: Option<RawUpstreamTls>,
     protocol: String,
+    discovery: Option<RawDiscovery>,
+});
+
+raw_struct!(RawDiscovery, "an object" {
+    sources: Option<Vec<RawDiscoverySource>>,
+    dns_servers: Option<Vec<String>>,
+});
+
+raw_struct!(RawDiscoverySource, "an object" {
+    dns: String,
+    srv: String,
+    file: String,
 });
 
 raw_struct!(RawEndpoint, "an object" {

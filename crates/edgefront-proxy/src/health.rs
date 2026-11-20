@@ -20,6 +20,7 @@
 //!
 //! [`State`]: crate::endpoint::State
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -54,7 +55,9 @@ pub type ChangeFn = Box<dyn Fn(&Endpoint, bool, &str) + Send + Sync>;
 /// Probes a set of endpoints.
 pub struct Checker {
     cfg: HealthCheck,
-    eps: Vec<Endpoint>,
+    /// The endpoints to probe; [`Checker::set_endpoints`] replaces them
+    /// and [`Checker::run`] follows.
+    eps: watch::Sender<Arc<[Endpoint]>>,
     clock: Arc<dyn Clock>,
     client: Client<Empty<Bytes>>,
     random: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -65,7 +68,7 @@ impl fmt::Debug for Checker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Checker")
             .field("cfg", &self.cfg)
-            .field("endpoints", &self.eps.len())
+            .field("endpoints", &self.eps.borrow().len())
             .finish_non_exhaustive()
     }
 }
@@ -95,7 +98,7 @@ impl Checker {
         let client = Client::new(&probe_limits(cfg.timeout));
         Checker {
             cfg,
-            eps,
+            eps: watch::Sender::new(eps.into()),
             clock,
             client,
             random: Box::new(move || unit(rng.next_u64())),
@@ -117,8 +120,16 @@ impl Checker {
     }
 
     /// The endpoints being probed.
-    pub fn endpoints(&self) -> &[Endpoint] {
-        &self.eps
+    pub fn endpoints(&self) -> Arc<[Endpoint]> {
+        Arc::clone(&self.eps.borrow())
+    }
+
+    /// Probes `eps` from now on, as when discovery adds or removes
+    /// endpoints: [`Checker::run`] starts probing the new ones at once and
+    /// stops the removed ones, while those that stay keep their schedule
+    /// and their state.
+    pub fn set_endpoints(&self, eps: impl Into<Arc<[Endpoint]>>) {
+        self.eps.send_replace(eps.into());
     }
 
     /// The wait before an endpoint's next probe: the interval plus a fresh
@@ -133,20 +144,47 @@ impl Checker {
     /// every probe loop has stopped. A probe in flight at shutdown is
     /// abandoned without being recorded.
     pub async fn run(self: Arc<Self>, shutdown: impl Future<Output = ()>) {
-        let (stop, stopped) = watch::channel(false);
+        let mut set = self.eps.subscribe();
+        // Each probe loop by its endpoint's state, which an endpoint keeps
+        // across sets; the loop holds the state, so a key is never reused
+        // while its loop runs.
+        let mut stops: HashMap<usize, watch::Sender<bool>> = HashMap::new();
+        let key = |ep: &Endpoint| Arc::as_ptr(&ep.state) as usize;
         let mut loops = JoinSet::new();
-        for i in 0..self.eps.len() {
-            let checker = Arc::clone(&self);
-            let stopped = stopped.clone();
-            loops.spawn(async move { checker.probe_loop(i, stopped).await });
+        tokio::pin!(shutdown);
+        loop {
+            let eps = Arc::clone(&set.borrow_and_update());
+            let wanted: HashSet<usize> = eps.iter().map(key).collect();
+            stops.retain(|k, stop| {
+                let keep = wanted.contains(k);
+                if !keep {
+                    stop.send_replace(true);
+                }
+                keep
+            });
+            for ep in eps.iter() {
+                if stops.contains_key(&key(ep)) {
+                    continue;
+                }
+                let (stop, stopped) = watch::channel(false);
+                stops.insert(key(ep), stop);
+                let checker = Arc::clone(&self);
+                let ep = ep.clone();
+                loops.spawn(async move { checker.probe_loop(&ep, stopped).await });
+            }
+            while loops.try_join_next().is_some() {}
+            tokio::select! {
+                () = &mut shutdown => break,
+                changed = set.changed() => if changed.is_err() { break },
+            }
         }
-        shutdown.await;
-        stop.send_replace(true);
+        for stop in stops.values() {
+            stop.send_replace(true);
+        }
         while loops.join_next().await.is_some() {}
     }
 
-    async fn probe_loop(&self, i: usize, mut stopped: watch::Receiver<bool>) {
-        let ep = &self.eps[i];
+    async fn probe_loop(&self, ep: &Endpoint, mut stopped: watch::Receiver<bool>) {
         loop {
             tokio::select! {
                 biased;

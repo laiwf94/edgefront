@@ -65,6 +65,31 @@ impl Endpoint {
     }
 }
 
+/// The source a cluster's configuration names, with `dns_servers` for
+/// the DNS ones (the system's when empty).
+pub fn from_config(
+    source: &edgefront_core::config::DiscoverySource,
+    dns_servers: &[std::net::SocketAddr],
+) -> Box<dyn Source> {
+    use edgefront_core::config::DiscoverySource as Config;
+    match source {
+        Config::Dns(target) => {
+            // Validation checked it is host:port with a nonzero port.
+            let (name, port) = target.rsplit_once(':').unwrap_or((target, "0"));
+            let query = dns::DnsQuery::Host {
+                name: name.to_owned(),
+                port: port.parse().unwrap_or(0),
+            };
+            Box::new(dns::DnsSource::new(query).servers(dns_servers.to_vec()))
+        }
+        Config::Srv(name) => {
+            let query = dns::DnsQuery::Srv { name: name.clone() };
+            Box::new(dns::DnsSource::new(query).servers(dns_servers.to_vec()))
+        }
+        Config::File(path) => Box::new(file::FileSource::new(path)),
+    }
+}
+
 /// What a source reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateKind {

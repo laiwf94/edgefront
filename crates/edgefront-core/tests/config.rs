@@ -1277,3 +1277,99 @@ fn parses_http2() {
         assert!(err.contains(want), "{h2}: {err}");
     }
 }
+
+#[test]
+fn parses_discovery() {
+    use edgefront_core::config::{Discovery, DiscoverySource};
+    let with = |cluster: &str| {
+        format!(
+            r#"{{"listen":":80","routes":[{{"cluster":"a"}}],"clusters":[{{"name":"a"{cluster}}}]}}"#
+        )
+    };
+    assert_eq!(parse(MINIMAL).unwrap().clusters[0].discovery, None);
+    let all = parse(&with(
+        r#","discovery":{"sources":[{"dns":"api.internal:8080"},{"srv":"_http._tcp.api.internal"},
+            {"file":"/etc/edgefront/a.json"}],
+            "dns_servers":["10.0.0.53:53","[fd00::53]:5353"]}"#,
+    ))
+    .unwrap();
+    let c = &all.clusters[0];
+    assert!(c.endpoints.is_empty());
+    assert_eq!(
+        c.discovery,
+        Some(Discovery {
+            sources: vec![
+                DiscoverySource::Dns("api.internal:8080".into()),
+                DiscoverySource::Srv("_http._tcp.api.internal".into()),
+                DiscoverySource::File("/etc/edgefront/a.json".into()),
+            ],
+            dns_servers: vec![
+                "10.0.0.53:53".parse().unwrap(),
+                "[fd00::53]:5353".parse().unwrap()
+            ],
+        })
+    );
+    // It writes back in the same schema and reads back equal.
+    let json = serde_json::to_string(&all).unwrap();
+    assert!(json.contains(r#"{"dns":"api.internal:8080"}"#), "{json}");
+    assert_eq!(parse(&json).unwrap(), all);
+    // Static endpoints may sit beside discovery.
+    let both = parse(&with(
+        r#","endpoints":[{"address":"h:1"}],"discovery":{"sources":[{"file":"/x.json"}]}"#,
+    ))
+    .unwrap();
+    assert_eq!(both.clusters[0].endpoints.len(), 1);
+    for (cluster, want) in [
+        (
+            "",
+            "clusters[0].endpoints: at least one endpoint is required",
+        ),
+        (
+            r#","discovery":{}"#,
+            "clusters[0].discovery.sources: at least one source is required",
+        ),
+        (
+            r#","discovery":{"sources":[{}]}"#,
+            "clusters[0].discovery.sources[0]: must name exactly one of dns, srv or file",
+        ),
+        (
+            r#","discovery":{"sources":[{"dns":"a:1","file":"/x"}]}"#,
+            "clusters[0].discovery.sources[0]: must name exactly one",
+        ),
+        (
+            r#","discovery":{"sources":[{"dns":"api.internal"}]}"#,
+            "clusters[0].discovery.sources[0].dns",
+        ),
+        (
+            r#","discovery":{"sources":[{"dns":"api.internal:0"}]}"#,
+            "clusters[0].discovery.sources[0].dns",
+        ),
+        (
+            r#","discovery":{"sources":[{"srv":"bad name!"}]}"#,
+            "clusters[0].discovery.sources[0].srv",
+        ),
+        (
+            r#","discovery":{"sources":[{"file":"/x"},{"file":"/x"}]}"#,
+            "clusters[0].discovery.sources[1]: is listed twice",
+        ),
+        (
+            r#","discovery":{"sources":[{"file":"/x"}],"dns_servers":["10.0.0.53"]}"#,
+            "clusters[0].discovery.dns_servers[0]: \"10.0.0.53\" is not ip:port",
+        ),
+        (
+            r#","discovery":{"sources":[{"consul":"x"}]}"#,
+            "unknown field",
+        ),
+    ] {
+        let err = parse(&with(cluster)).unwrap_err().to_string();
+        assert!(err.contains(want), "{cluster}: {err}");
+    }
+    let many: Vec<String> = (0..17).map(|i| format!(r#"{{"file":"/{i}"}}"#)).collect();
+    let err = parse(&with(&format!(
+        r#","discovery":{{"sources":[{}]}}"#,
+        many.join(",")
+    )))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("at most 16 sources"), "{err}");
+}

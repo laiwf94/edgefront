@@ -267,7 +267,7 @@ impl FromIterator<(u8, bool)> for Census {
 
 /// The current priority picture of a cluster, steer's `balancer.State`.
 /// The load is all zeros in panic and when nothing is available.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PriorityState {
     pub healthy: Vec<u32>,
     pub total: Vec<u32>,

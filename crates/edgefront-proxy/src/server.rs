@@ -87,6 +87,7 @@
 //! the admin API's `/clusters` reports, and [`Proxy::drain`] closes each
 //! connection after its response while the process drains.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -99,24 +100,27 @@ use bytes::{Bytes, BytesMut};
 use edgefront_core::admin::{BalancerState, ClusterState, EndpointState, ProxyState};
 use edgefront_core::body::{self, Body, BoxError};
 use edgefront_core::clock::{Clock, MonotonicClock};
-use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix};
+use edgefront_core::config::{Cluster as ClusterConfig, Config, IpPrefix, limits};
 use edgefront_core::filter::{Decision, Delivery, Exchange, RequestHead, RouteFilters, Upstream};
 use edgefront_core::http1::{ClientLimits, TlsTo};
 use edgefront_core::listener::Handler;
 use edgefront_core::reload;
-use edgefront_core::telemetry::metrics::{ClusterMetrics, Registry, SteerMetrics, TlsMetrics};
+use edgefront_core::telemetry::metrics::{
+    ClusterMetrics, DiscoveryMetrics, Registry, SteerMetrics, TlsMetrics,
+};
 use edgefront_core::tls::client_auth::spiffe_matches;
 use edgefront_core::tls::{ClientIdentity, TlsInfo};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
 use hyper::body::{Body as HttpBody, Frame, Incoming, SizeHint};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, Sleep};
 
 use crate::balancer::maglev::hash_key;
 use crate::balancer::rng::{Rng, SplitMix64};
 use crate::balancer::{Balancer, Options};
+use crate::discovery::{self as disc, Merger, Update, UpdateKind};
 use crate::endpoint::{Endpoint, InFlight};
 use crate::forwarded;
 use crate::grpc;
@@ -177,6 +181,9 @@ pub struct Proxy {
     conn_quota: edgefront_core::listener::ConnQuota,
     /// Decides each new connection ([`Proxy::with_connection_gate`]).
     gate: Option<Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>>,
+    /// The latest endpoints discovery gave each cluster that has it, read
+    /// whenever a runtime is built.
+    discovered: Mutex<HashMap<String, Arc<[disc::Endpoint]>>>,
 }
 
 /// One loaded configuration, never changed after it is built (steer's
@@ -188,7 +195,7 @@ struct Runtime {
     admin_listen: String,
     routes: usize,
     /// Each route's index and its cluster's.
-    router: Router<(usize, usize)>,
+    router: Arc<Router<(usize, usize)>>,
     clusters: Vec<Arc<Cluster>>,
     trusted: Arc<[IpPrefix]>,
 }
@@ -211,13 +218,13 @@ impl Runtime {
                 .position(|c| c.config.name == name)
                 .expect("validation ties every route to a cluster")
         };
-        let router = Router::new(cfg.routes.iter().enumerate().map(|(ri, r)| {
+        let router = Arc::new(Router::new(cfg.routes.iter().enumerate().map(|(ri, r)| {
             (
                 r.host.as_str(),
                 r.path_prefix.as_str(),
                 (ri, index(&r.cluster)),
             )
-        }));
+        })));
         Runtime {
             version,
             loaded_at: SystemTime::now(),
@@ -233,6 +240,23 @@ impl Runtime {
     fn cluster(&self, name: &str) -> Option<&Arc<Cluster>> {
         self.clusters.iter().find(|c| c.config.name == name)
     }
+
+    /// The same runtime with the cluster at `index` replaced, as discovery
+    /// does: same version, routes and every other cluster.
+    fn with_cluster(&self, index: usize, cluster: Arc<Cluster>) -> Runtime {
+        let mut clusters = self.clusters.clone();
+        clusters[index] = cluster;
+        Runtime {
+            version: self.version,
+            loaded_at: self.loaded_at,
+            listen: self.listen.clone(),
+            admin_listen: self.admin_listen.clone(),
+            routes: self.routes,
+            router: Arc::clone(&self.router),
+            clusters,
+            trusted: Arc::clone(&self.trusted),
+        }
+    }
 }
 
 /// What every cluster is built with.
@@ -240,16 +264,20 @@ struct Sources<'a> {
     clock: &'a Arc<dyn Clock>,
     rng: &'a Arc<dyn Rng>,
     metrics: &'a Arc<SteerMetrics>,
+    /// Each discovering cluster's latest endpoints.
+    discovered: &'a HashMap<String, Arc<[disc::Endpoint]>>,
 }
 
 struct Cluster {
     config: ClusterConfig,
-    balancer: Balancer,
+    /// `None` while the cluster has no endpoints, which only discovery
+    /// gives it: every request then fails with no healthy upstream.
+    balancer: Option<Balancer>,
     /// The header Maglev hashes, when the policy is Maglev.
     hash_header: Option<HeaderName>,
     clock: Arc<dyn Clock>,
     /// The way to the endpoints: HTTP/1.1, HTTP/2 or either.
-    client: Way,
+    client: Arc<Way>,
     timeout: Option<Duration>,
     /// Requests holding a permit; shared with the cluster of the same name
     /// in the next runtime, so a reload keeps the count right.
@@ -265,6 +293,60 @@ struct Cluster {
     jitter: SplitMix64,
     /// steer's per-cluster series.
     metrics: ClusterMetrics,
+}
+
+/// An endpoint a cluster is to balance over.
+struct Wanted<'a> {
+    address: &'a str,
+    weight: u32,
+    priority: u32,
+}
+
+/// The ready endpoints of a discovered set.
+fn ready(found: &[disc::Endpoint]) -> Vec<Wanted<'_>> {
+    found
+        .iter()
+        .filter(|e| e.ready)
+        .map(|e| Wanted {
+            address: &e.address,
+            weight: e.weight,
+            priority: e.priority.into(),
+        })
+        .collect()
+}
+
+/// The endpoints for `wanted`, each keeping the state of the endpoint of
+/// the same address in `prev`. An endpoint nothing will probe is made
+/// healthy again, and one nothing will eject is let back in.
+fn carry(
+    wanted: &[Wanted<'_>],
+    prev: Option<&[Endpoint]>,
+    epoch: std::time::Instant,
+    cfg: &ClusterConfig,
+) -> Vec<Endpoint> {
+    let old: HashMap<&str, &Arc<crate::endpoint::State>> = prev
+        .unwrap_or_default()
+        .iter()
+        .map(|e| (&*e.address, &e.state))
+        .collect();
+    wanted
+        .iter()
+        .map(|w| {
+            let ep = match old.get(w.address) {
+                Some(state) => {
+                    Endpoint::with_state(w.address, w.weight, w.priority, Arc::clone(state))
+                }
+                None => Endpoint::new(w.address, w.weight, w.priority, epoch),
+            };
+            if cfg.health_check.is_none() && !ep.state.healthy() {
+                ep.state.set_healthy(true);
+            }
+            if cfg.outlier_detection.is_none() {
+                ep.state.clear_ejection();
+            }
+            ep
+        })
+        .collect()
 }
 
 /// A cluster's retry settings and the budget its retries draw on.
@@ -283,44 +365,44 @@ impl Cluster {
     /// is kept while `connect_timeout` is unchanged; and the retry budget
     /// is kept while its settings are. An endpoint nothing will probe is
     /// made healthy again, and one nothing will eject is let back in.
+    ///
+    /// A cluster with discovery balances over the ready endpoints its
+    /// sources last gave, or over its listed endpoints until they first
+    /// answer.
     fn new(cfg: &ClusterConfig, prev: Option<&Cluster>, src: &Sources<'_>) -> Self {
         let clock = src.clock;
         let epoch = clock.now();
-        let endpoints: Vec<Endpoint> = cfg
-            .endpoints
-            .iter()
-            .map(|e| {
-                let kept = prev.and_then(|p| {
-                    p.balancer
-                        .endpoints()
-                        .iter()
-                        .find(|o| *o.address == *e.address)
-                });
-                let ep = match kept {
-                    Some(o) => Endpoint::with_state(
-                        &e.address,
-                        e.weight,
-                        e.priority.into(),
-                        Arc::clone(&o.state),
-                    ),
-                    None => Endpoint::new(&e.address, e.weight, e.priority.into(), epoch),
-                };
-                if cfg.health_check.is_none() && !ep.state.healthy() {
-                    ep.state.set_healthy(true);
-                }
-                if cfg.outlier_detection.is_none() {
-                    ep.state.clear_ejection();
-                }
-                ep
-            })
-            .collect();
+        let listed = || -> Vec<Wanted<'_>> {
+            cfg.endpoints
+                .iter()
+                .map(|e| Wanted {
+                    address: &e.address,
+                    weight: e.weight,
+                    priority: e.priority.into(),
+                })
+                .collect()
+        };
+        let wanted = match (&cfg.discovery, src.discovered.get(&cfg.name)) {
+            (Some(_), Some(found)) => ready(found),
+            _ => listed(),
+        };
+        let endpoints = carry(&wanted, prev.map(Cluster::endpoints), epoch, cfg);
         let opts = Options::new(cfg.policy)
             .panic_threshold(cfg.panic_threshold_percent)
             .clock(Arc::clone(clock))
             .rng(Arc::clone(src.rng));
         // Validation keeps every weight in 1..=1000, every priority at most
-        // 7 and at most 1,024 endpoints, below Maglev's default table size.
-        let balancer = Balancer::new(endpoints, opts).expect("a validated cluster");
+        // 7 and at most 1,024 listed endpoints, below Maglev's default
+        // table size; discovery checks its sets before it publishes them.
+        let balancer = (!endpoints.is_empty())
+            .then(|| Balancer::new(endpoints, opts))
+            .and_then(|b| {
+                b.map_err(|e| {
+                    tracing::error!(cluster = cfg.name, error = %e, "cannot balance");
+                })
+                .ok()
+            });
+        let eps = || balancer.as_ref().map_or(&[][..], Balancer::endpoints);
         let retry = cfg.retry.as_ref().map(|r| {
             let kept = prev.and_then(|p| match (&p.config.retry, &p.retry) {
                 (Some(old), Some(rt)) if old.budget == r.budget => Some(Arc::clone(&rt.budget)),
@@ -349,7 +431,7 @@ impl Cluster {
             });
             Arc::new(Detector::new(
                 od.clone(),
-                balancer.endpoints().to_vec(),
+                eps().to_vec(),
                 Arc::clone(clock),
                 Some(on_eject),
             ))
@@ -386,7 +468,7 @@ impl Cluster {
             });
             let checker = Checker::new(
                 hc.clone(),
-                balancer.endpoints().to_vec(),
+                eps().to_vec(),
                 Arc::clone(clock),
                 Some(on_change),
             );
@@ -413,7 +495,7 @@ impl Cluster {
             }
             (None, _) => Way::new(cfg.protocol, &limits, None),
         };
-        let addresses: Vec<&str> = cfg.endpoints.iter().map(|e| e.address.as_str()).collect();
+        let addresses: Vec<&str> = eps().iter().map(|e| &*e.address).collect();
         Cluster {
             config: cfg.clone(),
             hash_header: cfg
@@ -421,7 +503,7 @@ impl Cluster {
                 .as_deref()
                 .and_then(|h| HeaderName::from_bytes(h.as_bytes()).ok()),
             clock: Arc::clone(clock),
-            client,
+            client: Arc::new(client),
             timeout: Some(cfg.timeout).filter(|t| !t.is_zero()),
             in_flight: prev
                 .map_or_else(|| Arc::new(AtomicU32::new(0)), |p| Arc::clone(&p.in_flight)),
@@ -433,6 +515,82 @@ impl Cluster {
             metrics: src.metrics.cluster(&cfg.name, &addresses),
             balancer,
         }
+    }
+
+    /// The endpoints the cluster balances over, in order.
+    fn endpoints(&self) -> &[Endpoint] {
+        self.balancer.as_ref().map_or(&[][..], Balancer::endpoints)
+    }
+
+    /// The same cluster balancing over the ready endpoints of `found`, as
+    /// discovery changes it. Everything else carries on untouched: the
+    /// pool, the in-flight count, the retry budget, the checker and the
+    /// detector, which follow the new endpoints without restarting, so
+    /// endpoints that stay keep their probe schedule. An endpoint that
+    /// stays keeps its state and its attempt series; the series of one
+    /// that goes are dropped. Refused when the balancer cannot take the
+    /// set (Maglev's table holds at most 65,536 endpoints).
+    fn rediscovered(&self, found: &[disc::Endpoint], src: &Sources<'_>) -> Result<Cluster, String> {
+        let cfg = &self.config;
+        let wanted = ready(found);
+        let endpoints = carry(&wanted, Some(self.endpoints()), src.clock.now(), cfg);
+        let balancer = if endpoints.is_empty() {
+            None
+        } else {
+            let opts = Options::new(cfg.policy)
+                .panic_threshold(cfg.panic_threshold_percent)
+                .clock(Arc::clone(src.clock))
+                .rng(Arc::clone(src.rng));
+            Some(Balancer::new(endpoints, opts).map_err(|e| e.to_string())?)
+        };
+        let new = balancer.as_ref().map_or(&[][..], Balancer::endpoints);
+        let old: HashMap<&str, usize> = self
+            .endpoints()
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (&*e.address, i))
+            .collect();
+        let attempts = new
+            .iter()
+            .map(|e| match old.get(&*e.address) {
+                Some(&i) => self
+                    .metrics
+                    .endpoint_attempts(i)
+                    .cloned()
+                    .unwrap_or_else(|| src.metrics.endpoint_attempts(&cfg.name, &e.address)),
+                None => src.metrics.endpoint_attempts(&cfg.name, &e.address),
+            })
+            .collect();
+        let kept: HashSet<&str> = new.iter().map(|e| &*e.address).collect();
+        for e in self.endpoints() {
+            if !kept.contains(&*e.address) {
+                src.metrics.forget_endpoint(&cfg.name, &e.address);
+            }
+        }
+        if let Some(c) = &self.checker {
+            c.set_endpoints(new.to_vec());
+        }
+        if let Some(d) = &self.detector {
+            d.set_endpoints(new.to_vec());
+        }
+        Ok(Cluster {
+            config: cfg.clone(),
+            hash_header: self.hash_header.clone(),
+            clock: Arc::clone(&self.clock),
+            client: Arc::clone(&self.client),
+            timeout: self.timeout,
+            in_flight: Arc::clone(&self.in_flight),
+            max_requests: self.max_requests,
+            retry: self.retry.as_ref().map(|r| Retrying {
+                policy: r.policy.clone(),
+                budget: Arc::clone(&r.budget),
+            }),
+            detector: self.detector.clone(),
+            checker: self.checker.clone(),
+            jitter: SplitMix64::from_entropy(),
+            metrics: self.metrics.with_attempts(attempts),
+            balancer,
+        })
     }
 
     /// How much of a body of `length` to buffer for replay, if any.
@@ -460,7 +618,11 @@ impl Cluster {
     /// The cluster as `GET /clusters` shows it, as of `now` on the
     /// cluster's clock and `wall` on the system clock.
     fn state(&self, now: std::time::Instant, wall: SystemTime) -> ClusterState {
-        let b = self.balancer.state();
+        let b = self
+            .balancer
+            .as_ref()
+            .map(Balancer::state)
+            .unwrap_or_default();
         let widen = |v: &[u32]| v.iter().map(|&n| u64::from(n)).collect();
         ClusterState {
             name: self.config.name.clone(),
@@ -475,7 +637,6 @@ impl Cluster {
                 panic: b.panic,
             },
             endpoints: self
-                .balancer
                 .endpoints()
                 .iter()
                 .map(|ep| {
@@ -627,6 +788,7 @@ impl Proxy {
                 clock: &clock,
                 rng: &rng,
                 metrics: &metrics,
+                discovered: &HashMap::new(),
             },
         );
         Proxy {
@@ -640,6 +802,7 @@ impl Proxy {
             draining: AtomicBool::new(false),
             conn_quota: edgefront_core::listener::ConnQuota::default(),
             gate: None,
+            discovered: Mutex::new(HashMap::new()),
         }
     }
 
@@ -718,6 +881,7 @@ impl Proxy {
             return Err(why.to_owned());
         }
         let version = old.version + 1;
+        let discovered = self.discovered();
         let runtime = Runtime::build(
             cfg,
             Some(&old),
@@ -726,6 +890,7 @@ impl Proxy {
                 clock: &self.clock,
                 rng: &self.rng,
                 metrics: &self.metrics,
+                discovered: &discovered,
             },
         );
         let (clusters, routes) = (runtime.clusters.len(), runtime.routes);
@@ -772,44 +937,96 @@ impl Proxy {
     /// cluster. Their state is what the balancer reads on every pick.
     pub fn endpoints(&self, name: &str) -> Option<Vec<Endpoint>> {
         let rt = self.runtime();
-        rt.cluster(name).map(|c| c.balancer.endpoints().to_vec())
+        rt.cluster(name).map(|c| c.endpoints().to_vec())
     }
 
-    /// Runs every cluster's health checks and outlier detection ticks
-    /// until `shutdown` resolves, then returns once each has stopped. The
-    /// binary spawns it beside the listener; without it endpoints are
-    /// never probed and ejections never decay, though consecutive
-    /// failures still eject. After a reload the checks of the replaced
-    /// configuration stop and those of the new one start.
+    /// Runs every cluster's health checks, outlier detection ticks and
+    /// discovery sources until `shutdown` resolves, then returns once each
+    /// has stopped. The binary spawns it beside the listener; without it
+    /// endpoints are never probed, ejections never decay (though
+    /// consecutive failures still eject) and discovery never runs. After a
+    /// reload the checks of replaced clusters stop and those of new ones
+    /// start; a cluster discovery changes keeps its checks running, and
+    /// they follow its endpoints. Discovery restarts for a cluster only
+    /// when a reload changes its sources or listed endpoints.
     pub async fn run_checks(&self, shutdown: impl std::future::Future<Output = ()>) {
         let mut changes = self.current.subscribe();
         tokio::pin!(shutdown);
+        let (tx, mut rx) = mpsc::channel::<Arrival>(1024);
+        let mut running: HashMap<String, Discovering> = HashMap::new();
+        let mut generation = 0u64;
+        let mut synced = 0u64;
+        let mut checkers: Vec<(Arc<Checker>, watch::Sender<bool>)> = Vec::new();
+        let mut detectors: Vec<(Arc<Detector>, watch::Sender<bool>)> = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
             let rt = Arc::clone(&changes.borrow_and_update());
-            let (stop, stopped) = watch::channel(false);
-            let mut tasks = tokio::task::JoinSet::new();
-            for c in &rt.clusters {
-                if let Some(checker) = &c.checker {
-                    let checker = Arc::clone(checker);
-                    let until = until_stopped(stopped.clone());
-                    tasks.spawn(async move { checker.run(until).await });
+            if rt.version != synced {
+                synced = rt.version;
+                self.sync_discovery(&rt, &mut running, &tx, &mut generation);
+            }
+            let want_checkers: Vec<&Arc<Checker>> = rt
+                .clusters
+                .iter()
+                .filter_map(|c| c.checker.as_ref())
+                .collect();
+            checkers.retain(|(c, stop)| {
+                let keep = want_checkers.iter().any(|w| Arc::ptr_eq(w, c));
+                if !keep {
+                    stop.send_replace(true);
                 }
-                if let Some(detector) = &c.detector {
-                    let detector = Arc::clone(detector);
-                    let until = until_stopped(stopped.clone());
-                    tasks.spawn(async move { detector.run(until).await });
+                keep
+            });
+            for c in want_checkers {
+                if !checkers.iter().any(|(have, _)| Arc::ptr_eq(have, c)) {
+                    let (stop, stopped) = watch::channel(false);
+                    let checker = Arc::clone(c);
+                    tasks.spawn(async move { checker.run(until_stopped(stopped)).await });
+                    checkers.push((Arc::clone(c), stop));
                 }
             }
+            let want_detectors: Vec<&Arc<Detector>> = rt
+                .clusters
+                .iter()
+                .filter_map(|c| c.detector.as_ref())
+                .collect();
+            detectors.retain(|(d, stop)| {
+                let keep = want_detectors.iter().any(|w| Arc::ptr_eq(w, d));
+                if !keep {
+                    stop.send_replace(true);
+                }
+                keep
+            });
+            for d in want_detectors {
+                if !detectors.iter().any(|(have, _)| Arc::ptr_eq(have, d)) {
+                    let (stop, stopped) = watch::channel(false);
+                    let detector = Arc::clone(d);
+                    tasks.spawn(async move { detector.run(until_stopped(stopped)).await });
+                    detectors.push((Arc::clone(d), stop));
+                }
+            }
+            while tasks.try_join_next().is_some() {}
+            drop(rt);
             let done = tokio::select! {
                 () = &mut shutdown => true,
                 changed = changes.changed() => changed.is_err(),
+                Some(first) = rx.recv() => {
+                    self.arrive(first, &mut rx, &mut running);
+                    false
+                }
             };
-            stop.send_replace(true);
-            while tasks.join_next().await.is_some() {}
             if done {
-                return;
+                break;
             }
         }
+        running.clear();
+        for (_, stop) in &checkers {
+            stop.send_replace(true);
+        }
+        for (_, stop) in &detectors {
+            stop.send_replace(true);
+        }
+        while tasks.join_next().await.is_some() {}
     }
 
     /// The retry budget's balance in the cluster named `name`, when it
@@ -820,10 +1037,188 @@ impl Proxy {
         c.retry.as_ref().map(|r| r.budget.balance())
     }
 
+    /// A copy of the discovered sets, for building a runtime.
+    fn discovered(&self) -> HashMap<String, Arc<[disc::Endpoint]>> {
+        self.discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Starts discovery for each cluster of `rt` that has it and is not
+    /// already running with the same sources and listed endpoints, and
+    /// stops it for clusters that no longer have it. A cluster starting
+    /// with listed endpoints balances over them at once; one whose sources
+    /// a reload changed keeps its last discovered endpoints until a new
+    /// source first reports.
+    fn sync_discovery(
+        &self,
+        rt: &Runtime,
+        running: &mut HashMap<String, Discovering>,
+        tx: &mpsc::Sender<Arrival>,
+        generation: &mut u64,
+    ) {
+        let wanted: HashMap<&str, &ClusterConfig> = rt
+            .clusters
+            .iter()
+            .filter(|c| c.config.discovery.is_some())
+            .map(|c| (c.config.name.as_str(), &c.config))
+            .collect();
+        running.retain(|name, d| wanted.get(name.as_str()).is_some_and(|c| d.started_for(c)));
+        self.discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|name, _| wanted.contains_key(name.as_str()));
+        for (name, cfg) in wanted {
+            if running.contains_key(name) {
+                continue;
+            }
+            *generation += 1;
+            let d = Discovering::start(cfg, *generation, &self.metrics, tx);
+            running.insert(name.to_owned(), d);
+            let d = running.get_mut(name).expect("just inserted");
+            let first = !self
+                .discovered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(name);
+            if first && d.merger.version() != d.published {
+                self.publish(name, d, std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Applies `first` and every update already waiting behind it, then
+    /// rebuilds each cluster whose merged set moved, once.
+    fn arrive(
+        &self,
+        first: Arrival,
+        rx: &mut mpsc::Receiver<Arrival>,
+        running: &mut HashMap<String, Discovering>,
+    ) {
+        let mut touched: HashMap<Arc<str>, std::time::Instant> = HashMap::new();
+        let mut take = |a: Arrival| {
+            let Some(d) = running.get_mut(&*a.cluster) else {
+                return;
+            };
+            if d.generation != a.generation {
+                return;
+            }
+            let source = a.update.source;
+            let failed = matches!(a.update.kind, UpdateKind::Failed(_));
+            if let UpdateKind::Failed(e) = &a.update.kind {
+                tracing::warn!(
+                    cluster = &*a.cluster,
+                    source = d
+                        .merger
+                        .status()
+                        .nth(source)
+                        .map_or("", |s| s.name.as_str()),
+                    error = e.as_str(),
+                    "discovery source failed; keeping its last endpoints"
+                );
+            }
+            d.merger.apply(a.update, a.at);
+            let stale = d.merger.status().nth(source).is_some_and(|s| s.stale);
+            d.metrics.source(source, failed, stale);
+            touched.entry(a.cluster).or_insert(a.at);
+        };
+        take(first);
+        // Coalesce what is already queued, but not without bound, so one
+        // busy cluster cannot hold the others back for long.
+        for _ in 0..4096 {
+            match rx.try_recv() {
+                Ok(a) => take(a),
+                Err(_) => break,
+            }
+        }
+        for (name, since) in touched {
+            if let Some(d) = running.get_mut(&*name)
+                && d.merger.version() != d.published
+            {
+                self.publish(&name, d, since);
+            }
+        }
+    }
+
+    /// Rebuilds the cluster `name` on `d`'s merged set and swaps it in.
+    fn publish(&self, name: &str, d: &mut Discovering, since: std::time::Instant) {
+        d.published = d.merger.version();
+        let found: Arc<[disc::Endpoint]> = d.merger.endpoints().cloned().collect();
+        d.metrics.endpoints(found.len());
+        if found.len() > limits::MAX_DISCOVERED_ENDPOINTS {
+            d.metrics.refused();
+            tracing::warn!(
+                cluster = name,
+                endpoints = found.len(),
+                limit = limits::MAX_DISCOVERED_ENDPOINTS,
+                "discovered too many endpoints; keeping the last set"
+            );
+            return;
+        }
+        let _held = self
+            .reloading
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let rt = self.runtime();
+        let Some(index) = rt.clusters.iter().position(|c| c.config.name == name) else {
+            return;
+        };
+        let rebuilt = {
+            let none = HashMap::new();
+            let src = Sources {
+                clock: &self.clock,
+                rng: &self.rng,
+                metrics: &self.metrics,
+                discovered: &none,
+            };
+            rt.clusters[index].rediscovered(&found, &src)
+        };
+        match rebuilt {
+            Ok(cluster) => {
+                let ready = cluster.endpoints().len();
+                self.discovered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.to_owned(), found);
+                self.current
+                    .send_replace(Arc::new(rt.with_cluster(index, Arc::new(cluster))));
+                d.metrics.applied(since.elapsed());
+                tracing::debug!(
+                    cluster = name,
+                    version = d.published,
+                    ready,
+                    "discovered endpoints applied"
+                );
+            }
+            Err(e) => {
+                d.metrics.refused();
+                tracing::warn!(
+                    cluster = name,
+                    error = e.as_str(),
+                    "cannot balance the discovered endpoints; keeping the last set"
+                );
+            }
+        }
+    }
+
+    /// The endpoints discovery last gave the cluster named `name`, ready
+    /// or not and in address order, or `None` before it first gave any
+    /// (or when the cluster does not discover). [`Proxy::endpoints`] has
+    /// the ready ones the balancer uses.
+    pub fn discovered_endpoints(&self, name: &str) -> Option<Vec<disc::Endpoint>> {
+        self.discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .map(|found| found.to_vec())
+    }
+
     /// How many priority levels the cluster named `name` balances over.
     pub fn priority_levels(&self, name: &str) -> Option<usize> {
         let rt = self.runtime();
-        rt.cluster(name).map(|c| c.balancer.levels())
+        rt.cluster(name)
+            .map(|c| c.balancer.as_ref().map_or(0, Balancer::levels))
     }
     /// Answers one request from `peer`.
     pub async fn handle(&self, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
@@ -1005,7 +1400,7 @@ impl Proxy {
                 .unwrap_or(Err(Failure::Timeout)),
             None => exchange_fut.await,
         };
-        let access = access.tried(&cluster.balancer, &tried);
+        let access = access.tried(cluster.endpoints(), &tried);
 
         let failure = match result {
             Ok((resp, in_flight)) => {
@@ -1212,12 +1607,12 @@ impl Cluster {
         let per_try = self.retry.as_ref().and_then(|r| r.policy.per_try_timeout());
         let mut stream = Some(body);
 
-        let Some(mut i) = self.balancer.pick(key, tried) else {
+        let Some(mut i) = self.balancer.as_ref().and_then(|b| b.pick(key, tried)) else {
             return Err(Failure::NoHealthyUpstream);
         };
         for attempt in 0u32.. {
             tried.push(i);
-            let endpoint = &self.balancer.endpoints()[i];
+            let endpoint = &self.endpoints()[i];
             let in_flight = endpoint.state.track();
             let body = match stream.as_ref() {
                 Some(UpstreamBody::Empty) => body::empty(),
@@ -1260,7 +1655,7 @@ impl Cluster {
                 if !r.policy.retryable(attempt, replayable, safe, outcome) {
                     return None;
                 }
-                let next = self.balancer.pick(key, tried)?;
+                let next = self.balancer.as_ref()?.pick(key, tried)?;
                 if !r.budget.try_withdraw() {
                     self.metrics.budget_exhausted();
                     tracing::debug!(cluster = self.config.name, "retry budget exhausted");
@@ -1424,6 +1819,122 @@ impl Refresh {
                 drop(exchange.deliver(resp, Delivery::Generated(code)));
             }
         }
+    }
+}
+
+/// One update from a cluster's discovery source, on its way to the
+/// cluster's merger.
+struct Arrival {
+    cluster: Arc<str>,
+    /// Which start of the cluster's discovery it comes from; updates from
+    /// one a reload replaced are dropped.
+    generation: u64,
+    update: Update,
+    at: std::time::Instant,
+}
+
+/// One cluster's discovery while it runs.
+struct Discovering {
+    /// The sources and listed endpoints it was started for.
+    discovery: edgefront_core::config::Discovery,
+    listed: Vec<edgefront_core::config::Endpoint>,
+    generation: u64,
+    merger: Merger,
+    /// The merger version last published to the cluster.
+    published: u64,
+    metrics: DiscoveryMetrics,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Discovering {
+    /// Starts `cfg`'s sources, each sending into `tx`, with the listed
+    /// endpoints as one more source after them.
+    fn start(
+        cfg: &ClusterConfig,
+        generation: u64,
+        metrics: &SteerMetrics,
+        tx: &mpsc::Sender<Arrival>,
+    ) -> Discovering {
+        let discovery = cfg.discovery.clone().expect("a discovering cluster");
+        let cluster: Arc<str> = cfg.name.as_str().into();
+        let sources: Vec<Box<dyn disc::Source>> = discovery
+            .sources
+            .iter()
+            .map(|s| disc::from_config(s, &discovery.dns_servers))
+            .collect();
+        let mut names: Vec<String> = sources.iter().map(|s| s.name()).collect();
+        if !cfg.endpoints.is_empty() {
+            names.push("static".to_owned());
+        }
+        let mut merger = Merger::new(names.clone());
+        let mut tasks = Vec::new();
+        for (index, source) in sources.into_iter().enumerate() {
+            let (stx, mut srx) = mpsc::channel(64);
+            tasks.push(tokio::spawn(source.run(stx)).abort_handle());
+            let tx = tx.clone();
+            let cluster = Arc::clone(&cluster);
+            tasks.push(
+                tokio::spawn(async move {
+                    while let Some(kind) = srx.recv().await {
+                        let arrival = Arrival {
+                            cluster: Arc::clone(&cluster),
+                            generation,
+                            update: Update {
+                                source: index,
+                                kind,
+                            },
+                            at: std::time::Instant::now(),
+                        };
+                        if tx.send(arrival).await.is_err() {
+                            return;
+                        }
+                    }
+                })
+                .abort_handle(),
+            );
+        }
+        if !cfg.endpoints.is_empty() {
+            let listed = cfg
+                .endpoints
+                .iter()
+                .map(|e| disc::Endpoint {
+                    address: e.address.clone(),
+                    weight: e.weight,
+                    priority: e.priority,
+                    zone: None,
+                    ready: true,
+                })
+                .collect();
+            let update = Update {
+                source: names.len() - 1,
+                kind: UpdateKind::Set(listed),
+            };
+            merger.apply(update, std::time::Instant::now());
+        }
+        let metrics = metrics.discovery(&cfg.name, &names);
+        Discovering {
+            discovery,
+            listed: cfg.endpoints.clone(),
+            generation,
+            merger,
+            published: 0,
+            metrics,
+            tasks,
+        }
+    }
+
+    /// Whether it runs what `cfg` asks for.
+    fn started_for(&self, cfg: &ClusterConfig) -> bool {
+        cfg.discovery.as_ref() == Some(&self.discovery) && cfg.endpoints == self.listed
+    }
+}
+
+impl Drop for Discovering {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+        self.metrics.retire();
     }
 }
 
@@ -1911,8 +2422,7 @@ impl<'a> Access<'a> {
         Access { cluster, ..self }
     }
 
-    fn tried(self, balancer: &'a Balancer, tried: &[usize]) -> Self {
-        let eps = balancer.endpoints();
+    fn tried(self, eps: &'a [Endpoint], tried: &[usize]) -> Self {
         let endpoints = tried.iter().map(|&i| &*eps[i].address).collect();
         Access { endpoints, ..self }
     }

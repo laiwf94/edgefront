@@ -598,7 +598,7 @@ pub fn execute_outlier(t: &OutlierTrace) -> (Answer, OutlierStats) {
             OutlierOp::State => {
                 stats.states += 1;
                 let mut s = String::from("state");
-                for e in detector.endpoints() {
+                for e in detector.endpoints().iter() {
                     let until = e.state.ejected_until().map_or("-".to_string(), |u| {
                         u.duration_since(epoch).as_nanos().to_string()
                     });

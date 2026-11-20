@@ -195,6 +195,33 @@ impl Registry {
         inner.help.insert(name.to_owned(), help.to_owned());
     }
 
+    /// Removes the counter of family `name` with `labels`, if there is
+    /// one, so a series whose subject is gone stops being rendered.
+    pub fn remove_counter(&self, name: &str, labels: &str) {
+        self.lock().counters.remove(&series(name, labels));
+    }
+
+    /// Removes the gauge of family `name` with `labels`, if there is one.
+    pub fn remove_gauge(&self, name: &str, labels: &str) {
+        self.lock().gauges.remove(&series(name, labels));
+    }
+
+    /// Registers the gauge of family `name` with `labels` (see [`labels`]),
+    /// read by calling `read` on every scrape, replacing any gauge of that
+    /// family and labels. `read` runs under the registry's lock, so it
+    /// must not use the registry.
+    pub fn labeled_gauge(
+        &self,
+        name: &str,
+        labels: &str,
+        help: &str,
+        read: impl Fn() -> f64 + Send + Sync + 'static,
+    ) {
+        let mut inner = self.lock();
+        inner.gauges.insert(series(name, labels), Box::new(read));
+        inner.help.insert(name.to_owned(), help.to_owned());
+    }
+
     /// Appends every series in the text exposition format.
     pub fn write(&self, out: &mut String) {
         let inner = self.lock();
@@ -212,9 +239,10 @@ impl Registry {
             header(out, name, "counter");
             let _ = writeln!(out, "{key} {}", c.value());
         }
-        for (name, read) in &inner.gauges {
+        for (key, read) in &inner.gauges {
+            let (name, _) = split_series(key);
             header(out, name, "gauge");
-            let _ = writeln!(out, "{name} {}", format_float(read()));
+            let _ = writeln!(out, "{key} {}", format_float(read()));
         }
         for (key, h) in &inner.histograms {
             let (name, labels) = split_series(key);
@@ -426,6 +454,23 @@ const EJECTIONS: &str = "steer_outlier_ejections_total";
 const EJECTIONS_HELP: &str = "Endpoints ejected by outlier detection.";
 const TRANSITIONS: &str = "steer_health_transitions_total";
 const TRANSITIONS_HELP: &str = "Active health check verdict changes.";
+const DISCOVERY_ENDPOINTS: &str = "edgefront_discovery_endpoints";
+const DISCOVERY_ENDPOINTS_HELP: &str =
+    "Endpoints discovery gives a cluster, ready or not, static ones included.";
+const DISCOVERY_UPDATES: &str = "edgefront_discovery_updates_total";
+const DISCOVERY_UPDATES_HELP: &str = "Successful answers from a discovery source.";
+const DISCOVERY_FAILURES: &str = "edgefront_discovery_failures_total";
+const DISCOVERY_FAILURES_HELP: &str =
+    "Failed reads of a discovery source; the last good endpoints stay.";
+const DISCOVERY_STALE: &str = "edgefront_discovery_stale";
+const DISCOVERY_STALE_HELP: &str =
+    "1 while a discovery source's last read failed and its last good endpoints are kept.";
+const DISCOVERY_REFUSED: &str = "edgefront_discovery_refused_total";
+const DISCOVERY_REFUSED_HELP: &str =
+    "Discovered endpoint sets a cluster refused, keeping the endpoints it had.";
+const DISCOVERY_APPLY: &str = "edgefront_discovery_apply_duration_seconds";
+const DISCOVERY_APPLY_HELP: &str =
+    "From a discovery update arriving to the cluster balancing on it.";
 const HANDSHAKES: &str = "steer_tls_handshakes_total";
 const HANDSHAKES_HELP: &str = "TLS handshakes on the proxy listener by result.";
 const HANDSHAKE_DURATION: &str = "steer_tls_handshake_duration_seconds";
@@ -525,6 +570,76 @@ impl SteerMetrics {
             budget_exhausted: r.counter(BUDGET_EXHAUSTED, &by_cluster, BUDGET_EXHAUSTED_HELP),
             overflow: r.counter(OVERFLOW, &by_cluster, OVERFLOW_HELP),
             attempts,
+        }
+    }
+
+    /// The attempt series of `endpoint` in `cluster`, created at zero on
+    /// first use; the same series as [`SteerMetrics::cluster`] gives.
+    pub fn endpoint_attempts(&self, cluster: &str, endpoint: &str) -> [Arc<Counter>; 5] {
+        AttemptResult::ALL.map(|result| {
+            self.registry.counter(
+                ATTEMPTS,
+                &labels(&[
+                    ("cluster", cluster),
+                    ("endpoint", endpoint),
+                    ("result", result.as_str()),
+                ]),
+                ATTEMPTS_HELP,
+            )
+        })
+    }
+
+    /// Stops rendering the attempt series of `endpoint` in `cluster`, as
+    /// when discovery removes the endpoint.
+    pub fn forget_endpoint(&self, cluster: &str, endpoint: &str) {
+        for result in AttemptResult::ALL {
+            self.registry.remove_counter(
+                ATTEMPTS,
+                &labels(&[
+                    ("cluster", cluster),
+                    ("endpoint", endpoint),
+                    ("result", result.as_str()),
+                ]),
+            );
+        }
+    }
+
+    /// The discovery series of `cluster` and its `sources`, by name.
+    pub fn discovery(&self, cluster: &str, sources: &[String]) -> DiscoveryMetrics {
+        let r = &self.registry;
+        let by_cluster = labels(&[("cluster", cluster)]);
+        let endpoints = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&endpoints);
+        r.labeled_gauge(
+            DISCOVERY_ENDPOINTS,
+            &by_cluster,
+            DISCOVERY_ENDPOINTS_HELP,
+            move || read.load(Ordering::Relaxed) as f64,
+        );
+        let sources = sources
+            .iter()
+            .map(|source| {
+                let l = labels(&[("cluster", cluster), ("source", source)]);
+                let stale = Arc::new(AtomicU64::new(0));
+                let read = Arc::clone(&stale);
+                r.labeled_gauge(DISCOVERY_STALE, &l, DISCOVERY_STALE_HELP, move || {
+                    read.load(Ordering::Relaxed) as f64
+                });
+                SourceMetrics {
+                    updates: r.counter(DISCOVERY_UPDATES, &l, DISCOVERY_UPDATES_HELP),
+                    failures: r.counter(DISCOVERY_FAILURES, &l, DISCOVERY_FAILURES_HELP),
+                    stale,
+                    labels: l,
+                }
+            })
+            .collect();
+        DiscoveryMetrics {
+            registry: Arc::clone(r),
+            cluster: by_cluster.clone(),
+            endpoints,
+            refused: r.counter(DISCOVERY_REFUSED, &by_cluster, DISCOVERY_REFUSED_HELP),
+            apply: r.histogram(DISCOVERY_APPLY, &by_cluster, DISCOVERY_APPLY_HELP),
+            sources,
         }
     }
 
@@ -632,6 +747,86 @@ impl ClusterMetrics {
         self.attempts
             .get(endpoint)
             .map_or(0, |by_result| by_result[result.index()].value())
+    }
+}
+
+impl ClusterMetrics {
+    /// The same cluster's series for a new list of endpoints, given each
+    /// one's attempt series.
+    pub fn with_attempts(&self, attempts: Vec<[Arc<Counter>; 5]>) -> ClusterMetrics {
+        ClusterMetrics {
+            attempts,
+            ..self.clone()
+        }
+    }
+
+    /// The attempt series of the endpoint at `endpoint`.
+    pub fn endpoint_attempts(&self, endpoint: usize) -> Option<&[Arc<Counter>; 5]> {
+        self.attempts.get(endpoint)
+    }
+}
+
+/// One cluster's discovery series.
+#[derive(Debug)]
+pub struct DiscoveryMetrics {
+    registry: Arc<Registry>,
+    cluster: String,
+    endpoints: Arc<AtomicU64>,
+    refused: Arc<Counter>,
+    apply: Arc<Histogram>,
+    sources: Vec<SourceMetrics>,
+}
+
+#[derive(Debug)]
+struct SourceMetrics {
+    updates: Arc<Counter>,
+    failures: Arc<Counter>,
+    stale: Arc<AtomicU64>,
+    labels: String,
+}
+
+impl DiscoveryMetrics {
+    /// Sets the cluster's endpoint count.
+    pub fn endpoints(&self, n: usize) {
+        self.endpoints.store(n as u64, Ordering::Relaxed);
+    }
+
+    /// Records one answer from the source at `source`: a success or a
+    /// failure, and whether it is now stale.
+    pub fn source(&self, source: usize, failed: bool, stale: bool) {
+        if let Some(s) = self.sources.get(source) {
+            if failed {
+                s.failures.inc();
+            } else {
+                s.updates.inc();
+            }
+            s.stale.store(u64::from(stale), Ordering::Relaxed);
+        }
+    }
+
+    /// Counts a discovered set the cluster refused.
+    pub fn refused(&self) {
+        self.refused.inc();
+    }
+
+    /// Records how long applying an update took.
+    pub fn applied(&self, took: Duration) {
+        self.apply.observe(took);
+    }
+
+    /// How many updates have been applied.
+    pub fn applies(&self) -> u64 {
+        self.apply.count()
+    }
+
+    /// Removes the gauges, as when the cluster's discovery stops; the
+    /// counters stay, as counters do.
+    pub fn retire(&self) {
+        self.registry
+            .remove_gauge(DISCOVERY_ENDPOINTS, &self.cluster);
+        for s in &self.sources {
+            self.registry.remove_gauge(DISCOVERY_STALE, &s.labels);
+        }
     }
 }
 
@@ -823,6 +1018,20 @@ b_seconds_count 1
         assert_eq!(split_series(r#"a{x="1"}"#), ("a", r#"x="1""#));
         assert_eq!(series("a", ""), "a");
         assert_eq!(series("a", r#"x="1""#), r#"a{x="1"}"#);
+    }
+
+    #[test]
+    fn labeled_gauges_share_one_header_and_are_replaced_by_labels() {
+        let r = Registry::new();
+        r.labeled_gauge("g", &labels(&[("c", "b")]), "help", || 2.0);
+        r.labeled_gauge("g", &labels(&[("c", "a")]), "help", || 1.0);
+        r.labeled_gauge("g", &labels(&[("c", "a")]), "help", || 3.0);
+        r.gauge("h", "plain", || 4.0);
+        assert_eq!(
+            r.render(),
+            "# HELP g help\n# TYPE g gauge\ng{c=\"a\"} 3\ng{c=\"b\"} 2\n\
+             # HELP h plain\n# TYPE h gauge\nh 4\n"
+        );
     }
 
     #[test]

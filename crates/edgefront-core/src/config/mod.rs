@@ -40,6 +40,11 @@ pub mod limits {
     pub const MAX_CLUSTERS: usize = 256;
     /// Per cluster.
     pub const MAX_ENDPOINTS: usize = 1024;
+    /// The most endpoints discovery may give one cluster; a larger set
+    /// is refused and the cluster keeps the one it has.
+    pub const MAX_DISCOVERED_ENDPOINTS: usize = 200_000;
+    /// Per cluster.
+    pub const MAX_DISCOVERY_SOURCES: usize = 16;
     pub const MAX_PRIORITY: u8 = 7;
     pub const MAX_WEIGHT: u32 = 1000;
     pub const MAX_TRUSTED_PROXIES: usize = 64;
@@ -413,6 +418,35 @@ pub struct Cluster {
     /// The HTTP version spoken to the endpoints.
     #[serde(skip_serializing_if = "UpstreamProtocol::is_default")]
     pub protocol: UpstreamProtocol,
+    /// Where else endpoints come from. With discovery, `endpoints` may be
+    /// empty; when it is not, the listed endpoints are one more source,
+    /// after the discovered ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<Discovery>,
+}
+
+/// A cluster's discovery sources (see `edgefront_proxy::discovery`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Discovery {
+    /// In order: for an address several sources name, the first wins.
+    pub sources: Vec<DiscoverySource>,
+    /// The DNS servers `dns` and `srv` sources ask, as `ip:port`; the
+    /// system's when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns_servers: Vec<std::net::SocketAddr>,
+}
+
+/// One discovery source. Each is written as an object with one key, such
+/// as `{"dns": "api.internal:8080"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverySource {
+    /// A name's A and AAAA records, as `host:port`.
+    Dns(String),
+    /// A service's SRV records, such as `_http._tcp.api.internal`.
+    Srv(String),
+    /// A watched JSON file of endpoints.
+    File(String),
 }
 
 /// The HTTP version a cluster speaks to its endpoints.
