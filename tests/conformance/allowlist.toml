@@ -45,3 +45,4 @@ method-POST = { result = "optional_fail", reason = "Only responses to GET are st
 # If-Modified-Since date, so the stored response has changed since then
 # and the client gets it whole.
 conditional-lm-fresh-no-lm = { result = "optional_fail", reason = "If-Modified-Since is judged against the stored Date when there is no Last-Modified (RFC 9111 4.3.2); the Date is later than it, so the answer is 200" }
+# try 9
