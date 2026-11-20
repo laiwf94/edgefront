@@ -8,6 +8,7 @@
 
 pub mod cidr;
 pub mod class;
+pub mod client_addr;
 pub mod clock;
 pub mod config;
 pub mod conn;
