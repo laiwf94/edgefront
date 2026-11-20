@@ -259,11 +259,22 @@ fn set_limit_keeps_counts_and_reset_clears_them() {
 
 #[test]
 fn sweep_removes_idle_clients_only() {
-    let t = table(256, 1, HOUR, FullPolicy::Deny);
+    // The 200 takes span 12.5 hours, so clients go idle while the table
+    // fills; a full shard would reclaim them before the sweep could. The
+    // hash seed is random, so with 256 entries (4 shards of 64, about 50
+    // clients each) one sometimes filled: 11 runs in 300 reclaimed 2. At
+    // 4,096 (64 shards, about 3 each) none can.
+    let t = table(4096, 1, HOUR, FullPolicy::Deny);
     for i in 0..200 {
         assert_eq!(t.take(&key(i), u64::from(i) * SLOT), Ok(true));
     }
     let n = t.shards();
+    let st = t.stats();
+    assert_eq!(
+        (st.entries, st.reclaims),
+        (200, 0),
+        "no shard filled: {st:?}"
+    );
     assert_eq!(t.sweep(HOUR, n), 0, "every window still counts");
     // At an hour and two buckets, the clients seen in the first bucket
     // (0) and the second (1) have empty windows.
