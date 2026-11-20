@@ -447,6 +447,33 @@ pub enum DiscoverySource {
     Srv(String),
     /// A watched JSON file of endpoints.
     File(String),
+    /// A Kubernetes Service's EndpointSlices.
+    Kubernetes(KubernetesSource),
+}
+
+/// The EndpointSlices of one Kubernetes Service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KubernetesSource {
+    pub namespace: String,
+    pub service: String,
+    /// The port's name in the slices; the first port when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    /// The API server, `https://host:port` (or `http://` for a local
+    /// proxy, with no credentials); the pod's own, with its service
+    /// account, when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_server: Option<String>,
+    /// With `api_server`: the CA its certificate must chain to (required
+    /// for https), a bearer token file, and a client certificate and key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
 }
 
 /// The HTTP version a cluster speaks to its endpoints.

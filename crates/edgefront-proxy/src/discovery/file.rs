@@ -28,12 +28,14 @@ pub const MAX_FILE_BYTES: u64 = 16 << 20;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileSet {
-    endpoints: Vec<FileEndpoint>,
+    endpoints: Vec<WireEndpoint>,
 }
 
+/// One endpoint as files and the delta feed write it: only `address` is
+/// required.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FileEndpoint {
+pub(super) struct WireEndpoint {
     address: String,
     #[serde(default = "one")]
     weight: u32,
@@ -53,35 +55,41 @@ fn yes() -> bool {
     true
 }
 
-/// Parses an endpoint file's contents.
-pub fn parse(data: &[u8]) -> Result<Vec<Endpoint>, String> {
-    let set: FileSet = serde_json::from_slice(data).map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(set.endpoints.len());
-    for (i, e) in set.endpoints.into_iter().enumerate() {
-        let port_ok = e.address.rsplit_once(':').is_some_and(|(host, port)| {
+impl WireEndpoint {
+    /// The endpoint, checked as the configuration's are: `host:port`
+    /// with a nonzero port, weight 1 to 1,000 and priority up to 7. `at`
+    /// names it in errors.
+    pub(super) fn check(self, at: &str) -> Result<Endpoint, String> {
+        let port_ok = self.address.rsplit_once(':').is_some_and(|(host, port)| {
             !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0)
         });
         if !port_ok {
-            return Err(format!(
-                "endpoints[{i}].address {:?} is not host:port",
-                e.address
-            ));
+            return Err(format!("{at}.address {:?} is not host:port", self.address));
         }
-        if !(1..=1000).contains(&e.weight) {
-            return Err(format!("endpoints[{i}].weight must be between 1 and 1000"));
+        if !(1..=1000).contains(&self.weight) {
+            return Err(format!("{at}.weight must be between 1 and 1000"));
         }
-        if e.priority > 7 {
-            return Err(format!("endpoints[{i}].priority must be at most 7"));
+        if self.priority > 7 {
+            return Err(format!("{at}.priority must be at most 7"));
         }
-        out.push(Endpoint {
-            address: e.address,
-            weight: e.weight,
-            priority: e.priority,
-            zone: e.zone,
-            ready: e.ready,
-        });
+        Ok(Endpoint {
+            address: self.address,
+            weight: self.weight,
+            priority: self.priority,
+            zone: self.zone,
+            ready: self.ready,
+        })
     }
-    Ok(out)
+}
+
+/// Parses an endpoint file's contents.
+pub fn parse(data: &[u8]) -> Result<Vec<Endpoint>, String> {
+    let set: FileSet = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    set.endpoints
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| e.check(&format!("endpoints[{i}]")))
+        .collect()
 }
 
 /// What identifies one version of the file.

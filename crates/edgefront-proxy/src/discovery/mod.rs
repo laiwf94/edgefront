@@ -34,12 +34,13 @@
 
 pub mod dns;
 pub mod file;
+pub mod k8s;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 /// One discovered endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Endpoint {
     /// `host:port`.
     pub address: String,
@@ -87,6 +88,21 @@ pub fn from_config(
             Box::new(dns::DnsSource::new(query).servers(dns_servers.to_vec()))
         }
         Config::File(path) => Box::new(file::FileSource::new(path)),
+        Config::Kubernetes(k) => {
+            let source = k8s::KubernetesSource::new(&k.namespace, &k.service, k.port.as_deref());
+            Box::new(match &k.api_server {
+                Some(server) => {
+                    let path = |p: &Option<String>| p.as_ref().map(std::path::PathBuf::from);
+                    let mut api = k8s::ApiAccess::new(server);
+                    api.ca_file = path(&k.ca_file);
+                    api.token_file = path(&k.token_file);
+                    api.cert_file = path(&k.cert_file);
+                    api.key_file = path(&k.key_file);
+                    source.api(api)
+                }
+                None => source,
+            })
+        }
     }
 }
 

@@ -1280,7 +1280,7 @@ fn parses_http2() {
 
 #[test]
 fn parses_discovery() {
-    use edgefront_core::config::{Discovery, DiscoverySource};
+    use edgefront_core::config::{Discovery, DiscoverySource, KubernetesSource};
     let with = |cluster: &str| {
         format!(
             r#"{{"listen":":80","routes":[{{"cluster":"a"}}],"clusters":[{{"name":"a"{cluster}}}]}}"#
@@ -1289,7 +1289,10 @@ fn parses_discovery() {
     assert_eq!(parse(MINIMAL).unwrap().clusters[0].discovery, None);
     let all = parse(&with(
         r#","discovery":{"sources":[{"dns":"api.internal:8080"},{"srv":"_http._tcp.api.internal"},
-            {"file":"/etc/edgefront/a.json"}],
+            {"file":"/etc/edgefront/a.json"},
+            {"kubernetes":{"namespace":"prod","service":"api","port":"http"}},
+            {"kubernetes":{"namespace":"prod","service":"web","api_server":"https://10.0.0.1:6443",
+              "ca_file":"/etc/k8s/ca.crt","token_file":"/etc/k8s/token"}}],
             "dns_servers":["10.0.0.53:53","[fd00::53]:5353"]}"#,
     ))
     .unwrap();
@@ -1302,6 +1305,26 @@ fn parses_discovery() {
                 DiscoverySource::Dns("api.internal:8080".into()),
                 DiscoverySource::Srv("_http._tcp.api.internal".into()),
                 DiscoverySource::File("/etc/edgefront/a.json".into()),
+                DiscoverySource::Kubernetes(KubernetesSource {
+                    namespace: "prod".into(),
+                    service: "api".into(),
+                    port: Some("http".into()),
+                    api_server: None,
+                    ca_file: None,
+                    token_file: None,
+                    cert_file: None,
+                    key_file: None,
+                }),
+                DiscoverySource::Kubernetes(KubernetesSource {
+                    namespace: "prod".into(),
+                    service: "web".into(),
+                    port: None,
+                    api_server: Some("https://10.0.0.1:6443".into()),
+                    ca_file: Some("/etc/k8s/ca.crt".into()),
+                    token_file: Some("/etc/k8s/token".into()),
+                    cert_file: None,
+                    key_file: None,
+                }),
             ],
             dns_servers: vec![
                 "10.0.0.53:53".parse().unwrap(),
@@ -1330,7 +1353,7 @@ fn parses_discovery() {
         ),
         (
             r#","discovery":{"sources":[{}]}"#,
-            "clusters[0].discovery.sources[0]: must name exactly one of dns, srv or file",
+            "clusters[0].discovery.sources[0]: must name exactly one of dns, srv, file or kubernetes",
         ),
         (
             r#","discovery":{"sources":[{"dns":"a:1","file":"/x"}]}"#,
@@ -1347,6 +1370,38 @@ fn parses_discovery() {
         (
             r#","discovery":{"sources":[{"srv":"bad name!"}]}"#,
             "clusters[0].discovery.sources[0].srv",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"Prod","service":"api"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.namespace",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"prod"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.service",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"prod","service":"api","port":"HTTP_1"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.port",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"a","service":"b","token_file":"/t"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.token_file: is only used with api_server",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"a","service":"b","api_server":"https://k:6443"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.ca_file: is required with an https:// api_server",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"a","service":"b","api_server":"http://k:8001","token_file":"/t"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.api_server: must be https:// to send a token",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"a","service":"b","api_server":"https://k:6443/x","ca_file":"/c"}}]}"#,
+            "clusters[0].discovery.sources[0].kubernetes.api_server",
+        ),
+        (
+            r#","discovery":{"sources":[{"kubernetes":{"namespace":"a","service":"b","api_server":"https://k:6443","ca_file":"/c","cert_file":"/x"}}]}"#,
+            "cert_file and key_file go together",
         ),
         (
             r#","discovery":{"sources":[{"file":"/x"},{"file":"/x"}]}"#,

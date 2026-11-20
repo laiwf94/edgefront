@@ -10,8 +10,8 @@ use super::raw::{self, RawCluster, RawConfig, RawHttp2, RawTls};
 use super::{
     Acme, AcmeChallenge, Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config,
     ConfigError, Discovery, DiscoverySource, Endpoint, FieldError, HealthCheck, Http2, IpPrefix,
-    Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion, UpstreamProtocol, UpstreamTls,
-    defaults, go, limits,
+    KubernetesSource, Ocsp, OutlierDetection, Policy, Retry, Route, Tls, TlsVersion,
+    UpstreamProtocol, UpstreamTls, defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -665,12 +665,17 @@ impl Validator {
         let mut sources = Vec::new();
         for (i, rs) in raw_sources.iter().enumerate() {
             let at = format!("{path}.sources[{i}]");
-            let set = [!rs.dns.is_empty(), !rs.srv.is_empty(), !rs.file.is_empty()]
-                .iter()
-                .filter(|s| **s)
-                .count();
+            let set = [
+                !rs.dns.is_empty(),
+                !rs.srv.is_empty(),
+                !rs.file.is_empty(),
+                rs.kubernetes.is_some(),
+            ]
+            .iter()
+            .filter(|s| **s)
+            .count();
             if set != 1 {
-                self.add(at, "must name exactly one of dns, srv or file");
+                self.add(at, "must name exactly one of dns, srv, file or kubernetes");
                 continue;
             }
             let source = if !rs.dns.is_empty() {
@@ -689,8 +694,73 @@ impl Validator {
                     );
                 }
                 DiscoverySource::Srv(rs.srv.clone())
-            } else {
+            } else if !rs.file.is_empty() {
                 DiscoverySource::File(rs.file.clone())
+            } else {
+                let k = rs.kubernetes.as_ref().expect("counted above");
+                for (field, value) in [("namespace", &k.namespace), ("service", &k.service)] {
+                    if !valid_dns_label(value) {
+                        self.add(
+                            format!("{at}.kubernetes.{field}"),
+                            "must be a DNS label: 1 to 63 characters from a-z 0-9 -",
+                        );
+                    }
+                }
+                if !k.port.is_empty() && !valid_dns_label(&k.port) {
+                    self.add(
+                        format!("{at}.kubernetes.port"),
+                        "must be a port name: 1 to 63 characters from a-z 0-9 -",
+                    );
+                }
+                let opt = |s: &String| (!s.is_empty()).then(|| s.clone());
+                let https = k.api_server.starts_with("https://");
+                if k.api_server.is_empty() {
+                    for (field, value) in [
+                        ("ca_file", &k.ca_file),
+                        ("token_file", &k.token_file),
+                        ("cert_file", &k.cert_file),
+                        ("key_file", &k.key_file),
+                    ] {
+                        if !value.is_empty() {
+                            self.add(
+                                format!("{at}.kubernetes.{field}"),
+                                "is only used with api_server",
+                            );
+                        }
+                    }
+                } else {
+                    if let Err(e) = check_server_url(&k.api_server) {
+                        self.add(format!("{at}.kubernetes.api_server"), e);
+                    }
+                    if https && k.ca_file.is_empty() {
+                        self.add(
+                            format!("{at}.kubernetes.ca_file"),
+                            "is required with an https:// api_server",
+                        );
+                    }
+                    if !https && !(k.token_file.is_empty() && k.cert_file.is_empty()) {
+                        self.add(
+                            format!("{at}.kubernetes.api_server"),
+                            "must be https:// to send a token or a client certificate",
+                        );
+                    }
+                    if k.cert_file.is_empty() != k.key_file.is_empty() {
+                        self.add(
+                            format!("{at}.kubernetes.cert_file"),
+                            "cert_file and key_file go together",
+                        );
+                    }
+                }
+                DiscoverySource::Kubernetes(KubernetesSource {
+                    namespace: k.namespace.clone(),
+                    service: k.service.clone(),
+                    port: opt(&k.port),
+                    api_server: opt(&k.api_server),
+                    ca_file: opt(&k.ca_file),
+                    token_file: opt(&k.token_file),
+                    cert_file: opt(&k.cert_file),
+                    key_file: opt(&k.key_file),
+                })
             };
             if sources.contains(&source) {
                 self.add(format!("{path}.sources[{i}]"), "is listed twice");
@@ -1168,6 +1238,29 @@ fn valid_srv_name(s: &str) -> bool {
                 && l.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         })
+}
+
+/// A server's URL: `http://` or `https://` and `host:port`, nothing more.
+fn check_server_url(u: &str) -> Result<(), String> {
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .ok_or_else(|| format!("{} must be an http:// or https:// URL", go::quote(u)))?;
+    let rest = rest.trim_end_matches('/');
+    if rest.contains(['/', '@', '?', '#']) || check_endpoint_address(rest).is_err() {
+        return Err(format!("{} must be scheme://host:port", go::quote(u)));
+    }
+    Ok(())
+}
+
+/// A Kubernetes namespace, Service or port name (an RFC 1123 label).
+fn valid_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
 }
 
 fn check_hostname(h: &str) -> Result<(), String> {

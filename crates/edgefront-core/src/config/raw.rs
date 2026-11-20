@@ -327,6 +327,18 @@ raw_struct!(RawDiscoverySource, "an object" {
     dns: String,
     srv: String,
     file: String,
+    kubernetes: Option<RawKubernetes>,
+});
+
+raw_struct!(RawKubernetes, "an object" {
+    namespace: String,
+    service: String,
+    port: String,
+    api_server: String,
+    ca_file: String,
+    token_file: String,
+    cert_file: String,
+    key_file: String,
 });
 
 raw_struct!(RawEndpoint, "an object" {
