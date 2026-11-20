@@ -1,0 +1,21 @@
+# The demo's HTTP limits, attached to the proxy's one route.
+
+# Failed logins: five per account per minute. Only 401 and 403 count, so
+# a user who logs in correctly is never limited, and a guesser is refused
+# after five wrong passwords without the upstream seeing a sixth.
+[[http_limits]]
+name = "login"
+rate = "5/min burst 5"
+key = ["header:x-user"]
+count = [401, 403]
+[http_limits.match]
+path = "/login"
+methods = ["POST"]
+
+# The API: ten requests a second per API key under /api.
+[[http_limits]]
+name = "api"
+rate = "10/s burst 10"
+key = ["path_prefix:/api", "header:x-api-key"]
+[http_limits.match]
+path_prefix = "/api"

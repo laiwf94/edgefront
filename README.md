@@ -134,7 +134,7 @@ steer is fully ported, and `legacy/steer` is deleted. Its history stays reachabl
 
 ## Limiter (port of pacer)
 
-`edgefront-limiter` holds libpacer's algorithms, ported to safe Rust, and pacerd's config. Its only dependency is serde, for the config:
+`edgefront-limiter` holds libpacer's algorithms, ported to safe Rust, and pacerd's config. Built with `default-features = false` its only dependency is serde, for the config; the default `http` feature adds the [HTTP limits](#http-limits) layer for the proxy, on the proxy's own crates:
 
 - `Gcra`: an exact token bucket (the generic cell rate algorithm) whose arrival time is one `AtomicU64` updated by compare-and-swap. `take`, `take_upto`, `take_range`, `refund`, `remaining` and `reconfigure` never lock, and a denied take says exactly how many nanoseconds to wait before it would be admitted. The arrival time counts from a moving epoch, so unlike pacer's it keeps working past 4.5 years of uptime: any `u64` of nanoseconds is a valid time.
 - `clock`: the epoch arithmetic and the clocks that give `now_ns`: `MonotonicClock`, and `ManualClock` for tests and simulations.
@@ -216,6 +216,44 @@ per_ip_conn_rate = "100/s burst 200"
 - **Operation.** `edgefront check edge.toml` and `edgefront limits -c edge.toml -t` report the lists' sizes and memory: a config with a million-prefix deny list prints `address_policy: 2 trusted proxies, 3 classes, 1000002 prefixes, 92517736 bytes`, then a line per class and per list file, in 1.0 s. SIGHUP re-reads the list files and swaps the new lists in without stopping lookups; a bad line refuses the reload and keeps the running policy. Refusals are logged as `conn rejected reason=class_deny class=blocked client=198.51.100.9`, and `edgefront ctl limits stats` adds a line with each verdict's count.
 
 A list of a million prefixes loads and reloads in 0.3 to 0.4 s, and a lookup takes 34 to 35 ns at p99, measured on this Mac (details in [docs/DESIGN.md](docs/DESIGN.md#address-policy)). `crates/edgefront/tests/e2e_address_policy.rs` runs it behind two trusted proxies: deny from a list file, allow, a limited partner class, forged headers, a default client and a reload.
+
+### HTTP limits
+
+`edgefront proxy --config proxy.json --limits limits.toml` limits requests on the proxy's routes by any request field, counting every response or only the statuses you choose, with the standard RateLimit headers. The rules are the `[[http_limits]]` section of a TOML limiter config:
+
+```toml
+# Five failed logins per account a minute: only 401 and 403 count.
+[[http_limits]]
+name = "login"
+rate = "5/min burst 5"                      # a RateSpec token bucket
+key = ["header:x-user"]
+count = [401, 403]                          # codes and classes ("4xx"); default every response
+[http_limits.match]
+path = "/login"
+methods = ["POST"]
+
+# Ten requests a second per API key under /api, held up to 500 ms instead of refused.
+[[http_limits]]
+name = "api"
+routes = [0]                                # proxy routes by index; default all
+rate = "10/s burst 10"
+key = ["path_prefix:/api", "header:x-api-key"]
+action = "delay"                            # block (default), delay or log
+max_delay = "500ms"
+[http_limits.response]                      # the refusal: 429 and a text body by default
+status = 429
+body = "{\"error\":\"rate limited\"}"
+content_type = "application/json"
+```
+
+- **Keys** combine any of `path`, `path_prefix:/p`, `host`, `method`, `header:NAME`, `cookie:NAME` and `query:NAME`. A request missing one of the fields is not limited by that rule. The path is the cleaned one the proxy routed on, so `/./login`, `//login` and `/%6Cogin` are one key, and query values are percent-decoded. A header, cookie or parameter sent twice puts every such request in one shared bucket, so a client cannot pair a fresh value with the one the upstream reads. Keys are built on the stack and hashed past 31 bytes.
+- **Counting on responses.** A rule with `count` takes its token when the request arrives, so concurrent guesses cannot slip through together, and gives it back once the response has a status the list excludes. A password guesser is refused after five failures without the upstream seeing a sixth; a user whose logins succeed is never limited.
+- **Several rules on one request** are checked in order; one that refuses gives back what the earlier ones took.
+- **Headers** (draft-ietf-httpapi-ratelimit-headers-11): `RateLimit-Policy: "login";q=5;w=60` and `RateLimit: "login";r=3;t=11;edgefront-ms=11873` on every response the rules applied to, and `Retry-After` on refusals. `t` is the whole seconds until the next token, rounded down as the draft's effective window must be; `edgefront-ms` is the same wait in milliseconds, rounded up, and `Retry-After` is the refusal's exact wait rounded up, so neither is early. `headers = false` leaves them out.
+- **`edgefront check limits.toml`** builds the rules, naming the field of every mistake, and lints ones that cannot work: a key or path outside the match's `path_prefix` (`http-key-never-matches`), `header:host`, which HTTP/2 requests lack (`http-key-host-header`), a count of the rule's own refusal status (`http-count-own-status`), and `max_delay` without `delay`.
+- The rules are fixed for the life of the process: a SIGHUP reload of a proxy with `--limits` is refused and logged, and the running configuration keeps serving.
+
+`examples/http_limits.sh` runs both rules above against a small upstream and checks every step (CI runs it; `crates/edgefront/tests/e2e_http_limits.rs` runs it against the test build). Measured on this Mac ([docs/benchmarks/http-limits.md](docs/benchmarks/http-limits.md)): limiting adds 0.71 to 0.75 µs at p99 per request in the proxy pipeline, and at 50,000 requests per second over 100,000 paths the limited proxy admitted 900,475 requests where a replay of the schedule through the same rules admits 900,472, in the two runs whose requests arrived on time.
 
 ### Migrating from pacer
 

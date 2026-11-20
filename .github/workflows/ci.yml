@@ -182,6 +182,8 @@ jobs:
         run: examples/limiter_config.sh
       - name: L4 limits demo (pacer's live demo on edgefront limits)
         run: examples/l4_limits.sh
+      - name: HTTP limits demo (edgefront proxy --limits)
+        run: examples/http_limits.sh
 
   # steer's failover drill against edgefront: 100.00% of requests in all
   # four phases with the resilience features on, and every fault showing

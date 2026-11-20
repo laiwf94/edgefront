@@ -1,0 +1,12 @@
+# Two rules that cannot do what they say, for edgefront check.
+[[http_limits]]
+name = "never"
+rate = "1/s"
+key = ["path_prefix:/admin"]
+[http_limits.match]
+path_prefix = "/api"
+
+[[http_limits]]
+name = "own-status"
+rate = "1/s"
+count = ["4xx"]
