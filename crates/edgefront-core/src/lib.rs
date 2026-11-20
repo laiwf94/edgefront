@@ -7,6 +7,8 @@
 //! - [`config`]: the proxy configuration (steer's schema, in JSON or
 //!   TOML), and in [`config::loader`] the TOML loading, validation and
 //!   environment secrets the cache's config builds on;
+//! - [`cluster`]: SWIM membership over HMAC-signed UDP, which the cache's
+//!   tiers and the limiter's cluster build on;
 //! - [`clock`]: monotonic time and timers behind a trait, with a manual
 //!   clock for deterministic tests;
 //! - [`ids`]: request identifiers, and in [`reqid`] steer's rules for
@@ -35,6 +37,7 @@ pub mod acme;
 pub mod admin;
 pub mod body;
 pub mod clock;
+pub mod cluster;
 pub mod config;
 pub mod filter;
 pub mod h2;
