@@ -7,6 +7,7 @@ use http::Request;
 use super::*;
 use crate::clock::ManualClock;
 use crate::config::http_limits::{HttpLimitsSection, build};
+use crate::listener::ListenerLimits;
 
 const SEC: u64 = 1_000_000_000;
 
@@ -530,4 +531,64 @@ async fn a_key_over_its_limit_for_n_windows_is_boxed_then_banned() {
         .unwrap()
         .with_bans(Arc::clone(l.bans()));
     assert!(Arc::ptr_eq(rebuilt.bans(), l.bans()));
+}
+
+#[tokio::test]
+async fn listener_caps_come_before_every_rule_and_route() {
+    let clock = Arc::new(ManualClock::new(SEC));
+    let l = Arc::new(
+        HttpLimiter::new(Vec::new(), clock.clone())
+            .unwrap()
+            .with_listener(
+                ListenerLimits::new(
+                    Some(Rate::new(2, SEC, 2)),
+                    Some(Rate::new(3, SEC, 3)),
+                    Some(10),
+                )
+                .unwrap(),
+            ),
+    );
+    drop(clock);
+    let f = l.route_filters(2).unwrap();
+    assert_eq!(f.filtered(), 2, "every route, though no rule");
+    let up = Upstream::default();
+    for route in [0, 1, 0] {
+        assert_eq!(send(&f, route, &up, "GET", "/", &[]).await.status(), 200);
+    }
+    let r = send(&f, 1, &up, "GET", "/", &[]).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(hv(&r, "retry-after"), "1");
+    assert!(l.admit_connection() && l.admit_connection());
+    assert!(!l.admit_connection(), "the connection rate");
+    assert_eq!(l.listener_refused(), Some([1, 1, 0]));
+    let _ = l;
+}
+
+#[tokio::test]
+async fn requests_in_flight_hold_their_place_until_delivered() {
+    let clock = Arc::new(ManualClock::new(SEC));
+    let l = Arc::new(
+        HttpLimiter::new(Vec::new(), clock)
+            .unwrap()
+            .with_listener(ListenerLimits::new(None, None, Some(1)).unwrap()),
+    );
+    let uri: http::Uri = "/".parse().unwrap();
+    let h = http::HeaderMap::new();
+    let first = l.decide(&[], &Method::GET, &uri, &h).await;
+    let Decision::Forward(Some(x)) = first else {
+        panic!("a settlement holds the place")
+    };
+    let second = l.decide(&[], &Method::GET, &uri, &h).await;
+    assert!(matches!(&second, Decision::Respond(r) if r.status() == 503));
+    drop(x.deliver(Response::new(full("ok")), Delivery::Upstream));
+    assert!(matches!(
+        l.decide(&[], &Method::GET, &uri, &h).await,
+        Decision::Forward(Some(_))
+    ));
+    assert_eq!(
+        HttpLimiter::new(Vec::new(), Arc::new(ManualClock::new(0)))
+            .unwrap()
+            .listener_refused(),
+        None
+    );
 }

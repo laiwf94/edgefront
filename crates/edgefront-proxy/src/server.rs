@@ -175,6 +175,8 @@ pub struct Proxy {
     draining: AtomicBool,
     /// What each client connection may carry ([`Proxy::with_conn_quota`]).
     conn_quota: edgefront_core::listener::ConnQuota,
+    /// Decides each new connection ([`Proxy::with_connection_gate`]).
+    gate: Option<Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>>,
 }
 
 /// One loaded configuration, never changed after it is built (steer's
@@ -637,7 +639,20 @@ impl Proxy {
             reloading: Mutex::new(()),
             draining: AtomicBool::new(false),
             conn_quota: edgefront_core::listener::ConnQuota::default(),
+            gate: None,
         }
+    }
+
+    /// Asks `gate` about each connection the listener accepts, before any
+    /// handshake; a `false` closes it with nothing read. A limiter's
+    /// listener-wide connection rate is such a gate.
+    #[must_use]
+    pub fn with_connection_gate(
+        mut self,
+        gate: Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>,
+    ) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Closes each client connection gracefully once it has carried the
@@ -1456,6 +1471,10 @@ impl Handler for Proxy {
 
     fn conn_quota(&self) -> edgefront_core::listener::ConnQuota {
         self.conn_quota
+    }
+
+    fn admit_connection(&self, peer: SocketAddr) -> bool {
+        self.gate.as_ref().is_none_or(|g| g(peer))
     }
 
     async fn call(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {

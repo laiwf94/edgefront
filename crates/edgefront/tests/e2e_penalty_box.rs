@@ -40,6 +40,7 @@ fn the_penalty_box_demo_passes() {
         "  ok    second offence: banned: 429\n",
         "  ok    Connection: close on the third response: 1\n",
         "  ok    connections opened: 2\n",
+        "  ok    connections served: 3\n",
         "  ok    refused while banned: 0\n",
         "  ok    still refused after the reload: 0\n",
         "  ok    admitted once the ban expired: 1\n",

@@ -48,6 +48,7 @@ use crate::ban::BanList;
 use crate::clock::Clock;
 use crate::cost::{Cost, graphql_cost, header_cost};
 use crate::gcra::{Error, Rate};
+use crate::listener::{InFlight, ListenerLimits, ListenerRefusal};
 use crate::penalty::{PenaltyBox, PenaltyConfig};
 use crate::record::{Outcome, Record, Recorder};
 use crate::shadow::{Mode, Shadow};
@@ -244,6 +245,8 @@ pub struct HttpLimiter {
     bans: Arc<BanList>,
     /// Every decision, when recording.
     recorder: Option<Arc<Recorder>>,
+    /// Caps on the whole listener, checked before any rule.
+    listener: Option<Arc<ListenerLimits>>,
 }
 
 impl fmt::Debug for HttpLimiter {
@@ -276,7 +279,30 @@ impl HttpLimiter {
             clock,
             bans: Arc::new(BanList::new(10_000_000, 1 << 20)),
             recorder: None,
+            listener: None,
         })
+    }
+
+    /// Caps every request on every route with `limits` (request rate and
+    /// requests in flight) before any rule, and gives
+    /// [`HttpLimiter::admit_connection`] its connection rate.
+    #[must_use]
+    pub fn with_listener(mut self, limits: ListenerLimits) -> Self {
+        self.listener = Some(Arc::new(limits));
+        self
+    }
+
+    /// The listener-wide connection rate's verdict on a new connection;
+    /// `true` without listener limits.
+    pub fn admit_connection(&self) -> bool {
+        self.listener
+            .as_ref()
+            .is_none_or(|l| l.connection(self.clock.now_ns()).is_ok())
+    }
+
+    /// The listener-wide refusals: connection rate, request rate, in flight.
+    pub fn listener_refused(&self) -> Option<[u64; 3]> {
+        self.listener.as_ref().map(|l| l.refused())
     }
 
     /// Records every decision of every rule into `recorder`, whose rule
@@ -406,7 +432,7 @@ impl HttpLimiter {
         }
         let mut filters = RouteFilters::new(routes);
         for (route, rules) in per_route.into_iter().enumerate() {
-            if rules.is_empty() {
+            if rules.is_empty() && self.listener.is_none() {
                 continue;
             }
             if rules.len() > MAX_RULES_PER_ROUTE {
@@ -548,6 +574,23 @@ async fn decide(
         path,
     };
     let now = limiter.clock.now_ns();
+    // The listener's caps come first and hold the request's place until
+    // the response is delivered.
+    let mut in_flight = None;
+    if let Some(l) = &limiter.listener {
+        match l.request(now) {
+            Ok(g) => in_flight = Some(g),
+            Err(ListenerRefusal::InFlight) => {
+                return Decision::Respond(listener_refusal(StatusCode::SERVICE_UNAVAILABLE, None));
+            }
+            Err(ListenerRefusal::RequestRate(retry) | ListenerRefusal::ConnRate(retry)) => {
+                return Decision::Respond(listener_refusal(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Some(retry),
+                ));
+            }
+        }
+    }
     let mut charges: Vec<Charge> = Vec::new();
     let mut wait_ns = 0u64;
     for &ri in rules {
@@ -729,13 +772,33 @@ async fn decide(
         let spec = &limiter.rules[c.rule].spec;
         spec.headers || spec.count.is_some() || spec.cost.after_response()
     });
-    if !needed {
+    if !needed && in_flight.is_none() {
         return Decision::Forward(None);
     }
     Decision::Forward(Some(Box::new(Settlement {
         limiter: Arc::clone(limiter),
         charges,
+        _in_flight: in_flight,
     })))
+}
+
+/// The answer to a request the listener's caps refuse.
+fn listener_refusal(status: StatusCode, retry_ns: Option<u64>) -> Response<Body> {
+    let mut resp = Response::new(full(if status == StatusCode::SERVICE_UNAVAILABLE {
+        "too many requests in flight\n"
+    } else {
+        "too many requests\n"
+    }));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Some(r) = retry_ns {
+        resp.headers_mut()
+            .insert(RETRY_AFTER, headers::retry_after(r));
+    }
+    resp
 }
 
 /// The nanoseconds one token takes to refill, rounded up.
@@ -770,6 +833,8 @@ fn refusal(rule: &Rule, retry_ns: u64) -> Response<Body> {
 struct Settlement {
     limiter: Arc<HttpLimiter>,
     charges: Vec<Charge>,
+    /// The request's place in flight, given back when this is dropped.
+    _in_flight: Option<InFlight>,
 }
 
 impl Exchange for Settlement {

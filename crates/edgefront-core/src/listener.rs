@@ -121,6 +121,13 @@ pub trait Handler: Send + Sync + 'static {
     fn conn_quota(&self) -> ConnQuota {
         ConnQuota::default()
     }
+
+    /// Whether to serve a connection just accepted from `peer`; a refused
+    /// one is closed with nothing read, before any handshake. Every
+    /// connection by default.
+    fn admit_connection(&self, _peer: SocketAddr) -> bool {
+        true
+    }
 }
 
 /// What happened while a listener ran.
@@ -191,6 +198,10 @@ async fn run<H: Handler>(
         };
         tokio::select! {
             accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) if !handler.admit_connection(peer) => {
+                    // The handler counts its refusals.
+                    drop((stream, slot));
+                }
                 Ok((stream, peer)) => {
                     report.accepted += 1;
                     let _ = stream.set_nodelay(true);

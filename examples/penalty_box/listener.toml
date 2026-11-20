@@ -1,0 +1,5 @@
+# Listener-wide caps for the demo: three new connections a second for the
+# whole entry point, whoever opens them.
+[listener]
+conn_rate = "3/s burst 3"
+max_in_flight = 100

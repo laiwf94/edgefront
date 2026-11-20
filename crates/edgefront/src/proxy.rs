@@ -16,7 +16,8 @@
 //! as a failed reload and the running configuration keeps serving. The
 //! same file may set `[connection_quota]` (requests and bytes per client
 //! connection, closed with `Connection: close` or GOAWAY) and
-//! `[overload]` (limits scaled down while the host's pressure stall
+//! `[listener]` (connection and request rates and requests in flight for
+//! the whole listener), `[overload]` (limits scaled down while the host's pressure stall
 //! information shows CPU or memory pressure; Linux only) and
 //! `[recording]` (every decision written for `edgefront ctl limits
 //! replay`). The file is watched: a change that only moves rules between
@@ -91,6 +92,7 @@ pub struct Extras {
     pub conn_quota: Option<edgefront_core::listener::ConnQuota>,
     pub overload: Option<edgefront_limiter::overload::OverloadConfig>,
     pub recording: Option<edgefront_limiter::record::RecordConfig>,
+    pub listener: Option<edgefront_limiter::listener::ListenerToml>,
 }
 
 /// The `[connection_quota]` and `[overload]` sections of `path`.
@@ -105,7 +107,13 @@ pub fn extras(path: &str) -> Result<Extras, String> {
     let base = std::path::Path::new(path)
         .parent()
         .unwrap_or(std::path::Path::new("."));
+    let l: edgefront_limiter::listener::ListenerSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    if let Some(t) = &l.listener {
+        t.build().map_err(|e| format!("{path}: {e}"))?;
+    }
     Ok(Extras {
+        listener: l.listener,
         recording: r
             .recording
             .map(|c| c.build(base))
@@ -212,13 +220,14 @@ fn flush_recordings(recorder: Arc<edgefront_limiter::record::Recorder>) {
 /// The HTTP limits in `path`, built and attached to `routes` routes,
 /// recording into `recording` when it is set.
 pub fn limits(path: &str, routes: usize) -> Result<(Arc<HttpLimiter>, RouteFilters), String> {
-    limits_recorded(path, routes, None)
+    limits_recorded(path, routes, None, None)
 }
 
 fn limits_recorded(
     path: &str,
     routes: usize,
     recording: Option<&edgefront_limiter::record::RecordConfig>,
+    listener: Option<&edgefront_limiter::listener::ListenerToml>,
 ) -> Result<(Arc<HttpLimiter>, RouteFilters), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let section: HttpLimitsSection =
@@ -226,6 +235,9 @@ fn limits_recorded(
     let rules = http_limits::build(&section.http_limits).map_err(|e| format!("{path}: {e}"))?;
     let mut limiter = HttpLimiter::new(rules, Arc::new(MonotonicClock::new()))
         .map_err(|e| format!("{path}: {e}"))?;
+    if let Some(t) = listener {
+        limiter = limiter.with_listener(t.build().map_err(|e| format!("{path}: {e}"))?);
+    }
     if let Some(cfg) = recording {
         let rec = edgefront_limiter::record::Recorder::new(cfg.clone(), limiter.rule_names())
             .map_err(|e| format!("{path}: recording in {}: {e}", cfg.dir.display()))?;
@@ -314,12 +326,21 @@ pub fn run(args: &[String]) -> ExitCode {
         let mut recorder: Option<Arc<edgefront_limiter::record::Recorder>> = None;
         if let Some(lp) = limits_path {
             let built = extras(lp).and_then(|x| {
-                let l = limits_recorded(lp, loaded.config.routes.len(), x.recording.as_ref())?;
+                let l = limits_recorded(
+                    lp,
+                    loaded.config.routes.len(),
+                    x.recording.as_ref(),
+                    x.listener.as_ref(),
+                )?;
                 Ok((l, x))
             });
             match built {
                 Ok(((limiter, filters), extras)) => {
                     watch_modes(lp.to_owned(), Arc::clone(&limiter));
+                    if extras.listener.is_some() {
+                        let l = Arc::clone(&limiter);
+                        proxy = proxy.with_connection_gate(Arc::new(move |_| l.admit_connection()));
+                    }
                     if let Some(rec) = limiter.recorder() {
                         flush_recordings(Arc::clone(rec));
                         recorder = Some(Arc::clone(rec));

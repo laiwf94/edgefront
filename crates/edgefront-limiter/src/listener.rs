@@ -25,6 +25,60 @@ pub enum ListenerRefusal {
     InFlight,
 }
 
+/// The `[listener]` section of a limiter config, for `edgefront proxy
+/// --limits`:
+///
+/// ```toml
+/// [listener]
+/// conn_rate = "1000/s burst 2000"    # new connections, RateSpec text
+/// request_rate = "50000/s"           # requests on every route
+/// max_in_flight = 10000              # requests in flight; past it 503
+/// ```
+#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerToml {
+    #[serde(default)]
+    pub conn_rate: Option<String>,
+    #[serde(default)]
+    pub request_rate: Option<String>,
+    #[serde(default)]
+    pub max_in_flight: Option<u64>,
+}
+
+/// A document's `listener` table, ignoring everything else.
+#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+pub struct ListenerSection {
+    #[serde(default)]
+    pub listener: Option<ListenerToml>,
+}
+
+impl ListenerToml {
+    /// The limits, or the mistake as `listener.field: reason`.
+    pub fn build(&self) -> Result<ListenerLimits, String> {
+        let rate = |field: &str, v: &Option<String>| -> Result<Option<Rate>, String> {
+            let Some(t) = v else { return Ok(None) };
+            match crate::rate::RateSpec::parse(t)
+                .map_err(|e| format!("listener.{field}: {e}"))?
+                .plan()
+            {
+                crate::rate::Plan::Bucket(r) => Ok(Some(r)),
+                crate::rate::Plan::Quota { .. } => Err(format!(
+                    "listener.{field}: {t:?} is a quota window; give a rate"
+                )),
+            }
+        };
+        if self.max_in_flight == Some(0) {
+            return Err("listener.max_in_flight: must be at least 1".into());
+        }
+        ListenerLimits::new(
+            rate("conn_rate", &self.conn_rate)?,
+            rate("request_rate", &self.request_rate)?,
+            self.max_in_flight,
+        )
+        .map_err(|e| format!("listener: {e}"))
+    }
+}
+
 /// The listener's caps; any may be absent.
 #[derive(Debug, Default)]
 pub struct ListenerLimits {
@@ -153,6 +207,28 @@ mod tests {
             drop(open.request(0).unwrap());
         }
         assert!(ListenerLimits::new(Some(Rate::new(0, SEC, 1)), None, None).is_err());
+    }
+
+    #[test]
+    fn the_section_builds() {
+        let s: ListenerSection =
+            toml::from_str("[listener]\nconn_rate = \"10/s\"\nmax_in_flight = 5\n").unwrap();
+        let l = s.listener.unwrap().build().unwrap();
+        assert!(l.connection(SEC).is_ok());
+        for (t, want) in [
+            ("[listener]\nmax_in_flight = 0\n", "listener.max_in_flight"),
+            (
+                "[listener]\nrequest_rate = \"x\"\n",
+                "listener.request_rate",
+            ),
+            ("[listener]\nconn_rate = \"10/day\"\n", "is a quota window"),
+        ] {
+            let s: ListenerSection = toml::from_str(t).unwrap();
+            assert!(
+                s.listener.unwrap().build().unwrap_err().contains(want),
+                "{t}"
+            );
+        }
     }
 
     #[test]

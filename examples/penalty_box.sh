@@ -5,7 +5,8 @@
 #
 #   1. a client over its limit two seconds running is boxed, refused
 #      without its limit being looked at, released on time, and banned on
-#      its second offence; connections close after their quota
+#      its second offence; connections close after their quota, and a
+#      listener-wide connection rate caps the whole entry point
 #   2. a ban set through the edgefront limits admin API refuses a client,
 #      survives a reload, and expires on time
 #   3. overload mode under synthetic CPU saturation keeps the good
@@ -102,6 +103,19 @@ for p in a b c d e; do urls+=(-o /dev/null "http://127.0.0.1:$px/$p"); done
 curl -s -D "$work/ka" -H 'x-api-key: ka' -w '%{num_connects}\n' "${urls[@]}" >"$work/connects"
 check "Connection: close on the third response" "$(grep -ci '^connection: close' "$work/ka")" 1
 check "connections opened" "$(awk '{ n += $1 } END { print n }' "$work/connects")" 2
+
+echo
+echo "   a second proxy, capped at 3 new connections a second for the whole listener:"
+kill "$edge_pid" 2>/dev/null || true
+wait "$edge_pid" 2>/dev/null || true
+EDGEFRONT_LOG=info EDGEFRONT_DRAIN_PERIOD=0s "$EDGEFRONT_BIN" proxy --config "$work/proxy.json" \
+    --limits examples/penalty_box/listener.toml >"$work/proxy2.log" 2>&1 &
+edge_pid=$!
+for _ in $(seq 100); do grep -q '"listening"' "$work/proxy2.log" 2>/dev/null && break; sleep 0.1; done
+codes=""
+for _ in $(seq 6); do codes="$codes $(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$px/" || true)"; done
+echo "   six fresh connections:$codes"
+check "connections served" "$(echo "$codes" | tr ' ' '\n' | grep -cx 200)" 3
 
 echo
 echo "2. a ban through the edgefront limits admin API"
