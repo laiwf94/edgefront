@@ -93,6 +93,7 @@ fn layer_overhead(c: &mut Criterion) {
         max_variants: 8,
         heuristic_max: Duration::from_secs(86_400),
         max_ttl: None,
+        slice_bytes: 1 << 20,
     };
     let layer = CacheLayer::new(
         cache,

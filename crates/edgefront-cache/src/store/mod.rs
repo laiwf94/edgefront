@@ -213,9 +213,30 @@ impl Cache {
         true
     }
 
+    /// Whether either tier holds `key`, without reading it.
+    pub fn contains(&self, key: &str) -> bool {
+        self.memory.peek(key).is_some() || self.disk.as_ref().is_some_and(|d| d.contains(key))
+    }
+
     /// Removes everything the targets name from both tiers and returns how
-    /// many URLs went.
+    /// many URLs went. Purging a URL also purges the slices of a large
+    /// object stored under it ([`crate::slice`]).
     pub async fn purge(&self, targets: &[PurgeTarget]) -> usize {
+        let mut expanded = targets.to_vec();
+        for target in targets {
+            if let PurgeTarget::Key(key) = target {
+                expanded.push(PurgeTarget::Tag(crate::slice::slice_tag(key).into()));
+            }
+        }
+        let slices = expanded.split_off(targets.len());
+        let removed = self.purge_targets(targets).await;
+        if !slices.is_empty() {
+            self.purge_targets(&slices).await;
+        }
+        removed
+    }
+
+    async fn purge_targets(&self, targets: &[PurgeTarget]) -> usize {
         self.log.record(targets);
         let mut removed = 0;
         for target in targets {

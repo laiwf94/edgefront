@@ -394,7 +394,7 @@ Pull requests that touch the crates run the regression gate (`bench/gates.toml`,
 
 ## Where it stops
 
-HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are kept in memory up to the per-object limit (8 MiB by default), and a fill over 64 KiB streams to every waiting client as it arrives; larger responses stream through uncached. Up to 16 byte ranges are served per request, as one range or as `multipart/byteranges`. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#what-it-does-not-do-well) for the full list.
+HTTP/1.1 only; no TLS, HTTP/2 or HTTP/3, and plain HTTP to origins and peers. Objects are kept in memory up to the per-object limit (8 MiB by default), and a fill over 64 KiB streams to every waiting client as it arrives. Larger responses are cached as 1 MiB slices (`slice_bytes`), served whole or by range from them, and missing slices are fetched with `Range`. Up to 16 byte ranges are served per request, as one range or as `multipart/byteranges`. Purge propagation costs O(N²) messages for N nodes, which suits tens of nodes, and a peer that is down for longer than the ten-minute window misses the purge. Queued purge deliveries are lost on shutdown. See [docs/DESIGN.md](docs/DESIGN.md#what-it-does-not-do-well) for the full list.
 
 ## Checking a change
 

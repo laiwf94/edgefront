@@ -20,4 +20,5 @@ pub mod policy;
 pub mod purge;
 pub mod range;
 pub mod respond;
+pub mod slice;
 pub mod store;

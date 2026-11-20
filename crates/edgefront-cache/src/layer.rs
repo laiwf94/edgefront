@@ -66,6 +66,7 @@ use crate::object::{CachedObject, Key, SURROGATE_KEY, primary_key};
 use crate::policy::{self, Exchange as Exchanged, Freshness, NotStorable, Use};
 use crate::purge::PurgeTarget;
 use crate::respond;
+use crate::slice::{self, Layout, Progress, SLICES, Slicer};
 use crate::store::Cache;
 
 /// Wall-clock time, replaceable in tests.
@@ -255,6 +256,12 @@ enum Fetched {
         head: Arc<CachedObject>,
         fill: Arc<Filling>,
     },
+    /// A large object being stored as slices: its manifest and the fill's
+    /// progress, which followers read from.
+    Sliced {
+        head: Arc<CachedObject>,
+        progress: Arc<Progress>,
+    },
     /// A response only the leader could use: not storable, or too large.
     Single(StatusCode),
     /// No usable upstream response.
@@ -336,7 +343,158 @@ impl Filter for CacheLayer {
     }
 }
 
+/// The byte range a request asks of a sliced object of `total` bytes: the
+/// status, the first and the last byte. `Err` is the 416 to send.
+fn slice_range(
+    headers: &HeaderMap,
+    etag: Option<&crate::headers::EntityTag>,
+    total: u64,
+) -> Result<(StatusCode, u64, u64), Box<Response<Body>>> {
+    let whole = Ok((StatusCode::OK, 0, total.saturating_sub(1)));
+    let Some(range) = headers.get(header::RANGE) else {
+        return whole;
+    };
+    // If-Range: only the stored entity tag, compared strongly.
+    if let Some(cond) = headers.get(header::IF_RANGE) {
+        let holds = crate::headers::EntityTag::parse(cond.as_bytes())
+            .is_some_and(|t| etag.is_some_and(|e| e.strong_eq(&t)));
+        if !holds {
+            return whole;
+        }
+    }
+    match crate::range::parse(range.as_bytes(), total) {
+        crate::range::ByteRange::Satisfiable { start, end } => {
+            Ok((StatusCode::PARTIAL_CONTENT, start, end))
+        }
+        crate::range::ByteRange::Unsatisfiable => {
+            let mut resp = Response::new(edgefront_core::body::empty());
+            *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                resp.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            resp.headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(0));
+            Err(Box::new(resp))
+        }
+        // Several ranges of a sliced object are answered with the whole.
+        _ => whole,
+    }
+}
+
+/// A response for bytes `start..=end` of the sliced object `head` with
+/// `body`, or no body for HEAD.
+fn sliced_response(
+    head: &CachedObject,
+    status: StatusCode,
+    start: u64,
+    end: u64,
+    total: u64,
+    body: Option<Body>,
+    now: SystemTime,
+) -> Response<Body> {
+    let mut headers = head.headers.clone();
+    headers.remove(&SLICES);
+    headers.remove(SURROGATE_KEY);
+    headers.insert(
+        header::AGE,
+        HeaderValue::from(head.freshness.current_age(now).as_secs()),
+    );
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    let len = if total == 0 { 0 } else { end - start + 1 };
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if status == StatusCode::PARTIAL_CONTENT
+        && let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+    {
+        headers.insert(header::CONTENT_RANGE, v);
+    }
+    let mut resp = Response::new(body.unwrap_or_else(edgefront_core::body::empty));
+    *resp.status_mut() = status;
+    *resp.headers_mut() = headers;
+    resp
+}
+
 impl Shared {
+    /// Answers a request for the sliced object `obj` from its slices, or
+    /// says what to fetch: `Err(Some(range))` the slices a range needs,
+    /// `Err(None)` the whole object, when some are no longer held.
+    fn sliced_hit(
+        &self,
+        obj: &Arc<CachedObject>,
+        layout: Layout,
+        method: &Method,
+        req: &HeaderMap,
+        key: &Key,
+        now: SystemTime,
+    ) -> Result<Response<Body>, Option<HeaderValue>> {
+        // Preconditions first, from the manifest's headers.
+        let pre = respond::from_cache(obj, &Method::HEAD, req, now);
+        if matches!(
+            pre.status(),
+            StatusCode::NOT_MODIFIED | StatusCode::PRECONDITION_FAILED
+        ) {
+            let mut resp = pre;
+            resp.headers_mut().remove(&SLICES);
+            self.mark(
+                &mut resp,
+                &format!("hit; ttl={}", obj.freshness.ttl_secs(now)),
+                Outcome::Hit,
+            );
+            return Ok(resp);
+        }
+        let ranged = if *method == Method::GET {
+            slice_range(req, obj.etag.as_ref(), layout.total)
+        } else {
+            Ok((StatusCode::OK, 0, layout.total.saturating_sub(1)))
+        };
+        let (status, start, end) = match ranged {
+            Ok(r) => r,
+            Err(mut resp) => {
+                self.mark(
+                    &mut resp,
+                    &format!("hit; ttl={}", obj.freshness.ttl_secs(now)),
+                    Outcome::Hit,
+                );
+                return Ok(*resp);
+            }
+        };
+        if layout.total > 0 {
+            let needed = layout.covering(start, end);
+            let missing = needed
+                .clone()
+                .find(|i| !self.cache.contains(&slice::slice_key(key, *i)));
+            if let Some(first) = missing {
+                if status == StatusCode::OK {
+                    return Err(None);
+                }
+                let last = *needed.end();
+                let to = (layout.start_of(last) + layout.len_of(last)) - 1;
+                let range =
+                    HeaderValue::from_str(&format!("bytes={}-{to}", layout.start_of(first)))
+                        .expect("ASCII digits");
+                return Err(Some(range));
+            }
+        }
+        let body = (*method == Method::GET && layout.total > 0).then(|| {
+            slice::read(
+                self.cache.clone(),
+                key.clone(),
+                layout,
+                start,
+                end,
+                obj.etag.clone(),
+                None,
+            )
+            .boxed()
+        });
+        let mut resp = sliced_response(obj, status, start, end, layout.total, body, now);
+        self.mark(
+            &mut resp,
+            &format!("hit; ttl={}", obj.freshness.ttl_secs(now)),
+            Outcome::Hit,
+        );
+        Ok(resp)
+    }
+
     /// Sets the response's `Cache-Status` and [`Outcome`].
     fn mark(&self, resp: &mut Response<Body>, detail: &str, outcome: Outcome) {
         let value = HeaderValue::from_str(&format!("{}; {detail}", self.name))
@@ -376,7 +534,23 @@ impl Shared {
             return self.pass(key, &req, "fwd=request");
         }
         let now = self.clock.now();
-        let stored = self.cache.lookup(&key, req.headers).await;
+        let mut stored = self.cache.lookup(&key, req.headers).await;
+        // A large object stored as slices: served from them, or the slices
+        // it lacks fetched with Range. A stale manifest is not revalidated
+        // but fetched again.
+        let mut slice_fetch: Option<(Arc<CachedObject>, Option<HeaderValue>)> = None;
+        if let Some(obj) = stored.clone()
+            && let Some(layout) = Layout::of(&obj)
+        {
+            let usable = policy::decide(&obj.freshness, &obj.cc, &req_cc, now);
+            if matches!(usable, Use::Fresh | Use::StaleAccepted) {
+                match self.sliced_hit(&obj, layout, method, req.headers, &key, now) {
+                    Ok(resp) => return Decision::Respond(resp),
+                    Err(range) => slice_fetch = Some((obj, range)),
+                }
+            }
+            stored = None;
+        }
         let usable = stored
             .as_ref()
             .map(|obj| (obj, policy::decide(&obj.freshness, &obj.cc, &req_cc, now)));
@@ -421,6 +595,9 @@ impl Shared {
                 req.headers.insert(name, value);
             }
         }
+        if let Some((_, Some(range))) = &slice_fetch {
+            req.headers.insert(header::RANGE, range.clone());
+        }
         let forwarded = req.headers.clone();
         let fill = |lead| {
             Box::new(Fill {
@@ -439,6 +616,7 @@ impl Shared {
                 outcome: Outcome::Miss,
                 failure: None,
                 lead,
+                manifest: slice_fetch.as_ref().map(|(obj, _)| obj.clone()),
             })
         };
         if let Some((obj, Use::StaleWhileRevalidate)) = usable {
@@ -471,6 +649,7 @@ impl Shared {
             self.observer.collapsed();
             let follower = Follower {
                 shared: self,
+                key: &key,
                 client_headers: &client_headers,
                 req_cc: &req_cc,
                 stored: stored.as_ref(),
@@ -547,6 +726,7 @@ impl Shared {
 /// A request that waited for another one's fill.
 struct Follower<'a> {
     shared: &'a Shared,
+    key: &'a Key,
     client_headers: &'a HeaderMap,
     req_cc: &'a CacheControl,
     stored: Option<&'a Arc<CachedObject>>,
@@ -587,6 +767,46 @@ impl Follower<'_> {
                         detail: detail.to_string(),
                     },
                 }
+            }
+            Fetched::Sliced { head, progress } => {
+                let others = CLIENT_CONDITIONALS
+                    .iter()
+                    .filter(|n| **n != header::RANGE && **n != header::IF_RANGE)
+                    .any(|n| self.client_headers.contains_key(n));
+                if others || !head.matches(self.client_headers) {
+                    return None;
+                }
+                let now = self.shared.clock.now();
+                let layout = progress.layout;
+                let mut resp =
+                    match slice_range(self.client_headers, head.etag.as_ref(), layout.total) {
+                        Err(resp) => *resp,
+                        Ok((status, start, end)) => {
+                            if !progress.covers(start, end) {
+                                return None;
+                            }
+                            let body = (layout.total > 0).then(|| {
+                                slice::read(
+                                    self.shared.cache.clone(),
+                                    self.key.clone(),
+                                    layout,
+                                    start,
+                                    end,
+                                    head.etag.clone(),
+                                    Some(progress.clone()),
+                                )
+                                .boxed()
+                            });
+                            sliced_response(&head, status, start, end, layout.total, body, now)
+                        }
+                    };
+                let status = format!(
+                    "{}; fwd-status=200; stored; collapsed; ttl={}",
+                    self.fwd,
+                    head.freshness.ttl_secs(now)
+                );
+                self.shared.mark(&mut resp, &status, Outcome::Miss);
+                return Some(resp);
             }
             other => other,
         };
@@ -636,7 +856,10 @@ impl Follower<'_> {
                 format!("{fwd}; collapsed; detail={detail}"),
                 Outcome::Error,
             ),
-            Fetched::Object { .. } | Fetched::Single(_) | Fetched::Streaming { .. } => return None,
+            Fetched::Object { .. }
+            | Fetched::Single(_)
+            | Fetched::Streaming { .. }
+            | Fetched::Sliced { .. } => return None,
         };
         self.shared.mark(&mut resp, &status, outcome);
         Some(resp)
@@ -718,6 +941,8 @@ struct Fill {
     failure: Option<String>,
     /// The flight this fill leads, if followers wait on it.
     lead: Option<Lead<Fetched>>,
+    /// The manifest whose missing slices this fill fetches, if it does.
+    manifest: Option<Arc<CachedObject>>,
 }
 
 impl Fill {
@@ -835,6 +1060,12 @@ impl Fill {
         {
             return self.not_modified(&stored, &parts);
         }
+        if parts.status == StatusCode::PARTIAL_CONTENT
+            && self.policy.slice_bytes > 0
+            && let Some(manifest) = self.manifest.clone()
+        {
+            return self.slice_range_fill(parts, body, &manifest).await;
+        }
         if is_error_status(parts.status) {
             self.failure = Some(format!("fwd-status={}", parts.status.as_u16()));
         }
@@ -868,6 +1099,17 @@ impl Fill {
             .headers
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+        if let Some(total) = declared
+            && total > limit as u64
+            && self.policy.slice_bytes > 0
+            && parts.status == StatusCode::OK
+        {
+            let layout = Layout {
+                slice_bytes: self.policy.slice_bytes,
+                total,
+            };
+            return self.slice_fill(parts, body, layout, 0, total - 1);
+        }
         if declared.is_some_and(|n| n > limit as u64) {
             self.shared.observer.streamed_uncached();
             return self.through(parts, body);
@@ -1002,6 +1244,219 @@ impl Fill {
         });
         Upstream::Respond(resp)
     }
+}
+
+impl Fill {
+    /// A `206` to the aligned Range this fill sent for slices a manifest
+    /// lacked. Its entity tag and length are checked against the manifest:
+    /// a different object at the origin drops the old manifest and slices
+    /// first. Anything unusable goes to the client as it is.
+    async fn slice_range_fill(
+        &mut self,
+        parts: http::response::Parts,
+        body: Body,
+        manifest: &CachedObject,
+    ) -> Upstream {
+        let Some(old) = Layout::of(manifest) else {
+            return self.through(parts, body);
+        };
+        let range = parts
+            .headers
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range);
+        let Some((first_byte, last_byte, total)) = range else {
+            return self.through(parts, body);
+        };
+        let etag = crate::headers::EntityTag::from_header(&parts.headers);
+        let same = total == old.total
+            && match (&etag, &manifest.etag) {
+                (Some(a), Some(b)) => a.strong_eq(b),
+                _ => false,
+            };
+        let layout = if same {
+            old
+        } else {
+            // The origin's object changed: none of the old slices may be
+            // mixed with these.
+            self.shared
+                .cache
+                .purge(&[PurgeTarget::Key(self.key.clone())])
+                .await;
+            Layout {
+                slice_bytes: self.policy.slice_bytes,
+                total,
+            }
+        };
+        if first_byte % layout.slice_bytes != 0 || last_byte >= total {
+            return self.through(parts, body);
+        }
+        self.slice_fill(
+            parts,
+            body,
+            layout,
+            first_byte / layout.slice_bytes,
+            last_byte,
+        )
+    }
+
+    /// Stores the response's bytes from slice `first` to byte `last_byte`
+    /// as slices while every client reads them, then the manifest.
+    fn slice_fill(
+        &mut self,
+        mut parts: http::response::Parts,
+        body: Body,
+        layout: Layout,
+        first: u64,
+        last_byte: u64,
+    ) -> Upstream {
+        let upstream_status = parts.status.as_u16();
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::CONTENT_RANGE);
+        let cc = CacheControl::from_headers(&parts.headers);
+        let freshness = self.freshness(StatusCode::OK, &parts.headers, &cc);
+        let mut manifest_headers = parts.headers.clone();
+        manifest_headers.insert(SLICES, layout.header());
+        let head = Arc::new(CachedObject::new(
+            StatusCode::OK,
+            manifest_headers,
+            Bytes::new(),
+            freshness,
+            &self.client_headers,
+        ));
+        let progress = Progress::new(layout, first, last_byte);
+        let now = self.shared.clock.now();
+        let resp = match slice_range(&self.client_headers, head.etag.as_ref(), layout.total) {
+            Err(resp) => *resp,
+            Ok((status, start, end)) if progress.covers(start, end) || layout.total == 0 => {
+                let body = (layout.total > 0).then(|| {
+                    slice::read(
+                        self.shared.cache.clone(),
+                        self.key.clone(),
+                        layout,
+                        start,
+                        end,
+                        head.etag.clone(),
+                        Some(progress.clone()),
+                    )
+                    .boxed()
+                });
+                sliced_response(&head, status, start, end, layout.total, body, now)
+            }
+            // Bytes this fill does not fetch: the slices it covers are still
+            // stored, and the client is answered from what the origin sent.
+            Ok(_) => {
+                let resp = text(StatusCode::BAD_GATEWAY, "origin response invalid\n");
+                return self.failed_with(resp, "range");
+            }
+        };
+        self.status = format!(
+            "{}; fwd-status={upstream_status}; stored; ttl={}",
+            self.fwd,
+            head.freshness.ttl_secs(now)
+        );
+        self.outcome = Outcome::Miss;
+        let held = self.lead.take().map(|lead| {
+            lead.publish_held(Fetched::Sliced {
+                head: head.clone(),
+                progress: progress.clone(),
+            })
+        });
+        let shared = self.shared.clone();
+        let key = self.key.clone();
+        let client_headers = self.client_headers.clone();
+        let (epoch, max_variants) = (self.epoch, self.policy.max_variants);
+        let slice_headers = slice::slice_headers(&parts.headers, &key);
+        tokio::spawn(async move {
+            let store_slice = |index: u64, bytes: Bytes| {
+                let obj = Arc::new(CachedObject::new(
+                    StatusCode::OK,
+                    slice_headers.clone(),
+                    bytes,
+                    freshness,
+                    &HeaderMap::new(),
+                ));
+                shared.cache.store_limited(
+                    slice::slice_key(&key, index),
+                    obj,
+                    &HeaderMap::new(),
+                    epoch,
+                    1,
+                );
+            };
+            let expected = last_byte + 1 - layout.start_of(first);
+            let feed = async {
+                let mut body = body;
+                let mut slicer = Slicer::new(layout.slice_bytes);
+                let mut index = first;
+                let mut got = 0u64;
+                let mut fill = Filling::new(Some(layout.len_of(index)));
+                progress.begin(index, fill.clone());
+                while let Some(frame) = body.frame().await {
+                    let Ok(frame) = frame else {
+                        return Err("protocol");
+                    };
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
+                    got += data.len() as u64;
+                    if got > expected {
+                        return Err("protocol");
+                    }
+                    for (part, done) in slicer.push(data) {
+                        fill.push(part);
+                        if !done.is_empty() {
+                            fill.finish(None);
+                            store_slice(index, done);
+                            progress.stored(index);
+                            index += 1;
+                            if layout.start_of(index) <= last_byte {
+                                fill = Filling::new(Some(layout.len_of(index)));
+                                progress.begin(index, fill.clone());
+                            }
+                        }
+                    }
+                }
+                if got != expected {
+                    return Err("protocol");
+                }
+                if let Some(rest) = slicer.finish() {
+                    fill.finish(None);
+                    store_slice(index, rest);
+                    progress.stored(index);
+                }
+                Ok(())
+            };
+            match tokio::time::timeout(shared.body_timeout, feed).await {
+                Ok(Ok(())) => {
+                    shared
+                        .cache
+                        .store_limited(key, head, &client_headers, epoch, max_variants);
+                    progress.end(End::Complete(None));
+                }
+                Ok(Err(why)) => progress.end(End::Aborted(why.into())),
+                Err(_) => progress.end(End::Aborted("timeout".into())),
+            }
+            drop(held);
+        });
+        Upstream::Respond(resp)
+    }
+
+    fn failed_with(&mut self, resp: Response<Body>, detail: &str) -> Upstream {
+        self.failure = Some(format!("detail-origin={detail}"));
+        self.status = format!("{}; detail={detail}", self.fwd);
+        self.outcome = Outcome::Error;
+        Upstream::Respond(resp)
+    }
+}
+
+/// Parses `bytes <first>-<last>/<total>`.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (a, b) = range.split_once('-')?;
+    let (a, b, total) = (a.parse().ok()?, b.parse().ok()?, total.parse().ok()?);
+    (a <= b && b < total).then_some((a, b, total))
 }
 
 impl Exchange for Fill {

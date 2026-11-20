@@ -15,7 +15,8 @@ url = "http://127.0.0.1:9100"
 
 [cache]
 memory_bytes = 268435456      # 256 MiB
-max_object_bytes = 8388608    # 8 MiB; larger responses stream through uncached
+max_object_bytes = 8388608    # 8 MiB; larger responses are cached as slices
+slice_bytes = 1048576         # 1 MiB slices (at most half of max_object_bytes); 0 streams larger responses through uncached
 shards = 16
 max_variants = 8              # stored variants per URL when the origin sends Vary
 heuristic_max_secs = 86400    # cap on freshness guessed from Last-Modified

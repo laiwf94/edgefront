@@ -52,6 +52,9 @@ pub struct ProxySettings {
     pub body_timeout: Duration,
     /// Cap on heuristic freshness.
     pub heuristic_max: Duration,
+    /// Slice size for responses over the object limit; 0 to stream them
+    /// through uncached.
+    pub slice_bytes: u64,
 }
 
 impl Default for ProxySettings {
@@ -62,6 +65,7 @@ impl Default for ProxySettings {
             max_request_body: 10 << 20,
             body_timeout: Duration::from_secs(30),
             heuristic_max: Duration::from_secs(86_400),
+            slice_bytes: edgefront_cache::slice::DEFAULT_SLICE_BYTES,
         }
     }
 }
@@ -103,6 +107,10 @@ impl Proxy {
             max_variants: usize::MAX,
             heuristic_max: settings.heuristic_max,
             max_ttl: None,
+            slice_bytes: edgefront_cache::slice::effective(
+                settings.slice_bytes,
+                cache.memory().max_object_bytes() as u64,
+            ),
         };
         let layer = CacheLayer::with_observer(
             cache.clone(),

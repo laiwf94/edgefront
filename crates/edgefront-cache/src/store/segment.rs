@@ -601,6 +601,11 @@ impl SegmentStore {
         fs::rename(&temp, self.dir.join(index::SNAPSHOT))
     }
 
+    /// Whether `key` is indexed.
+    pub fn contains(&self, key: &str) -> bool {
+        self.lock().map.contains_key(key)
+    }
+
     /// Bytes of live records.
     pub fn bytes(&self) -> u64 {
         self.lock().live

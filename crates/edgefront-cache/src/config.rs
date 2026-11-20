@@ -125,6 +125,11 @@ pub struct CacheConfig {
     /// Cap on any stored response's freshness lifetime, inherited by every
     /// route; `None` leaves the origin's lifetime as it is.
     pub max_ttl_secs: Option<u64>,
+    /// Responses over `max_object_bytes` are cached as slices of this many
+    /// bytes, at most half of `max_object_bytes`, and not at all when that
+    /// leaves less than 64 KiB ([`crate::slice::effective`]); 0 streams them
+    /// through uncached.
+    pub slice_bytes: u64,
     pub disk: Option<DiskConfig>,
     /// The routes the cache serves, each with its overrides.
     pub routes: Vec<RouteCacheConfig>,
@@ -139,6 +144,7 @@ impl Default for CacheConfig {
             max_variants: 8,
             heuristic_max_secs: 86_400,
             max_ttl_secs: None,
+            slice_bytes: crate::slice::DEFAULT_SLICE_BYTES,
             disk: None,
             routes: Vec::new(),
         }
@@ -169,6 +175,8 @@ pub struct RouteCacheConfig {
     pub heuristic_max_secs: Option<u64>,
     #[serde(default)]
     pub max_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub slice_bytes: Option<u64>,
 }
 
 /// What the cache does on one route, with the global values filled in.
@@ -183,6 +191,9 @@ pub struct RoutePolicy {
     pub heuristic_max: Duration,
     /// Cap on any stored response's freshness lifetime.
     pub max_ttl: Option<Duration>,
+    /// Slice size for responses over `max_object_bytes`; 0 streams them
+    /// through uncached.
+    pub slice_bytes: u64,
 }
 
 /// The effective cache policy of every proxy route, in the routes' order.
@@ -301,6 +312,11 @@ impl CacheConfig {
             if let Some(v) = r.max_ttl_secs {
                 errs.range(&at("max_ttl_secs"), v, 1, MAX_TTL_SECS);
             }
+            if let Some(v) = r.slice_bytes
+                && v != 0
+            {
+                errs.range(&at("slice_bytes"), v, 64 << 10, 1 << 40);
+            }
             let key = (r.host.to_ascii_lowercase(), r.path_prefix.as_str());
             if let Some(first) = seen.insert(key, i) {
                 errs.push(
@@ -357,6 +373,11 @@ impl CacheConfig {
             max_variants: entry.max_variants.unwrap_or(self.max_variants),
             heuristic_max: max_ttl.map_or(heuristic, |cap| heuristic.min(cap)),
             max_ttl,
+            // A slice is stored like any object, so it must fit as one.
+            slice_bytes: crate::slice::effective(
+                entry.slice_bytes.unwrap_or(self.slice_bytes),
+                entry.max_object_bytes.unwrap_or(self.max_object_bytes),
+            ),
         }
     }
 }
@@ -526,6 +547,9 @@ impl Config {
         }
         if c.max_object_bytes == 0 || c.max_object_bytes > c.memory_bytes / c.shards as u64 {
             return Err("cache.max_object_bytes must be positive and fit in one shard (memory_bytes / shards)".into());
+        }
+        if c.slice_bytes != 0 && c.slice_bytes < 64 << 10 {
+            return Err("cache.slice_bytes must be 0 or at least 64 KiB".into());
         }
         if !(1..=64).contains(&c.max_variants) {
             return Err("cache.max_variants must be between 1 and 64".into());
@@ -843,6 +867,7 @@ mod tests {
                 max_variants: 4,
                 heuristic_max: Duration::from_secs(600),
                 max_ttl: Some(Duration::from_secs(3600)),
+                slice_bytes: 512 << 10,
             })
         );
         // The heuristic cap never outlasts the route's own lifetime cap.
@@ -853,6 +878,7 @@ mod tests {
                 max_variants: 2,
                 heuristic_max: Duration::from_secs(60),
                 max_ttl: Some(Duration::from_secs(60)),
+                slice_bytes: 128 << 10,
             })
         );
         // Disabled, without an entry, and out of range all bypass.
@@ -884,6 +910,7 @@ mod tests {
                 max_variants: 8,
                 heuristic_max: Duration::from_secs(86_400),
                 max_ttl: None,
+                slice_bytes: 1 << 20,
             })
         );
     }
@@ -968,6 +995,7 @@ mod tests {
                     max_variants: None,
                     heuristic_max_secs: None,
                     max_ttl_secs: None,
+                    slice_bytes: None,
                 })
                 .collect(),
             ..CacheConfig::default()
