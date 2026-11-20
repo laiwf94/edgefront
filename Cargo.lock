@@ -424,6 +424,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",

@@ -22,3 +22,4 @@ pub mod range;
 pub mod respond;
 pub mod slice;
 pub mod store;
+pub mod tier;
