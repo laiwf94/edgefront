@@ -746,9 +746,16 @@ Without tiers every node fetches from the origin on its own, so ten nodes send u
 
 **Shields** (`tier::shield`). `[[tier.shields]]` names, per host and path prefix, the nodes misses go to before the origin. The most specific route wins. Within a route's shields, each key goes to its rendezvous owner among those alive, so all of the edge's misses for one key reach one shield, which collapses them into one origin request. A shield never sends a miss to another shield, and the edge nodes' owners are chosen among the nodes that are not shields. A miss therefore takes at most edge, owner, shield, origin. With ten edges and a shield, a cold object asked of every edge at once, ten times each, reached the origin once (`tests/tier.rs`).
 
-**Hot keys** (`tier::hot`). Each node counts its requests in a count-min sketch, 4 rows of 4,096 counters, all halved every second, so a key's count settles near twice its rate. A key whose count reaches twice `hot_rate` (50 a second by default) is hot on that node. The node then keeps the owner's response for it instead of passing it on, and serves it locally from then on. When the count falls below half the threshold the key is demoted, and the node drops its copy unless it owns the key. In `tests/tier.rs`, with the top 100 keys requested on all ten nodes, every node promoted all 100. A further request for each of them on every node then made no peer hop at all. Once they cooled, every copy on a node that did not own its key was gone.
+**Hot keys** (`tier::hot`). Each node counts its requests in a count-min sketch, 4 rows of 4,096 counters, all halved every second, so a key's count settles near twice its rate. A key whose count reaches twice `hot_rate` (50 a second by default) is hot on that node. Since every node forwards its misses for a key to the owner, the owner sees the key's whole cluster rate. Hot keys are replicated in two ways:
 
-The issue asked for hot keys "replicated to 3 nodes" and for the top 100 keys to make no peer hops. With clients spread over every node, those two goals conflict: a key kept on 3 of 10 nodes still needs a hop from the other 7. Hot keys are therefore kept by every node that sees them hot, which is what takes the hops to zero, and the hot set per node is bounded (1,024 keys) instead.
+- The owner of a key that gets hot has its two runners-up, the next nodes in the key's rendezvous order, fetch it from the owner and keep it. The hop header's `replica` tier tells them to. That makes 3 replicas whatever traffic each node sees, and the first runner-up is the key's next owner, so it has the key if the owner leaves.
+- Any other node that sees the key hot keeps the owner's response for it instead of passing it on, and serves it locally.
+
+Together, a hot key makes no peer hop from any node that asks for it often. When a node's count for a key falls below half the threshold, the key is demoted there. The node drops its copy unless it is one of the key's 3 replicas, and the hot set per node is bounded at 1,024 keys.
+
+`tests/tier.rs` checks both:
+- With the top 100 keys requested on all ten nodes, every node promoted all 100, and a further request for each on every node made no peer hop. Once they cooled, exactly the 300 replica copies were left.
+- A key asked only of its owner was pushed to its two runners-up, which fetched it from the owner, not the origin.
 
 **Offload.** On a Zipf 1.0 trace of 40,000 requests for 1,000 keys, spread over ten nodes, ten nodes without tiers sent 6,907 requests to the origin (82.7% offload). Ten tiered nodes sent 1,000, one per key (97.5%), the same as one node that saw every request.
 

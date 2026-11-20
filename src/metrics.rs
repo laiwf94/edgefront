@@ -97,6 +97,11 @@ pub fn render_tier(tier: &edgefront_cache::tier::Tier) -> String {
             "Hot keys that cooled down on this node.",
             TierStats::get(&s.hot_demoted),
         ),
+        (
+            "cachet_tier_replicas_sent_total",
+            "Hot keys this node owns pushed to a runner-up.",
+            TierStats::get(&s.replicas_sent),
+        ),
     ] {
         counter(&mut out, name, help, value);
     }

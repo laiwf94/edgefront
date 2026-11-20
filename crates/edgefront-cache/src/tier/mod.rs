@@ -6,7 +6,9 @@
 //! - [`shield`]: per route, the upper-tier nodes misses go to instead of the
 //!   origin;
 //! - [`hot`]: a count-min sketch of this node's requests, so a key requested
-//!   often enough is kept here instead of fetched from its owner each time.
+//!   often enough is kept here instead of fetched from its owner each time,
+//!   and an owner that sees one of its keys get hot has its two runners-up
+//!   fetch and keep it too ([`REPLICAS`] in all).
 
 pub mod hot;
 pub mod owner;
@@ -27,6 +29,10 @@ use hot::{Change, HotKeys};
 use owner::{Node, Owners};
 use peer::{Hop, Tier as HopTier};
 use shield::Shields;
+
+/// The nodes that hold a hot key whatever traffic they see: its owner and
+/// its runners-up, which take it over if the owner leaves.
+pub const REPLICAS: usize = 3;
 
 /// A response extension: fetched from the key's owner for a key that is not
 /// hot here, so this node passes it on without storing it.
@@ -122,6 +128,8 @@ pub struct TierStats {
     pub fallbacks: AtomicU64,
     pub hot_promoted: AtomicU64,
     pub hot_demoted: AtomicU64,
+    /// Hot keys this node owns pushed to a runner-up.
+    pub replicas_sent: AtomicU64,
 }
 
 impl TierStats {
@@ -181,19 +189,45 @@ impl Tier {
                 .is_none_or(|o| o.id == self.settings.me)
     }
 
-    /// Counts a request for `key`: whether it is hot here, and the keys the
-    /// sketch demoted since the last call.
+    /// Counts a request for `key`: whether it just became hot here, and the
+    /// keys the sketch demoted since the last call.
     pub fn observe(&self, key: &str) -> (bool, Vec<String>) {
         let now = self.started.elapsed().as_millis() as u64;
         let mut hot = self.hot.lock().unwrap_or_else(PoisonError::into_inner);
         let demoted = hot.age(now);
-        if hot.observe(key, now) == Change::Promoted {
+        let promoted = hot.observe(key, now) == Change::Promoted;
+        if promoted {
             self.stats.hot_promoted.fetch_add(1, Ordering::Relaxed);
         }
         self.stats
             .hot_demoted
             .fetch_add(demoted.len() as u64, Ordering::Relaxed);
-        (hot.is_hot(key), demoted)
+        (promoted, demoted)
+    }
+
+    /// The runners-up a hot `key` this node owns is pushed to: the rest of
+    /// its [`REPLICAS`] highest-scoring edge nodes. Empty when this node
+    /// does not own it.
+    pub fn replicas(&self, key: &str) -> Vec<(String, SocketAddr)> {
+        let view = self.view();
+        let top = view.edges.top(key, REPLICAS);
+        if top.first().is_none_or(|o| o.id != self.settings.me) {
+            return Vec::new();
+        }
+        top[1..].iter().map(|n| (n.id.clone(), n.value)).collect()
+    }
+
+    /// Whether this node keeps `key` whatever its own traffic: it is the
+    /// owner or one of the runners-up.
+    pub fn keeps(&self, key: &str) -> bool {
+        self.is_shield()
+            || self
+                .view()
+                .edges
+                .top(key, REPLICAS)
+                .iter()
+                .any(|n| n.id == self.settings.me)
+            || self.view().edges.is_empty()
     }
 
     /// Whether `key` is hot on this node.
@@ -226,6 +260,17 @@ impl Tier {
         }
         if hop.is_some_and(|h| h.tier == HopTier::Shield) {
             return Next::Origin;
+        }
+        // A replica fetches from the owner that told it to.
+        if hop.is_some_and(|h| h.tier == HopTier::Replica)
+            && let Some(owner) = view.edges.owner(key)
+            && owner.id != *me
+        {
+            return Next::Node {
+                id: owner.id.clone(),
+                addr: owner.value,
+                tier: HopTier::Owner,
+            };
         }
         if let Some(set) = self.settings.shields.for_request(host, path) {
             let alive: Vec<Node<SocketAddr>> = set
@@ -395,13 +440,34 @@ mod tests {
     #[test]
     fn hot_keys_are_counted_and_meta_round_trips() {
         let (t, _tx) = tier("e0", cluster());
-        let mut hot = false;
-        for _ in 0..20 {
-            hot = t.observe("popular").0;
-        }
-        assert!(hot);
+        let promoted = (0..20).filter(|_| t.observe("popular").0).count();
+        assert_eq!(promoted, 1, "promoted once");
+        assert!(t.is_hot("popular"));
         assert_eq!(TierStats::get(&t.stats.hot_promoted), 1);
         assert!(!t.observe("rare").0);
+        // The replicas of a key this node owns: its two runners-up.
+        let view = t.view();
+        let mine = (0..100)
+            .map(|i| format!("h/{i}"))
+            .find(|k| view.edges.owner(k).unwrap().id == "e0")
+            .unwrap();
+        let reps = t.replicas(&mine);
+        let top: Vec<String> = view
+            .edges
+            .top(&mine, 3)
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        assert_eq!(
+            reps.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+            top[1..]
+        );
+        assert!(t.keeps(&mine));
+        let theirs = (0..100)
+            .map(|i| format!("h/{i}"))
+            .find(|k| !view.edges.top(k, 3).iter().any(|n| n.id == "e0"))
+            .unwrap();
+        assert!(t.replicas(&theirs).is_empty() && !t.keeps(&theirs));
         let m = Meta {
             http: "10.0.0.1:80".parse().unwrap(),
             weight: 2.5,

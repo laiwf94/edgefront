@@ -351,26 +351,28 @@ async fn hot_keys_are_kept_on_every_node_that_sees_them_hot() {
         "peer hops for the top 100 keys"
     );
     assert_eq!(o.hits(), 100);
-    // Once they cool, the copies on nodes that do not own them are dropped.
+    // Once they cool, the copies are dropped on every node but each key's
+    // three replicas (its owner and the two runners-up).
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let mut owners = BTreeMap::new();
     let view = c.nodes[0].as_ref().unwrap().proxy.tier().unwrap().view();
-    for p in &top {
-        owners.insert(
-            p.clone(),
-            view.edges
-                .owner(&format!("example.com{p}"))
-                .unwrap()
-                .id
-                .clone(),
-        );
-    }
-    // A request after the cooling counts each key again and ages the sketch,
-    // which demotes the rest.
+    let replicas: BTreeMap<String, Vec<String>> = top
+        .iter()
+        .map(|p| {
+            let ids = view
+                .edges
+                .top(&format!("example.com{p}"), 3)
+                .iter()
+                .map(|n| n.id.clone())
+                .collect();
+            (p.clone(), ids)
+        })
+        .collect();
+    // A request after the cooling ages each node's sketch, which demotes
+    // the keys.
     for n in 0..10 {
         c.get(n, "/tick").await;
     }
-    let mut held = 0;
+    let (mut kept, mut held) = (0, 0);
     for (n, node) in c.nodes.iter().enumerate() {
         let node = node.as_ref().unwrap();
         for p in &top {
@@ -380,14 +382,16 @@ async fn hot_keys_are_kept_on_every_node_that_sees_them_hot() {
                 .memory()
                 .get(&format!("example.com{p}"))
                 .is_some();
-            if owners[p] == c.ids[n] {
-                assert!(has, "the owner keeps {p}");
+            if replicas[p].contains(&c.ids[n]) {
+                assert!(has, "{} is a replica of {p} and keeps it", c.ids[n]);
+                kept += 1;
             } else if has {
                 held += 1;
             }
         }
     }
-    assert_eq!(held, 0, "copies left on non-owners after cooling");
+    assert_eq!(kept, 300);
+    assert_eq!(held, 0, "copies left outside the replicas after cooling");
     assert!(c.stat(|s| &s.hot_demoted) >= 900);
     c.shutdown().await;
 }
@@ -439,5 +443,52 @@ async fn a_forged_hop_header_is_ignored_and_never_reaches_the_origin() {
         "{:?}",
         seen[0].headers
     );
+    c.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_pushes_a_key_hot_on_it_to_its_two_runners_up() {
+    let o = origin().await;
+    let c = Cluster::start(o.addr, 10, false, "hot_rate = 5\n").await;
+    let view = c.nodes[0].as_ref().unwrap().proxy.tier().unwrap().view();
+    // A key owned by edge-0, asked only of edge-0.
+    let path = (0..1000)
+        .map(|i| format!("/solo/{i}"))
+        .find(|p| view.edges.owner(&format!("example.com{p}")).unwrap().id == "edge-0")
+        .unwrap();
+    let key = format!("example.com{path}");
+    let top: Vec<String> = view
+        .edges
+        .top(&key, 3)
+        .iter()
+        .map(|n| n.id.clone())
+        .collect();
+    for _ in 0..40 {
+        c.get(0, &path).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(c.stat(|s| &s.replicas_sent), 2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut holders: Vec<String> = c
+            .live()
+            .zip(&c.ids)
+            .filter(|(n, _)| n.proxy.cache.memory().get(&key).is_some())
+            .map(|(_, id)| id.clone())
+            .collect();
+        holders.sort();
+        let mut want = top.clone();
+        want.sort();
+        if holders == want {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "held by {holders:?}, wanted {top:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The replicas fetched it from the owner, not the origin.
+    assert_eq!(o.hits(), 1);
     c.shutdown().await;
 }

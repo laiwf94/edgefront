@@ -302,14 +302,64 @@ impl Proxy {
         let Some(key) = primary_key(req.uri(), req.headers()) else {
             return;
         };
-        let (_, demoted) = link.tier.observe(&key);
+        let (promoted, demoted) = link.tier.observe(&key);
+        if promoted {
+            self.push_replicas(link, req, &key);
+        }
         let gone: Vec<PurgeTarget> = demoted
             .into_iter()
-            .filter(|k| !link.tier.owns(k))
+            .filter(|k| !link.tier.keeps(k))
             .map(|k| PurgeTarget::Key(k.into()))
             .collect();
         if !gone.is_empty() {
             self.cache.purge(&gone).await;
+        }
+    }
+
+    /// A key this node owns just became hot: its runners-up are told to
+    /// fetch it from here and keep it, in the background.
+    fn push_replicas(&self, link: &TierLink, req: &Request<Body>, key: &str) {
+        let replicas = link.tier.replicas(key);
+        if replicas.is_empty() {
+            return;
+        }
+        let target = req
+            .uri()
+            .path_and_query()
+            .map_or("/", |p| p.as_str())
+            .to_owned();
+        let hop = peer::sign(
+            &link.tier.settings.key,
+            &link.tier.settings.me,
+            peer::Tier::Replica,
+            "GET",
+            &target,
+        );
+        let host = req.headers().get(header::HOST).cloned();
+        for (_, addr) in replicas {
+            let Ok(uri) = format!("http://{addr}{target}").parse::<Uri>() else {
+                continue;
+            };
+            let mut out = Request::new(crate::respond::empty());
+            *out.uri_mut() = uri;
+            if let Some(h) = &host {
+                out.headers_mut().insert(header::HOST, h.clone());
+            }
+            // No Via: the replica sends the request back here, and this
+            // node's name in Via would make that a loop.
+            out.headers_mut().insert(HOP, hop.clone());
+            let client = link.client.clone();
+            let timeout = link.timeout;
+            link.tier
+                .stats
+                .replicas_sent
+                .fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                if let Ok(Ok(resp)) = tokio::time::timeout(timeout, client.request(out)).await {
+                    // Read to the end, so the replica's fill completes.
+                    let _ = resp.into_body().collect().await;
+                }
+            });
         }
     }
 
@@ -347,6 +397,7 @@ impl Proxy {
         match tier {
             peer::Tier::Owner => stats.owner_fetches.fetch_add(1, Ordering::Relaxed),
             peer::Tier::Shield => stats.shield_fetches.fetch_add(1, Ordering::Relaxed),
+            peer::Tier::Replica => 0,
         };
         let mut headers = self.outbound_headers(parts.headers.clone(), id, client);
         headers.insert(
@@ -369,7 +420,8 @@ impl Proxy {
                 let (mut parts, body) = resp.into_parts();
                 strip_hop_by_hop(&mut parts.headers);
                 parts.headers.remove(HOP);
-                if tier == peer::Tier::Owner && !link.tier.is_hot(&key) {
+                let replica = hop.as_ref().is_some_and(|h| h.tier == peer::Tier::Replica);
+                if tier == peer::Tier::Owner && !replica && !link.tier.is_hot(&key) {
                     parts.extensions.insert(Transient);
                 }
                 Some(Response::from_parts(

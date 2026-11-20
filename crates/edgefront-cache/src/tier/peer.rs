@@ -25,6 +25,9 @@ pub enum Tier {
     Owner,
     /// A shield node above the edge.
     Shield,
+    /// One of a hot key's replicas, told by its owner to fetch it from the
+    /// owner and keep it.
+    Replica,
 }
 
 impl Tier {
@@ -32,6 +35,7 @@ impl Tier {
         match self {
             Tier::Owner => "owner",
             Tier::Shield => "shield",
+            Tier::Replica => "replica",
         }
     }
 }
@@ -86,6 +90,7 @@ pub fn verify(key: &[u8], value: &HeaderValue, method: &str, target: &str) -> Op
     let tier = match tier {
         "owner" => Tier::Owner,
         "shield" => Tier::Shield,
+        "replica" => Tier::Replica,
         _ => return None,
     };
     let tag = unhex(tag)?;
@@ -116,6 +121,8 @@ mod tests {
         );
         let s = sign(KEY, "edge-3", Tier::Shield, "GET", "/a");
         assert_eq!(verify(KEY, &s, "GET", "/a").unwrap().tier, Tier::Shield);
+        let r = sign(KEY, "edge-3", Tier::Replica, "GET", "/a");
+        assert_eq!(verify(KEY, &r, "GET", "/a").unwrap().tier, Tier::Replica);
         // Another target, method, key or tier: refused.
         assert_eq!(verify(KEY, &v, "GET", "/a?b=2"), None);
         assert_eq!(verify(KEY, &v, "HEAD", "/a?b=1"), None);

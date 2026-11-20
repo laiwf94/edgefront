@@ -472,7 +472,7 @@ Malformed requests get 400, oversized heads 431, long targets 414, oversized bod
 
 ## Tiered caching
 
-With `[tier]`, nodes find each other with SWIM over HMAC-signed UDP and spread the keys between them by weighted rendezvous hashing. A miss on a node that does not own the key goes to its owner, and `[[tier.shields]]` sends the owners' misses on to a shield. Each object then reaches the origin once however many nodes are asked for it. A key that gets hot on a node (`hot_rate`, 50 requests a second by default) is kept there too.
+With `[tier]`, nodes find each other with SWIM over HMAC-signed UDP and spread the keys between them by weighted rendezvous hashing. A miss on a node that does not own the key goes to its owner, and `[[tier.shields]]` sends the owners' misses on to a shield. Each object then reaches the origin once however many nodes are asked for it. A key that gets hot (`hot_rate`, 50 requests a second by default) is pushed by its owner to its two runners-up, and kept by every node that sees it hot.
 
 ```toml
 [tier]
