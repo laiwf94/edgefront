@@ -58,6 +58,7 @@ use super::der;
 use super::ocsp::Staples;
 use super::store::Store;
 use super::tickets::TicketKeys;
+use crate::acme::challenges::{ACME_TLS_ALPN, AlpnChallenges};
 use crate::config::{CipherSuite, Tls, TlsVersion};
 pub use crate::telemetry::metrics::HandshakeResult;
 
@@ -207,10 +208,19 @@ fn tls12_auth(id: u16) -> Option<SignatureAlgorithm> {
 }
 
 #[derive(Debug)]
-struct Resolver(Arc<Table>);
+struct Resolver(Arc<Table>, Option<Arc<AlpnChallenges>>);
 
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // A TLS-ALPN-01 validation (RFC 8737) gets the challenge
+        // certificate for its name, or nothing; never a real certificate.
+        if let Some(challenges) = &self.1
+            && hello
+                .alpn()
+                .is_some_and(|mut protos| protos.any(|p| p == ACME_TLS_ALPN))
+        {
+            return challenges.get(hello.server_name()?);
+        }
         let i = self
             .0
             .select(hello.server_name(), |k| usable(k, &hello))
@@ -229,6 +239,9 @@ pub struct Shared {
     /// OCSP staples already fetched, applied to a new snapshot's
     /// certificates as it loads.
     pub staples: Option<Arc<Staples>>,
+    /// TLS-ALPN-01 challenge certificates, served to `acme-tls/1`
+    /// handshakes; `None` does not offer that protocol at all.
+    pub alpn_challenges: Option<Arc<AlpnChallenges>>,
 }
 
 /// One loaded `tls` block. Immutable; a reload builds a new one.
@@ -241,6 +254,8 @@ pub struct Snapshot {
     dropped_suites: Vec<&'static str>,
     pub handshake_timeout: Duration,
     pub max_concurrent_handshakes: usize,
+    /// A client certificate is required but checked after the handshake.
+    require_client_after_handshake: bool,
 }
 
 impl Snapshot {
@@ -319,15 +334,27 @@ impl Snapshot {
             TlsVersion::Tls12 => &[&rustls::version::TLS13, &rustls::version::TLS12],
             TlsVersion::Tls13 => &[&rustls::version::TLS13],
         };
+        // With TLS-ALPN-01 on, a required client certificate is checked
+        // after the handshake instead of in it, so the CA's validation
+        // handshake (which has none) completes.
+        let defer_client_auth = shared.alpn_challenges.is_some()
+            && tls.client_auth.as_ref().is_some_and(|a| a.required);
         let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
             .with_protocol_versions(versions)
             .expect("ring supports TLS 1.2 and 1.3 with these suites")
             .with_client_cert_verifier(match &tls.client_auth {
                 None => Arc::new(rustls::server::NoClientAuth),
-                Some(auth) => client_auth::verifier(auth).map_err(LoadError::Certificate)?,
+                Some(auth) => client_auth::verifier(auth, defer_client_auth)
+                    .map_err(LoadError::Certificate)?,
             })
-            .with_cert_resolver(Arc::new(Resolver(Arc::clone(&table))));
+            .with_cert_resolver(Arc::new(Resolver(
+                Arc::clone(&table),
+                shared.alpn_challenges.clone(),
+            )));
         config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+        if shared.alpn_challenges.is_some() {
+            config.alpn_protocols.push(ACME_TLS_ALPN.to_vec());
+        }
         if let Some(keys) = &shared.tickets {
             config.ticketer = Arc::clone(keys) as Arc<dyn rustls::server::ProducesTickets>;
         }
@@ -337,6 +364,7 @@ impl Snapshot {
             certs,
             dropped_suites,
             handshake_timeout: tls.handshake_timeout,
+            require_client_after_handshake: defer_client_auth,
             max_concurrent_handshakes: usize::try_from(tls.max_concurrent_handshakes)
                 .unwrap_or(usize::MAX)
                 .max(1),
@@ -545,6 +573,8 @@ pub type OnHandshake = Arc<dyn Fn(HandshakeResult, Duration) + Send + Sync>;
 pub struct TlsInfo {
     /// The SNI the client sent, as sent.
     pub server_name: Option<String>,
+    /// The negotiated ALPN protocol.
+    pub alpn: Option<Vec<u8>>,
     /// The verified client certificate's identity, under `client_auth`.
     pub client: Option<ClientIdentity>,
     /// The negotiated protocol version, such as `0x0304` for TLS 1.3.
@@ -558,6 +588,7 @@ impl TlsInfo {
         let (_, conn) = stream.get_ref();
         TlsInfo {
             server_name: conn.server_name().map(str::to_owned),
+            alpn: conn.alpn_protocol().map(<[u8]>::to_vec),
             client: conn
                 .peer_certificates()
                 .and_then(|c| c.first())
@@ -568,6 +599,14 @@ impl TlsInfo {
                 .map_or(0, |s| u16::from(s.suite())),
         }
     }
+}
+
+/// Whether a finished handshake lacks the client certificate a deferred
+/// `client_auth` requires; an `acme-tls/1` validation never needs one.
+fn missing_client(s: &TlsStream<TcpStream>) -> bool {
+    let conn = s.get_ref().1;
+    conn.peer_certificates().is_none_or(<[_]>::is_empty)
+        && conn.alpn_protocol() != Some(ACME_TLS_ALPN)
 }
 
 /// Runs TLS handshakes for a listener, each on the store's snapshot at
@@ -681,6 +720,10 @@ impl Acceptor {
         drop(active);
         drop(slot);
         let (result, stream) = match outcome {
+            Ok(Ok(s)) if snapshot.require_client_after_handshake && missing_client(&s) => {
+                tracing::debug!("tls client sent no certificate; one is required");
+                (HandshakeResult::Error, None)
+            }
             Ok(Ok(s)) => (HandshakeResult::Ok, Some(s)),
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, "tls handshake failed");

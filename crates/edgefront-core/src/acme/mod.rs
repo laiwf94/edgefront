@@ -4,10 +4,9 @@
 //!   finalization with a CSR and the certificate download, every request
 //!   a JWS signed with the account's P-256 key, and the account kept on
 //!   disk at mode 0600;
-//! - [`challenges`]: proving control of a name, behind the [`Solver`]
-//!   trait, starting with the HTTP-01 responder.
-//!
-//! [`Solver`]: challenges::Solver
+//! - [`challenges`]: proving control of a name: an HTTP-01 responder, a
+//!   TLS-ALPN-01 certificate the TLS listener serves to the CA, and a
+//!   DNS-01 command hook.
 
 pub mod challenges;
 pub mod client;

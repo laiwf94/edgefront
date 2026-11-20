@@ -85,8 +85,11 @@ pub fn spiffe_matches(pattern: &str, id: &str) -> bool {
     }
 }
 
-/// Builds the verifier for `auth`, reading its CA bundle.
-pub fn verifier(auth: &ClientAuth) -> Result<Arc<dyn ClientCertVerifier>, String> {
+/// Builds the verifier for `auth`, reading its CA bundle. With `defer`, a
+/// required certificate is not demanded in the handshake but checked right
+/// after it (see [`Snapshot`](super::Snapshot)): an ACME TLS-ALPN-01
+/// validation has no client certificate and must still complete.
+pub fn verifier(auth: &ClientAuth, defer: bool) -> Result<Arc<dyn ClientCertVerifier>, String> {
     let file = &auth.ca_file;
     let mut roots = RootCertStore::empty();
     let certs = CertificateDer::pem_file_iter(file)
@@ -106,7 +109,7 @@ pub fn verifier(auth: &ClientAuth) -> Result<Arc<dyn ClientCertVerifier>, String
         Arc::new(roots),
         Arc::new(rustls::crypto::ring::default_provider()),
     );
-    let builder = if auth.required {
+    let builder = if auth.required && !defer {
         builder
     } else {
         builder.allow_unauthenticated()

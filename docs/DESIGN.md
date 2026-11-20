@@ -171,10 +171,20 @@ A refused handshake is a connect error, which steer's retry rules always retry. 
   6. the chain is downloaded.
 - `AccountStore` keeps the account key (`account.key`, PKCS#8 PEM) and the account URL per directory (`account.json`) in the state directory, so a restart reuses the account, and the issued `cert.pem` and `key.pem` beside them. The directory is mode 0700, and each file is written at 0600 through a temporary file renamed into place.
 
-The first solver is `acme::challenges::Http01`, a handler that answers `/.well-known/acme-challenge/<token>` with the key authorization and anything else with 404.
+**Challenges** (`acme::challenges`, behind the `Solver` trait, each set up before the CA is told and taken down after it decides):
+- `Http01` is a handler that answers `/.well-known/acme-challenge/<token>` with the key authorization, and anything else with 404.
+- `TlsAlpn01` (RFC 8737) makes a self-signed certificate for the name with a critical `acmeIdentifier` extension holding the SHA-256 of the key authorization, and puts it in `AlpnChallenges`, which every snapshot of a listener shares through `Shared::alpn_challenges`.
+  - A listener with `AlpnChallenges` also offers `acme-tls/1`.
+  - Its resolver gives a handshake that asks for `acme-tls/1` the challenge certificate for its SNI, or nothing, never a real certificate.
+  - The listener closes such a connection right after the handshake, so nothing is served on it.
+  - The certificate is built with `CertifiedKey::new`, because rustls's key check would refuse the critical extension that is its point.
+  - On such a listener a required client certificate is checked just after the handshake instead of in it, so the CA's validation (which has none) completes while every other client without one is still turned away.
+- `Dns01` runs a hook command as `<command…> set <fqdn> <value>` before the challenge and `clear` after, with the base64url SHA-256 of the key authorization at `_acme-challenge.<name>`. It must exit 0 within a minute. It is the challenge that validates `*.` names.
 
 `crates/edgefront-core/tests/acme.rs` runs Pebble, Let's Encrypt's test CA, in Docker, and never a real CA. `tests/common/pebble.rs` starts pinned `pebble` and `pebble-challtestsrv` images on a private network. challtestsrv answers every name with the host's address as containers see it, so Pebble validates against listeners the test opens. Pebble runs with no validation sleep and no random `badNonce`. The tests check:
 - an HTTP-01 order for two names, verified by a TLS client that trusts only Pebble's root;
+- a TLS-ALPN-01 order through the TLS listener, with the challenge certificate removed afterwards;
+- a DNS-01 order for a name and its wildcard, through a hook that sets TXT records in challtestsrv;
 - a second client finding the same account through the state directory, and a new key making a new account;
 - a failed challenge, a refused name and an untrusted directory, each reported with what failed.
 

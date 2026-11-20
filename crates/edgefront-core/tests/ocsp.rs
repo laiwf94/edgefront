@@ -392,6 +392,7 @@ async fn the_stapler_fetches_refreshes_keeps_and_withdraws() {
     let shared = Shared {
         tickets: None,
         staples: Some(Arc::clone(&staples)),
+        alpn_challenges: None,
     };
     let tls = tls_config(vec![cert("ocsp", &[])]);
     let store = Store::new(Arc::new(Snapshot::load_with(&tls, &shared).unwrap()));
@@ -508,6 +509,7 @@ async fn run_fetches_for_a_swapped_in_certificate_at_once() {
     let shared = Shared {
         tickets: None,
         staples: Some(Arc::new(Staples::default())),
+        alpn_challenges: None,
     };
     // First a certificate with no issuer in its chain: nothing to fetch.
     let store = Store::new(Arc::new(

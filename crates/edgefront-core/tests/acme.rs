@@ -1,7 +1,8 @@
 //! ACME against Pebble in Docker (never a real CA): the account, an order
-//! validated over HTTP-01, the certificate checked against Pebble's root,
-//! the account reused from its state directory, and the errors a failed
-//! challenge, a refused name and an untrusted directory give.
+//! validated by each challenge type, the certificate checked against
+//! Pebble's root, the account reused from its state directory, and the
+//! errors a failed challenge, a refused name and an untrusted directory
+//! give.
 
 #[path = "common/pebble.rs"]
 mod pebble;
@@ -11,10 +12,10 @@ mod tlsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use edgefront_core::acme::challenges::Http01;
+use edgefront_core::acme::challenges::{AlpnChallenges, Dns01, Http01, TlsAlpn01};
 use edgefront_core::acme::client::{self, AccountStore, AcmeError, Client, Issued};
 use edgefront_core::listener::{ServerLimits, serve, serve_tls};
-use edgefront_core::tls::{Acceptor, Snapshot, Store};
+use edgefront_core::tls::{Acceptor, Shared, Snapshot, Store};
 use pebble::{Pebble, free_port};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
@@ -97,7 +98,9 @@ async fn check(p: &Pebble, issued: &Issued, domains: &[&str], validity: Duration
     );
     for d in domains {
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let name = rustls::pki_types::ServerName::try_from(d.to_string()).unwrap();
+        // A wildcard covers any one label.
+        let host = d.replace("*.", "any.");
+        let name = rustls::pki_types::ServerName::try_from(host).unwrap();
         tokio_rustls::TlsConnector::from(Arc::clone(&cfg))
             .connect(name, tcp)
             .await
@@ -169,6 +172,68 @@ async fn http01_issues_and_the_account_is_reused() {
     assert_ne!(other.account(&contact).await.unwrap(), kid);
     let _ = stop.send(());
     let _ = std::fs::remove_dir_all(store.dir());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_alpn01_issues_through_the_tls_listener() {
+    let port = free_port();
+    let p = Pebble::start(free_port(), port, 90 * 86_400);
+    // A TLS listener with an unrelated certificate: only acme-tls/1
+    // handshakes for a name with a challenge get the challenge's.
+    let challenges = AlpnChallenges::new();
+    let tls = tlsc::tls_config(vec![tlsc::cert("default", &[])]);
+    let shared = Shared {
+        tickets: None,
+        staples: None,
+        alpn_challenges: Some(Arc::clone(&challenges)),
+    };
+    let store = Store::new(Arc::new(Snapshot::load_with(&tls, &shared).unwrap()));
+    let socket = TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(serve_tls(
+        socket,
+        Acceptor::new(store, None),
+        Arc::new(Http01::default()),
+        ServerLimits::default(),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
+    let accounts = state("alpn");
+    let c = account(&p, &accounts).await;
+    let issued = client::issue(
+        &c,
+        &[],
+        &[DOMAIN.to_owned()],
+        &TlsAlpn01(Arc::clone(&challenges)),
+    )
+    .await
+    .unwrap();
+    check(&p, &issued, &[DOMAIN], Duration::from_secs(90 * 86_400)).await;
+    assert!(
+        challenges.get(DOMAIN).is_none(),
+        "the challenge certificate is removed"
+    );
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(accounts.dir());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns01_issues_a_wildcard_through_the_hook() {
+    let p = Pebble::start(free_port(), free_port(), 90 * 86_400);
+    let hook = Dns01::new(p.dns_hook());
+    let accounts = state("dns");
+    let c = account(&p, &accounts).await;
+    let domains = vec![DOMAIN.to_owned(), format!("*.{DOMAIN}")];
+    let issued = client::issue(&c, &[], &domains, &hook).await.unwrap();
+    check(
+        &p,
+        &issued,
+        &[DOMAIN, "*.edge.test"],
+        Duration::from_secs(90 * 86_400),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(accounts.dir());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -133,6 +133,7 @@ pub fn load(path: &str, settings: &Settings, prefix: &str) -> Result<Loaded, Str
     let shared = Shared {
         tickets: Some(tickets),
         staples: Some(Arc::new(Staples::default())),
+        alpn_challenges: None,
     };
     load_with(path, settings, prefix, shared)
 }

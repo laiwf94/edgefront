@@ -213,6 +213,11 @@ async fn handshake_then_serve<H: Handler>(
         _ = stop.wait_for(|s| *s) => return,
     };
     if let Some((tls, info)) = established {
+        // A TLS-ALPN-01 validation ends with its handshake (RFC 8737
+        // section 3); nothing is served on acme-tls/1.
+        if info.alpn.as_deref() == Some(crate::acme::challenges::ACME_TLS_ALPN) {
+            return;
+        }
         connection(tls, peer, Some(info), handler, limits, stop).await;
     }
 }
