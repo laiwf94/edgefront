@@ -57,6 +57,7 @@ pub fn tls_config(certs: Vec<Certificate>) -> Tls {
         strict_sni: false,
         ocsp: Default::default(),
         client_auth: None,
+        acme: None,
     }
 }
 

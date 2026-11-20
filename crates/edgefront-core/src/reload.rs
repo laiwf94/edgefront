@@ -33,6 +33,8 @@ use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use crate::acme::challenges::{AlpnChallenges, Http01};
+use crate::acme::{managed, renew};
 use crate::admin::{self, Api, Control, ProxyState};
 use crate::clock::MonotonicClock;
 use crate::config::{Config, go};
@@ -130,10 +132,16 @@ pub struct Loaded {
 pub fn load(path: &str, settings: &Settings, prefix: &str) -> Result<Loaded, String> {
     let tickets = TicketKeys::new(MonotonicClock::shared(), tickets::DEFAULT_PERIOD)
         .map_err(|e| format!("cannot make session ticket keys: {e}"))?;
+    // acme-tls/1 is offered only by a listener that validates with it.
+    let alpn = Config::load(path)
+        .ok()
+        .and_then(|c| c.tls)
+        .and_then(|t| t.acme)
+        .is_some_and(|a| a.challenge == crate::config::AcmeChallenge::TlsAlpn01);
     let shared = Shared {
         tickets: Some(tickets),
         staples: Some(Arc::new(Staples::default())),
-        alpn_challenges: None,
+        alpn_challenges: alpn.then(AlpnChallenges::new),
     };
     load_with(path, settings, prefix, shared)
 }
@@ -161,7 +169,8 @@ pub fn load_with(
     let tls = match &config.tls {
         None => None,
         Some(t) => {
-            let snapshot = Snapshot::load_with(t, &shared).map_err(|e| format!("{path}: {e}"))?;
+            let snapshot = Snapshot::load_with(&managed::effective(t), &shared)
+                .map_err(|e| format!("{path}: {e}"))?;
             for problem in snapshot.warnings(SystemTime::now()) {
                 tracing::warn!(problem = problem.as_str(), "tls certificate");
             }
@@ -212,6 +221,10 @@ pub struct Lifecycle<S> {
     prefix: String,
     tls: Option<Arc<Store>>,
     shared: Shared,
+    /// The `tls` block in force, for the ACME issuer's rebuilds.
+    base: Arc<std::sync::Mutex<crate::config::Tls>>,
+    /// The ACME renewer's status, for `/metrics`.
+    acme: Option<Arc<std::sync::Mutex<renew::Status>>>,
     /// One reload at a time, from the admin API or SIGHUP.
     reloading: tokio::sync::Mutex<()>,
 }
@@ -222,6 +235,9 @@ impl<S: Service> Lifecycle<S> {
         let _held = self.reloading.lock().await;
         let result = match self.load_next() {
             Ok(next) => self.service.reload(&next.config).inspect(|_| {
+                if let Some(t) = &next.config.tls {
+                    *self.base.lock().unwrap_or_else(|p| p.into_inner()) = t.clone();
+                }
                 // Handshakes from now on use the new certificates;
                 // established connections keep the ones they negotiated.
                 if let (Some(store), Some(snapshot)) = (&self.tls, next.tls) {
@@ -248,13 +264,23 @@ impl<S: Service> Lifecycle<S> {
         if config.tls.is_some() != self.tls.is_some() {
             return Err("tls cannot be turned on or off by a reload; restart edgefront".to_owned());
         }
+        let running = self
+            .base
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .acme
+            .clone();
+        if config.tls.as_ref().and_then(|t| t.acme.clone()) != running {
+            return Err("tls.acme cannot change on a reload; restart edgefront".to_owned());
+        }
         drop(config);
-        load_with(
+        let next = load_with(
             &self.path,
             &self.settings,
             &self.prefix,
             self.shared.clone(),
-        )
+        )?;
+        Ok(next)
     }
 }
 
@@ -273,6 +299,12 @@ impl<S: Service> Control for Lifecycle<S> {
 
     fn metrics(&self, out: &mut String) {
         self.service.write_metrics(out);
+        if let Some(status) = &self.acme {
+            status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .write_metrics(SystemTime::now(), out);
+        }
     }
 }
 
@@ -447,6 +479,62 @@ pub async fn run<S: Service>(
             error,
         })?;
     let store = loaded.tls.map(Store::new);
+    let acme_block = config.tls.as_ref().and_then(|t| t.acme.clone());
+    // The HTTP-01 responder's listener, bound with the others.
+    let http01 = match acme_block
+        .as_ref()
+        .filter(|a| a.challenge == crate::config::AcmeChallenge::Http01)
+    {
+        Some(a) => {
+            let listen = a.http_listen.clone().unwrap_or_default();
+            let socket = bind(&listen).await.map_err(|error| ListenError {
+                listen: listen.clone(),
+                error,
+            })?;
+            Some((socket, Http01::new()))
+        }
+        None => None,
+    };
+    let base = Arc::new(std::sync::Mutex::new(config.tls.clone().unwrap_or_else(
+        || crate::config::Tls {
+            certificates: Vec::new(),
+            min_version: crate::config::TlsVersion::Tls12,
+            cipher_suites: None,
+            handshake_timeout: Duration::ZERO,
+            max_concurrent_handshakes: 0,
+            strict_sni: false,
+            ocsp: Default::default(),
+            client_auth: None,
+            acme: None,
+        },
+    )));
+    let renewer = match (&acme_block, &store) {
+        (Some(a), Some(store)) => {
+            let solver = managed::solver(
+                a,
+                http01.as_ref().map(|(_, h)| Arc::clone(h)),
+                loaded.shared.alpn_challenges.clone(),
+            )
+            .map_err(|e| ListenError {
+                listen: config.listen.clone(),
+                error: std::io::Error::other(e.to_string()),
+            })?;
+            let issuer = managed::AcmeIssuer::new(
+                a.clone(),
+                solver,
+                Arc::clone(store),
+                Arc::clone(&base),
+                loaded.shared.clone(),
+            );
+            Some(renew::Renewer::new(
+                issuer,
+                MonotonicClock::shared(),
+                Wall::system(),
+                managed::current_validity(a),
+            ))
+        }
+        _ => None,
+    };
     let lifecycle = Arc::new(Lifecycle {
         service: Arc::clone(&service),
         path,
@@ -454,6 +542,8 @@ pub async fn run<S: Service>(
         prefix: prefix.to_owned(),
         tls: store.clone(),
         shared: loaded.shared,
+        base,
+        acme: renewer.as_ref().map(renew::Renewer::status),
         reloading: tokio::sync::Mutex::new(()),
     });
     let api = Arc::new(
@@ -526,6 +616,15 @@ pub async fn run<S: Service>(
             ))
         }
     };
+    let http01_server = http01.map(|(socket, responder)| {
+        tokio::spawn(listener::serve(
+            socket,
+            responder,
+            admin_limits(Duration::ZERO),
+            until_stopped(stopped.clone()),
+        ))
+    });
+    let renewing = renewer.map(|r| tokio::spawn(r.run(until_stopped(stopped.clone()))));
     let admin_server = tokio::spawn(listener::serve(
         admin_socket,
         api,
@@ -560,6 +659,12 @@ pub async fn run<S: Service>(
         proxy: proxy_server.await.unwrap_or_default(),
         admin: admin_server.await.unwrap_or_default(),
     };
+    if let Some(t) = http01_server {
+        let _ = t.await;
+    }
+    if let Some(t) = renewing {
+        let _ = t.await;
+    }
     for (name, forced) in [
         ("proxy", report.proxy.forced),
         ("admin", report.admin.forced),

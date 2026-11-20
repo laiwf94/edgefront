@@ -115,6 +115,7 @@ fn upstream_tls() -> std::sync::Arc<edgefront_core::tls::Acceptor> {
             ca_file: fixture("ca.crt"),
             required: true,
         }),
+        acme: None,
     };
     Acceptor::new(
         Store::new(std::sync::Arc::new(Snapshot::load(&tls).unwrap())),

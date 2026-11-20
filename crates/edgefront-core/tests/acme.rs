@@ -1,20 +1,24 @@
 //! ACME against Pebble in Docker (never a real CA): the account, an order
 //! validated by each challenge type, the certificate checked against
-//! Pebble's root, the account reused from its state directory, and the
-//! errors a failed challenge, a refused name and an untrusted directory
-//! give.
+//! Pebble's root, the account reused from its state directory; and the
+//! renewal scheduler on a manual clock over 180 days.
 
 #[path = "common/pebble.rs"]
 mod pebble;
 #[path = "common/tls.rs"]
 mod tlsc;
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use edgefront_core::acme::challenges::{AlpnChallenges, Dns01, Http01, TlsAlpn01};
+use edgefront_core::acme::challenges::{AlpnChallenges, BoxFuture, Dns01, Http01, TlsAlpn01};
 use edgefront_core::acme::client::{self, AccountStore, AcmeError, Client, Issued};
+use edgefront_core::acme::renew::{Issuer, Renewer, renew_at};
+use edgefront_core::clock::{Clock, ManualClock};
+use edgefront_core::config::{Acme, AcmeChallenge};
 use edgefront_core::listener::{ServerLimits, serve, serve_tls};
+use edgefront_core::tls::ocsp::Wall;
 use edgefront_core::tls::{Acceptor, Shared, Snapshot, Store};
 use pebble::{Pebble, free_port};
 use rustls::pki_types::CertificateDer;
@@ -178,10 +182,20 @@ async fn http01_issues_and_the_account_is_reused() {
 async fn tls_alpn01_issues_through_the_tls_listener() {
     let port = free_port();
     let p = Pebble::start(free_port(), port, 90 * 86_400);
-    // A TLS listener with an unrelated certificate: only acme-tls/1
-    // handshakes for a name with a challenge get the challenge's.
+    // A TLS listener with no certificate yet, waiting for ACME: only
+    // acme-tls/1 handshakes for a name with a challenge get anywhere.
     let challenges = AlpnChallenges::new();
-    let tls = tlsc::tls_config(vec![tlsc::cert("default", &[])]);
+    let mut tls = tlsc::tls_config(Vec::new());
+    tls.acme = Some(Acme {
+        directory: p.directory.clone(),
+        contact: Vec::new(),
+        domains: vec![DOMAIN.to_owned()],
+        challenge: AcmeChallenge::TlsAlpn01,
+        state_dir: "/unused".into(),
+        ca_file: None,
+        http_listen: None,
+        dns_hook: None,
+    });
     let shared = Shared {
         tickets: None,
         staples: None,
@@ -279,4 +293,258 @@ async fn a_failed_challenge_and_protocol_errors_are_reported() {
         .is_err()
     );
     let _ = std::fs::remove_dir_all(accounts.dir());
+}
+
+/// An issuer on a fake CA: every certificate lasts 90 days from the wall
+/// time of its issuance, and the attempts listed in `fail` fail.
+struct FakeCa {
+    wall: Wall,
+    attempts: AtomicUsize,
+    fail: Vec<usize>,
+    issued_at: Mutex<Vec<SystemTime>>,
+    installed: AtomicUsize,
+}
+
+/// The renewer's handle on a shared [`FakeCa`].
+struct Ca(Arc<FakeCa>);
+
+impl Issuer for Ca {
+    fn issue(&self) -> BoxFuture<'_, Result<Issued, AcmeError>> {
+        Box::pin(async move {
+            let n = self.0.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail.contains(&n) {
+                return Err(AcmeError::Transport("the CA is down".into()));
+            }
+            let now = self.0.wall.now();
+            self.0.issued_at.lock().unwrap().push(now);
+            Ok(Issued {
+                chain_pem: String::new(),
+                key_pem: String::new(),
+                not_before: now,
+                not_after: now + Duration::from_secs(90 * 86_400),
+            })
+        })
+    }
+
+    fn install(&self, _: &Issued) -> Result<(), AcmeError> {
+        self.0.installed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+async fn settle() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+const DAY: Duration = Duration::from_secs(86_400);
+
+/// 180 days on a manual clock: issued at once, renewed at days 60, 120 and
+/// 180 (two thirds of each 90-day lifetime), never expired.
+#[tokio::test]
+async fn renewal_at_two_thirds_over_180_days() {
+    let clock = Arc::new(ManualClock::new());
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let wall = Wall::new(Arc::clone(&clock) as Arc<dyn Clock>, start);
+    let ca = Arc::new(FakeCa {
+        wall: wall.clone(),
+        attempts: AtomicUsize::new(0),
+        fail: Vec::new(),
+        issued_at: Mutex::new(Vec::new()),
+        installed: AtomicUsize::new(0),
+    });
+    let renewer = Renewer::new(
+        Ca(Arc::clone(&ca)),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        wall.clone(),
+        None,
+    );
+    let status = renewer.status();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(renewer.run(async move {
+        let _ = stopped.await;
+    }));
+    settle().await;
+    for _ in 0..180 {
+        clock.advance(DAY);
+        settle().await;
+        let s = status.lock().unwrap().clone();
+        let left = s.expires_in(wall.now()).unwrap();
+        assert!(
+            left > 29.0 * 86_400.0,
+            "the certificate got within {left}s of expiry"
+        );
+    }
+    let days: Vec<u64> = ca
+        .issued_at
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.duration_since(start).unwrap().as_secs() / 86_400)
+        .collect();
+    assert_eq!(days, vec![0, 60, 120, 180]);
+    assert_eq!(ca.installed.load(Ordering::SeqCst), 4);
+    let s = status.lock().unwrap().clone();
+    assert_eq!((s.renewals, s.failures), (4, 0));
+    assert_eq!(s.next, Some(start + 240 * DAY));
+    let mut metrics = String::new();
+    s.write_metrics(wall.now(), &mut metrics);
+    assert!(
+        metrics.contains("edgefront_acme_renewals_total{result=\"success\"} 4"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "edgefront_acme_certificate_expiry_seconds {}",
+            90 * 86_400
+        )),
+        "{metrics}"
+    );
+    let _ = stop.send(());
+    task.await.unwrap();
+    assert_eq!(renew_at(start, start + 90 * DAY), start + 60 * DAY);
+}
+
+/// A CA down at renewal time: retries after about 5, 10 and 20 minutes,
+/// each with at most 10% jitter, then success; the certificate never
+/// lapses.
+#[tokio::test]
+async fn failed_renewals_back_off_and_recover() {
+    let clock = Arc::new(ManualClock::new());
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let wall = Wall::new(Arc::clone(&clock) as Arc<dyn Clock>, start);
+    let ca = Arc::new(FakeCa {
+        wall: wall.clone(),
+        attempts: AtomicUsize::new(0),
+        fail: vec![0, 1, 2],
+        issued_at: Mutex::new(Vec::new()),
+        installed: AtomicUsize::new(0),
+    });
+    // Start from a certificate issued a day ago.
+    let current = (start - DAY, start + 89 * DAY);
+    let renewer = Renewer::new(
+        Ca(Arc::clone(&ca)),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        wall.clone(),
+        Some(current),
+    );
+    let status = renewer.status();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(renewer.run(async move {
+        let _ = stopped.await;
+    }));
+    settle().await;
+    assert_eq!(ca.attempts.load(Ordering::SeqCst), 0, "nothing due yet");
+    assert_eq!(status.lock().unwrap().next, Some(start + 59 * DAY));
+    clock.advance(59 * DAY);
+    settle().await;
+    assert_eq!(ca.attempts.load(Ordering::SeqCst), 1);
+    // Step a minute at a time and record when each attempt happened.
+    let mut at = vec![];
+    let mut seen = 1;
+    for minute in 1..=60 {
+        clock.advance(Duration::from_secs(60));
+        settle().await;
+        let n = ca.attempts.load(Ordering::SeqCst);
+        if n > seen {
+            at.push(minute);
+            seen = n;
+        }
+    }
+    // Attempts 2, 3 and 4 after backoffs of 5, 10 and 20 minutes (+10%).
+    assert_eq!(at.len(), 3, "{at:?}");
+    assert!((5..=6).contains(&at[0]), "{at:?}");
+    assert!((15..=17).contains(&at[1]), "{at:?}");
+    assert!((35..=39).contains(&at[2]), "{at:?}");
+    let s = status.lock().unwrap().clone();
+    assert_eq!((s.renewals, s.failures), (1, 3));
+    assert_eq!(s.last_error, None);
+    assert_eq!(ca.installed.load(Ordering::SeqCst), 1);
+    let _ = stop.send(());
+    task.await.unwrap();
+}
+
+#[test]
+fn config_checks_the_acme_block() {
+    use edgefront_core::config::Config;
+    let parse = |acme: &str| {
+        Config::from_json(
+            format!(
+                r#"{{"listen":":1","routes":[{{"cluster":"a"}}],
+                "clusters":[{{"name":"a","endpoints":[{{"address":"h:1"}}]}}],
+                "tls":{{"certificates":[],"acme":{acme}}}}}"#
+            )
+            .as_bytes(),
+        )
+    };
+    let ok = parse(
+        r#"{"directory":"https://ca/dir","contact":["mailto:ops@edge.test"],"domains":["Edge.Test"],
+        "challenge":"http-01","state_dir":"/var/lib/edgefront/acme","http_listen":":80"}"#,
+    )
+    .unwrap();
+    let a = ok.tls.unwrap().acme.unwrap();
+    assert_eq!(a.domains, vec!["edge.test".to_owned()]);
+    assert_eq!(a.challenge, AcmeChallenge::Http01);
+    assert_eq!(a.http_listen.as_deref(), Some(":80"));
+    let dns = parse(
+        r#"{"directory":"https://ca/dir","domains":["*.edge.test"],"challenge":"dns-01",
+        "state_dir":"/s","dns_hook":["/bin/hook"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        dns.tls.unwrap().acme.unwrap().challenge,
+        AcmeChallenge::Dns01
+    );
+    for (acme, want) in [
+        (
+            r#"{"directory":"http://ca/dir","domains":["a.test"],"state_dir":"/s","http_listen":":80"}"#,
+            "must be an https:// URL",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":[],"state_dir":"/s","http_listen":":80"}"#,
+            "at least one domain",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["a.test"],"http_listen":":80"}"#,
+            "state_dir: is required",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["a.test"],"state_dir":"/s"}"#,
+            "http_listen: is required for http-01",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["*.a.test"],"state_dir":"/s","challenge":"tls-alpn-01"}"#,
+            "wildcard names can only be validated with dns-01",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["a.test"],"state_dir":"/s","challenge":"dns-01"}"#,
+            "dns_hook: is required for dns-01",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["a.test"],"state_dir":"/s","challenge":"magic"}"#,
+            "must be http-01, tls-alpn-01 or dns-01",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["-x-"],"state_dir":"/s","challenge":"tls-alpn-01"}"#,
+            "domains[0]",
+        ),
+        (
+            r#"{"directory":"https://ca","domains":["a.test"],"contact":["ops@a.test"],"state_dir":"/s","challenge":"tls-alpn-01"}"#,
+            "must be a mailto: URL",
+        ),
+    ] {
+        let err = parse(acme).unwrap_err().to_string();
+        assert!(err.contains(want), "{want}: {err}");
+    }
+    // Without acme a tls block still needs a certificate.
+    let err = Config::from_json(
+        br#"{"listen":":1","routes":[{"cluster":"a"}],"clusters":[{"name":"a","endpoints":[{"address":"h:1"}]}],"tls":{"certificates":[]}}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("at least one certificate is required"),
+        "{err}"
+    );
 }

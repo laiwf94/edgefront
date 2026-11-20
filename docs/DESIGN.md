@@ -181,12 +181,28 @@ A refused handshake is a connect error, which steer's retry rules always retry. 
   - On such a listener a required client certificate is checked just after the handshake instead of in it, so the CA's validation (which has none) completes while every other client without one is still turned away.
 - `Dns01` runs a hook command as `<command…> set <fqdn> <value>` before the challenge and `clear` after, with the base64url SHA-256 of the key authorization at `_acme-challenge.<name>`. It must exit 0 within a minute. It is the challenge that validates `*.` names.
 
+**Renewal** (`acme::renew`).
+- `Renewer` issues at once when there is no certificate, then at two thirds of each certificate's lifetime, which for a 90-day certificate is 30 days before it expires.
+- A failed attempt is retried after 5 minutes, doubling to 6 hours, each with up to 10% jitter. Near expiry a retry is pulled to an hour before the end at the latest.
+- Time comes from an injected `Clock` and the `Wall` time that moves with it.
+- Its `Status` holds the validity, the success and failure counts and the last error. `/metrics` exposes it as `edgefront_acme_certificate_expiry_seconds` and `edgefront_acme_renewals_total{result}`.
+
+**In the proxy** (`acme::managed`, `reload::run`).
+- A `tls.acme` block names the `directory`, `contact`, `domains`, `challenge` (`http-01` by default, `tls-alpn-01` or `dns-01`) and `state_dir`. Optional are `ca_file` (the directory's trust, by default the first system bundle found), `http_listen` (required for HTTP-01) and `dns_hook` (required for DNS-01). With it, `certificates` may be empty. Validation refuses wildcards on anything but DNS-01.
+- The managed certificate on disk joins the configured ones: last, so a configured certificate stays the fallback, or first when there is none. A listener waiting for its first certificate refuses every ordinary handshake.
+- `reload::run` binds `http_listen` for HTTP-01 with the other listeners, and offers `acme-tls/1` only for TLS-ALPN-01.
+- `AcmeIssuer` orders the certificate. It saves the account URL and the certificate, rebuilds the snapshot from the configuration in force, and swaps it into the store, so new handshakes get the new certificate and open connections keep theirs.
+- A reload may change anything but the `acme` block, which needs a restart.
+
 `crates/edgefront-core/tests/acme.rs` runs Pebble, Let's Encrypt's test CA, in Docker, and never a real CA. `tests/common/pebble.rs` starts pinned `pebble` and `pebble-challtestsrv` images on a private network. challtestsrv answers every name with the host's address as containers see it, so Pebble validates against listeners the test opens. Pebble runs with no validation sleep and no random `badNonce`. The tests check:
 - an HTTP-01 order for two names, verified by a TLS client that trusts only Pebble's root;
 - a TLS-ALPN-01 order through the TLS listener, with the challenge certificate removed afterwards;
 - a DNS-01 order for a name and its wildcard, through a hook that sets TXT records in challtestsrv;
 - a second client finding the same account through the state directory, and a new key making a new account;
-- a failed challenge, a refused name and an untrusted directory, each reported with what failed.
+- a failed challenge, a refused name and an untrusted directory, each reported with what failed;
+- on a `ManualClock`, 180 days of renewals: issued at day 0 and renewed at days 60, 120 and 180, never within 29 days of expiry, with the metrics checked;
+- a CA down at renewal time, retried after about 5, 10 and 20 minutes before it recovers;
+- the configuration rules.
 
 The tests need Docker.
 

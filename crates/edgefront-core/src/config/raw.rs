@@ -251,6 +251,18 @@ raw_struct!(RawTls, "an object" {
     ocsp_stapling: Option<bool>,
     ocsp_responder: String,
     client_auth: Option<RawClientAuth>,
+    acme: Option<RawAcme>,
+});
+
+raw_struct!(RawAcme, "an object" {
+    directory: String,
+    contact: Option<Vec<String>>,
+    domains: Option<Vec<String>>,
+    challenge: String,
+    state_dir: String,
+    ca_file: String,
+    http_listen: String,
+    dns_hook: Option<Vec<String>>,
 });
 
 raw_struct!(RawClientAuth, "an object" {

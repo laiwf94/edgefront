@@ -6,10 +6,16 @@
 //!   disk at mode 0600;
 //! - [`challenges`]: proving control of a name: an HTTP-01 responder, a
 //!   TLS-ALPN-01 certificate the TLS listener serves to the CA, and a
-//!   DNS-01 command hook.
+//!   DNS-01 command hook;
+//! - [`renew`]: when to issue: at once without a certificate, then at two
+//!   thirds of each certificate's lifetime, with jittered retries;
+//! - [`managed`]: the listener's managed certificate on disk, and the
+//!   issuer that orders it and swaps it into the listener.
 
 pub mod challenges;
 pub mod client;
+pub mod managed;
+pub mod renew;
 
 /// Base64url without padding (RFC 4648 section 5), as JWS uses it.
 pub fn b64url(data: &[u8]) -> String {

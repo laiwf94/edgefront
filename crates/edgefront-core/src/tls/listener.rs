@@ -138,6 +138,10 @@ impl Table {
         name: Option<&str>,
         usable: impl Fn(&CertifiedKey) -> bool,
     ) -> Result<usize, UnknownServerName> {
+        if self.keys.is_empty() {
+            // Only an ACME listener waiting for its first certificate.
+            return Err(UnknownServerName);
+        }
         let name = normalize(name.unwrap_or_default());
         if !name.is_empty() {
             if let Some(i) = self.pick(self.exact.get(name.as_str()), &usable) {
@@ -314,7 +318,7 @@ impl Snapshot {
                 not_after: fields.not_after,
             });
         }
-        if table.keys.is_empty() {
+        if table.keys.is_empty() && tls.acme.is_none() {
             return Err(LoadError::Certificate(
                 "tls.certificates: at least one certificate is required".to_owned(),
             ));

@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use super::raw::{self, RawCluster, RawConfig, RawTls};
 use super::{
-    Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config, ConfigError, Endpoint,
-    FieldError, HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy, Retry, Route, Tls,
-    TlsVersion, UpstreamTls, defaults, go, limits,
+    Acme, AcmeChallenge, Budget, Certificate, CipherSuite, ClientAuth, Cluster, Config,
+    ConfigError, Endpoint, FieldError, HealthCheck, IpPrefix, Ocsp, OutlierDetection, Policy,
+    Retry, Route, Tls, TlsVersion, UpstreamTls, defaults, go, limits,
 };
 
 const MS: i64 = 1_000_000;
@@ -316,7 +316,7 @@ impl Validator {
             self.add(format!("{path}.ocsp_responder"), "must be an http:// URL");
         }
         let certs = rt.certificates.as_deref().unwrap_or_default();
-        if certs.is_empty() {
+        if certs.is_empty() && rt.acme.is_none() {
             self.add(
                 format!("{path}.certificates"),
                 "at least one certificate is required",
@@ -382,6 +382,10 @@ impl Validator {
                 stapling: rt.ocsp_stapling.unwrap_or(true),
                 responder: (!rt.ocsp_responder.is_empty()).then(|| rt.ocsp_responder.clone()),
             },
+            acme: rt
+                .acme
+                .as_ref()
+                .map(|a| self.acme(&format!("{path}.acme"), a)),
             client_auth: rt.client_auth.as_ref().map(|a| {
                 if a.ca_file.is_empty() {
                     self.add(format!("{path}.client_auth.ca_file"), "is required");
@@ -566,6 +570,83 @@ impl Validator {
                 .tls
                 .as_ref()
                 .map(|t| self.upstream_tls(&format!("{path}.tls"), t)),
+        }
+    }
+
+    fn acme(&mut self, path: &str, a: &raw::RawAcme) -> Acme {
+        if !a.directory.starts_with("https://") {
+            self.add(format!("{path}.directory"), "must be an https:// URL");
+        }
+        let contact = a.contact.clone().unwrap_or_default();
+        for (i, c) in contact.iter().enumerate() {
+            if !c.starts_with("mailto:") || c.len() <= 7 {
+                self.add(format!("{path}.contact[{i}]"), "must be a mailto: URL");
+            }
+        }
+        let domains: Vec<String> = a
+            .domains
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .map(|d| go::to_lower(d))
+            .collect();
+        if domains.is_empty() {
+            self.add(format!("{path}.domains"), "at least one domain is required");
+        }
+        if domains.len() > 100 {
+            self.add(format!("{path}.domains"), "at most 100 domains");
+        }
+        for (i, d) in domains.iter().enumerate() {
+            let name = d.strip_prefix("*.").unwrap_or(d);
+            if check_hostname(name).is_err() {
+                self.add(
+                    format!("{path}.domains[{i}]"),
+                    format!("{} must be a host name or *.suffix", go::quote(d)),
+                );
+            }
+        }
+        if a.state_dir.is_empty() {
+            self.add(format!("{path}.state_dir"), "is required");
+        }
+        let challenge = match a.challenge.as_str() {
+            "" | "http-01" => AcmeChallenge::Http01,
+            "tls-alpn-01" => AcmeChallenge::TlsAlpn01,
+            "dns-01" => AcmeChallenge::Dns01,
+            other => {
+                self.add(
+                    format!("{path}.challenge"),
+                    format!(
+                        "{} must be http-01, tls-alpn-01 or dns-01",
+                        go::quote(other)
+                    ),
+                );
+                AcmeChallenge::Http01
+            }
+        };
+        let wildcard = domains.iter().any(|d| d.starts_with("*."));
+        if wildcard && challenge != AcmeChallenge::Dns01 {
+            self.add(
+                format!("{path}.domains"),
+                "wildcard names can only be validated with dns-01",
+            );
+        }
+        if challenge == AcmeChallenge::Http01 && a.http_listen.is_empty() {
+            self.add(format!("{path}.http_listen"), "is required for http-01");
+        }
+        let dns_hook = a.dns_hook.clone().filter(|h| !h.is_empty());
+        if challenge == AcmeChallenge::Dns01 && dns_hook.is_none() {
+            self.add(format!("{path}.dns_hook"), "is required for dns-01");
+        }
+        let opt = |s: &String| (!s.is_empty()).then(|| s.clone());
+        Acme {
+            directory: a.directory.clone(),
+            contact,
+            domains,
+            challenge,
+            state_dir: a.state_dir.clone(),
+            ca_file: opt(&a.ca_file),
+            http_listen: opt(&a.http_listen),
+            dns_hook,
         }
     }
 

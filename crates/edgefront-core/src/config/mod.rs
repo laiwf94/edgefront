@@ -183,6 +183,47 @@ pub struct Tls {
     /// Ask clients for certificates and verify them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuth>,
+    /// Certificates issued and renewed automatically over ACME.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme: Option<Acme>,
+}
+
+/// How a listener gets certificates over ACME (RFC 8555).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Acme {
+    /// The CA's directory URL, `https://`.
+    pub directory: String,
+    /// Contact addresses for the account, as `mailto:` URLs.
+    pub contact: Vec<String>,
+    /// The names one certificate is issued for; the first is its subject.
+    pub domains: Vec<String>,
+    pub challenge: AcmeChallenge,
+    /// Where the account key, the account URL and the issued certificate
+    /// and key are kept, each file at mode 0600.
+    pub state_dir: String,
+    /// The CAs the directory's own TLS certificate must chain to; by
+    /// default the system's bundle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    /// For `http-01`: the plain listener that answers the CA's requests,
+    /// such as `:80`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_listen: Option<String>,
+    /// For `dns-01`: the command run as `<command> set|clear <name>
+    /// <value>` to publish and remove the TXT record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dns_hook: Option<Vec<String>>,
+}
+
+/// The ACME challenge a listener answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AcmeChallenge {
+    #[serde(rename = "http-01")]
+    Http01,
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01,
+    #[serde(rename = "dns-01")]
+    Dns01,
 }
 
 /// Client certificate verification on the listener.
@@ -589,6 +630,14 @@ impl Config {
                 && !auth.ca_file.starts_with('/')
             {
                 auth.ca_file = go::join(&dir, &auth.ca_file);
+            }
+            if let Some(acme) = &mut tls.acme {
+                let files = std::iter::once(&mut acme.state_dir).chain(acme.ca_file.as_mut());
+                for file in files {
+                    if !file.starts_with('/') {
+                        *file = go::join(&dir, file);
+                    }
+                }
             }
         }
         let dir = path
