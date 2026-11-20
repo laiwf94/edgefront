@@ -6,10 +6,15 @@
 //! a memory eviction costs nothing. Disk writes happen on one background
 //! thread fed by a bounded queue; when the queue is full the write is
 //! skipped, because the entry is still in memory and a cache may forget.
+//! The disk tier is a log-structured segment store ([`segment`]); the
+//! writer thread compacts it whenever the queue runs dry, and
+//! [`Cache::shutdown`] writes its index snapshot ([`index`]) for a warm
+//! restart.
 
 pub mod codec;
-pub mod disk;
+pub mod index;
 pub mod memory;
+pub mod segment;
 
 use std::io;
 use std::path::PathBuf;
@@ -22,8 +27,8 @@ use tokio::sync::oneshot;
 
 use crate::object::{CachedObject, Entry, Key};
 use crate::purge::{PurgeLog, PurgeTarget};
-use disk::DiskStore;
 use memory::MemoryStore;
+use segment::SegmentStore;
 
 /// Sizing for a [`Cache`].
 #[derive(Debug, Clone)]
@@ -77,7 +82,7 @@ enum Job {
 
 pub struct Cache {
     memory: MemoryStore,
-    disk: Option<Arc<DiskStore>>,
+    disk: Option<Arc<SegmentStore>>,
     writer: Option<SyncSender<Job>>,
     log: Arc<PurgeLog>,
     max_variants: usize,
@@ -92,7 +97,7 @@ impl Cache {
         let (disk, writer) = match &settings.disk {
             None => (None, None),
             Some(d) => {
-                let disk = Arc::new(DiskStore::open(&d.path, d.max_bytes)?);
+                let disk = Arc::new(SegmentStore::open(&d.path, d.max_bytes)?);
                 let (tx, rx) = sync_channel(d.queue.max(1));
                 let (disk2, log2, stats2) = (disk.clone(), log.clone(), stats.clone());
                 std::thread::Builder::new()
@@ -119,7 +124,7 @@ impl Cache {
         &self.memory
     }
 
-    pub fn disk(&self) -> Option<&DiskStore> {
+    pub fn disk(&self) -> Option<&SegmentStore> {
         self.disk.as_deref()
     }
 
@@ -237,6 +242,15 @@ impl Cache {
         removed
     }
 
+    /// Flushes the disk queue and writes the disk tier's index snapshot, so
+    /// the next start is warm. Call once, when the node stops.
+    pub async fn shutdown(&self) {
+        self.flush().await;
+        if let Some(disk) = self.disk.clone() {
+            let _ = tokio::task::spawn_blocking(move || disk.shutdown()).await;
+        }
+    }
+
     /// Waits until every disk write queued so far has finished.
     pub async fn flush(&self) {
         let Some(writer) = self.writer.clone() else {
@@ -252,11 +266,25 @@ impl Cache {
 
 fn write_loop(
     rx: std::sync::mpsc::Receiver<Job>,
-    disk: &DiskStore,
+    disk: &SegmentStore,
     log: &PurgeLog,
     stats: &CacheStats,
 ) {
-    for job in rx {
+    loop {
+        // Compact while there is nothing to write, one segment at a time.
+        let job = match rx.try_recv() {
+            Ok(job) => job,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if disk.compact().unwrap_or(false) {
+                    continue;
+                }
+                match rx.recv() {
+                    Ok(job) => job,
+                    Err(_) => return,
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+        };
         match job {
             Job::Write { key, entry, epoch } => {
                 let tags = entry.tags();
@@ -294,7 +322,7 @@ mod tests {
     use super::*;
     use crate::object::tests::map;
     use crate::policy::Freshness;
-    use disk::tests::TempDir;
+    use segment::tests::TempDir;
 
     fn obj(tags: &str, body: &'static str) -> Arc<CachedObject> {
         let f = Freshness {
@@ -493,10 +521,22 @@ mod tests {
             c.flush().await;
         }
         let c = with_disk(&dir, 1 << 20);
+        assert!(!c.disk().unwrap().warm);
         assert_eq!(
             c.lookup(&k("h/a"), &HeaderMap::new()).await.unwrap().body,
             "kept"
         );
+        c.shutdown().await;
+        drop(c);
+        // After a clean shutdown the index comes from the snapshot.
+        let c = with_disk(&dir, 1 << 20);
+        assert!(c.disk().unwrap().warm);
+        assert_eq!(c.disk().unwrap().len(), 1);
+        // Without a disk tier, shutdown only flushes.
+        Cache::new(&CacheSettings::default())
+            .unwrap()
+            .shutdown()
+            .await;
     }
 
     #[tokio::test]

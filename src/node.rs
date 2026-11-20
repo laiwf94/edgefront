@@ -198,7 +198,7 @@ impl Node {
         for task in self.background {
             task.abort();
         }
-        self.proxy.cache.flush().await;
+        self.proxy.cache.shutdown().await;
         tracing::info!("cachet stopped");
     }
 }

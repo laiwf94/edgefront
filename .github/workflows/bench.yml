@@ -52,6 +52,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build edgefront and the harness
         run: cargo build --release --locked --bin edgefront --bin edgefront-bench
+      # The segment store's warm restart, timed: a million objects from the
+      # index snapshot in under a second. Only a release build is held to it.
+      - name: Warm restart of a million objects
+        run: cargo test --release --locked -p edgefront-cache --test segment_restart -- --nocapture
       # The images from the binaries just built (bench/Dockerfile.prebuilt),
       # under the tags the runner uses, so it builds nothing itself.
       - name: Build the benchmark images

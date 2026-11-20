@@ -256,6 +256,36 @@ impl Metrics {
                 "URLs held by the disk tier.",
                 disk.len() as u64,
             );
+            gauge(
+                &mut out,
+                "cachet_disk_segment_bytes",
+                "Bytes of the disk tier's segment files, dead records included.",
+                disk.disk_bytes(),
+            );
+            gauge(
+                &mut out,
+                "cachet_disk_segments",
+                "Segment files of the disk tier.",
+                disk.segments() as u64,
+            );
+            counter(
+                &mut out,
+                "cachet_disk_user_bytes_total",
+                "Record bytes the cache asked the disk tier to write.",
+                disk.user_bytes.load(Ordering::Relaxed),
+            );
+            counter(
+                &mut out,
+                "cachet_disk_written_bytes_total",
+                "Bytes the disk tier wrote: records, tombstones and compaction's copies. Over cachet_disk_user_bytes_total, the write amplification.",
+                disk.written_bytes.load(Ordering::Relaxed),
+            );
+            counter(
+                &mut out,
+                "cachet_disk_compacted_bytes_total",
+                "Bytes compaction copied to the head of the log.",
+                disk.compacted_bytes.load(Ordering::Relaxed),
+            );
         }
         gauge(
             &mut out,

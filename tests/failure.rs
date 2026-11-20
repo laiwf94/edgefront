@@ -9,9 +9,10 @@ use common::{
     node_config, raw_sequence, raw_server, reply, secrets,
 };
 
-/// Kill the binary with SIGKILL mid-life, leave a half-written temporary
-/// file behind, take the origin down, and restart: the object comes back
-/// from the disk tier.
+/// Kill the binary with SIGKILL mid-life, leave a half-written record at
+/// the end of the segment it was writing, take the origin down, and
+/// restart: the object comes back from the disk tier and the torn record is
+/// cut off.
 #[tokio::test]
 async fn crash_and_restart_serves_from_disk() {
     let o = TestOrigin::start(handler(|_, _| {
@@ -38,7 +39,18 @@ async fn crash_and_restart_serves_from_disk() {
     .await;
     bin.signal("KILL");
     drop(bin);
-    std::fs::write(disk.join("tmp").join("torn-write"), b"CACHET\0\x01 partial").unwrap();
+    let segment = std::fs::read_dir(disk.join("segments"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .max()
+        .unwrap();
+    let whole = std::fs::metadata(&segment).unwrap().len();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"EFS1\x01\x00\x00\x10\x00 partial").unwrap();
+    drop(file);
     o.stop();
 
     let bin = Binary::start(&dir.0, &config, &[]);
@@ -50,7 +62,7 @@ async fn crash_and_restart_serves_from_disk() {
         "{}",
         got.cache_status()
     );
-    assert!(!disk.join("tmp").join("torn-write").exists());
+    assert_eq!(std::fs::metadata(&segment).unwrap().len(), whole);
 }
 
 #[tokio::test]
