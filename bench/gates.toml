@@ -56,7 +56,11 @@ committed_models = []
 # swapping every round, so a steady drift in the runner favours neither.
 # The comparison is with the change's own base commit, not baseline_commit,
 # so a pull request answers for its own diff and not for everything merged
-# since the gate was set.
+# since the gate was set. First proof at nine (bench runs 80-85): three
+# unchanged runs passed both metrics (largest change 1.9%); the 3 us plant
+# measured 7.1% (p < 0.0001, failed), 3.1% (p = 0.0071, under 5%) and 7.8%
+# (p = 0.020, passed), so the proof still needs a plant that costs a
+# measured 10% (docs/DESIGN.md).
 
 # Response-time p99 at a fixed 2,000 requests per second.
 [metrics.p99_ms]
