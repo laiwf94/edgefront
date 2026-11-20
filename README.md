@@ -185,14 +185,46 @@ edgefront ctl limits -s /run/pacerd/admin.sock client 192.0.2.7
 
 `examples/l4_limits.sh` is pacer's live demo on edgefront: the same config and clients, checking the connection-rate limit and its recovery, a slowloris client cut off beside a steady one, and a drain that finishes a download in flight byte for byte. CI runs it, and `crates/edgefront/tests/e2e_l4_limits.rs` runs it under `make test`. How it maps onto pacerd, and the two places it differs, are in [docs/DESIGN.md](docs/DESIGN.md#running-the-data-path-edgefront-limits).
 
+### Address policy
+
+A TOML limiter config can add an `[address_policy]` section to `edgefront limits`: allow and deny lists, classes of prefixes with limits of their own, IPv6 grouping per class, and the real client behind trusted proxies.
+
+```toml
+[address_policy]
+header = "x-forwarded-for"                  # or "forwarded" (RFC 7239); leave out to limit the peer
+trusted_proxies = ["10.0.0.1", "192.0.2.0/24"]
+trusted_proxy_files = ["proxies.txt"]       # one prefix per line, # comments; paths beside the config
+ipv6_prefix = 64                            # the default grouping
+
+[[address_policy.classes]]
+name = "blocked"
+action = "deny"                             # allow, deny or limit
+files = ["blocked.txt"]
+
+[[address_policy.classes]]
+name = "partners"
+action = "limit"
+prefixes = ["203.0.113.0/24", "2001:db8:100::/40"]
+ipv6_prefix = 48                            # one /48 is one client
+per_ip_max_conns = 50
+per_ip_conn_rate = "100/s burst 200"
+```
+
+- **The most specific prefix wins**, whatever its class: a partner's /24 inside a denied /16 is the partner's. A prefix in two classes is refused when the config loads. An address no class lists gets the listener's own limits.
+- **`deny` refuses with nothing read; `allow` lifts the per-client limits; `limit` replaces them** with the class's cap and rate, kept in a table of the class's own. The listener's `max_conns` and byte rates apply to everyone.
+- **The client behind proxies**: with `header` set, the request head is peeked (the upstream still gets every byte), and `X-Forwarded-For` or `Forwarded` is walked from the right through the trusted proxies to the first address that is not one. What a client writes in the header itself is never reached; a connection from an untrusted peer is limited as that peer. An IPv4-mapped IPv6 address counts as its IPv4 address.
+- **Operation.** `edgefront check edge.toml` and `edgefront limits -c edge.toml -t` report the lists' sizes and memory: a config with a million-prefix deny list prints `address_policy: 2 trusted proxies, 3 classes, 1000002 prefixes, 92517736 bytes`, then a line per class and per list file, in 1.0 s. SIGHUP re-reads the list files and swaps the new lists in without stopping lookups; a bad line refuses the reload and keeps the running policy. Refusals are logged as `conn rejected reason=class_deny class=blocked client=198.51.100.9`, and `edgefront ctl limits stats` adds a line with each verdict's count.
+
+A list of a million prefixes loads and reloads in 0.3 to 0.4 s, and a lookup takes 34 to 35 ns at p99, measured on this Mac (details in [docs/DESIGN.md](docs/DESIGN.md#address-policy)). `crates/edgefront/tests/e2e_address_policy.rs` runs it behind two trusted proxies: deny from a list file, allow, a limited partner class, forged headers, a default client and a reload.
+
 ### Migrating from pacer
 
 pacer is fully ported, and `legacy/pacer` is deleted (commit 54a2d6f). Its history stays reachable: `git log -- legacy/pacer` lists every commit that touched it in this repository, and `git log ff1d5f6^2` lists its own 36 commits from before the merge; `git checkout 54a2d6f^ -- legacy/pacer` brings the C back to build it. To move a pacerd deployment to `edgefront limits`:
 
-- **The config file is unchanged.** A pacerd.conf loads as it is, with pacerd's messages and line numbers for its mistakes; `edgefront limits -c pacerd.conf -t` is `pacerd -t`, and `edgefront check pacerd.conf` adds the lints. `edgefront check --print pacerd.conf` writes the same config as the TOML limiter section, which also takes `RateSpec` rates and quotas. pacer's example is `examples/limiter/pacerd.conf`.
+- **The config file is unchanged.** A pacerd.conf loads as it is, with pacerd's messages and line numbers for its mistakes; `edgefront limits -c pacerd.conf -t` is `pacerd -t`, and `edgefront check pacerd.conf` adds the lints. `edgefront check --print pacerd.conf` writes the same config as the TOML limiter section, which also takes `RateSpec` rates, quotas and the address policy. pacer's example is `examples/limiter/pacerd.conf`.
 - **pacerctl is `edgefront ctl limits -s SOCKET`**, with the same `stats`, `ping`, `reload` and `drain`; `stats` prints the same lines. The admin socket speaks HTTP instead of pacerd's line protocol, so a script that wrote to the socket itself moves to `ctl` or to `curl --unix-socket SOCKET http://edgefront/stats`.
 - **The log lines, counters, exit codes and signals are pacerd's**: SIGHUP reloads in place, SIGTERM drains, and a client keeps its debt across a reload as it did.
-- **What pacer did not have:** `top` and `client` in `ctl`, connection quotas, and the lints of `edgefront check`.
+- **What pacer did not have:** `top` and `client` in `ctl`, connection quotas, the lints of `edgefront check`, and [address policy](#address-policy).
 - **libpacer users** move to `edgefront-limiter`: the same algorithms with the same answers, held to libpacer's recorded transcripts by `make difftest-pacer`; the differences are listed in [docs/DESIGN.md](docs/DESIGN.md#porting-pacer-the-limiter-algorithms).
 
 [docs/benchmarks/pacer-port.md](docs/benchmarks/pacer-port.md) compares the two, measured before the deletion. edgefront-limiter makes more decisions per second than libpacer at every workload and thread count, from 1.07 to 2.90 times as many. Through `edgefront limits` a 64-byte round trip has a p99 of 173.1 µs against pacerd's 194.5, and a p50 of 96.0 against 94.0 (medians of three sessions). A tracked client costs 134.4 bytes against libpacer's 130.2. `crates/edgefront/tests/e2e_pacer_retired.rs` runs pacer's own example config through `edgefront limits` and checks that nothing in the build still needs legacy/pacer.
