@@ -317,7 +317,22 @@ async fn a_client_joining_a_slice_fill_gets_its_first_byte_at_once() {
     up.pace.store(20, Ordering::SeqCst);
     let (addr, cache, _stop) = start(&up).await;
     let leader = tokio::spawn(async move { fetch(addr, "").await });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Join once the fill is under way: its first slices are stored and the
+    // origin is still sending.
+    for _ in 0..1000 {
+        if cache.contains(&slice_key("a/video", 2)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        cache.contains(&slice_key("a/video", 2)),
+        "the fill never started"
+    );
+    assert!(
+        !cache.contains("a/video"),
+        "the fill ended before the client joined"
+    );
     let joined = Instant::now();
     let follower = fetch(addr, "").await;
     let leader = leader.await.unwrap();
