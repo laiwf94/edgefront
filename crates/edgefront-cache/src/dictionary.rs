@@ -602,7 +602,8 @@ pub fn compress(
                 size_hint: data.len(),
                 ..Default::default()
             };
-            let mut input = brotli::IoReaderWrapper(&mut &data[..]);
+            let mut source = data;
+            let mut input = brotli::IoReaderWrapper(&mut source);
             let mut output = brotli::IoWriterWrapper(&mut out);
             let (mut ib, mut ob) = (vec![0u8; 4096], vec![0u8; 4096]);
             brotli::enc::BrotliCompressCustomIoCustomDict(
