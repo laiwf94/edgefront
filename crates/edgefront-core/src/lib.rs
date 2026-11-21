@@ -43,6 +43,7 @@ pub mod filter;
 pub mod h2;
 pub mod http1;
 pub mod ids;
+pub mod interim;
 pub mod l4;
 pub mod listener;
 pub mod metrics;

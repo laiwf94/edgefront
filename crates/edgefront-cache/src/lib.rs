@@ -13,6 +13,7 @@ pub mod cluster;
 pub mod collapse;
 pub mod config;
 pub mod dictionary;
+pub mod early_hints;
 pub mod encoding;
 pub mod fill;
 pub mod headers;

@@ -355,3 +355,201 @@ async fn requests_a_dictionary_does_not_apply_to_get_the_usual_coding() {
         assert!(!got.cache_status().contains("detail=dc"), "{what}");
     }
 }
+
+/// What a raw HTTP/1.x client saw of one exchange: each response head in
+/// order with when its first byte arrived, and the final body.
+struct Exchange {
+    heads: Vec<(u16, String, Duration)>,
+    body: Vec<u8>,
+}
+
+/// Sends `request` on `conn` and reads interim responses and the final
+/// one, timing each from when the request was written.
+async fn exchange(conn: &mut tokio::net::TcpStream, request: &str) -> Exchange {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    conn.write_all(request.as_bytes()).await.unwrap();
+    let sent = std::time::Instant::now();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut heads = Vec::new();
+    let mut seen = 0;
+    let mut arrived = Vec::new();
+    loop {
+        // Every complete head in the buffer, timed by when its first byte
+        // came in.
+        while let Some(end) = buf[seen..].windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8(buf[seen..seen + end].to_vec()).unwrap();
+            let status: u16 = head[9..12].parse().unwrap();
+            // The read that brought the head's first byte.
+            let at = arrived
+                .iter()
+                .rev()
+                .find(|(offset, _): &&(usize, Duration)| *offset <= seen)
+                .map_or(Duration::ZERO, |(_, t)| *t);
+            heads.push((status, head.clone(), at));
+            seen += end + 4;
+            if status >= 200 {
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while buf.len() < seen + len {
+                    let mut chunk = [0u8; 65536];
+                    let n = conn.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "closed in the body");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                return Exchange {
+                    heads,
+                    body: buf[seen..seen + len].to_vec(),
+                };
+            }
+        }
+        let mut chunk = [0u8; 65536];
+        let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut chunk))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert!(n > 0, "closed before the final response");
+        arrived.push((buf.len(), sent.elapsed()));
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+const PAGE_LINKS: [(&str, &str); 2] = [
+    (
+        "link",
+        "</app.css>; rel=preload; as=style, </app.js>; rel=modulepreload",
+    ),
+    ("link", "</next.html>; rel=next"),
+];
+
+/// A node in front of an origin whose HTML page must be revalidated on
+/// every request and takes `think` to answer.
+async fn page_node(early_hints: bool, think: Duration) -> (TestOrigin, cachet::node::Node) {
+    let origin = TestOrigin::start(handler(|parts, _| {
+        if parts
+            .headers
+            .get("if-none-match")
+            .is_some_and(|v| v == "\"p1\"")
+        {
+            return reply(
+                304,
+                &[("etag", "\"p1\""), ("cache-control", "no-cache")],
+                "",
+            );
+        }
+        let mut headers = vec![
+            ("content-type", "text/html; charset=utf-8"),
+            ("cache-control", "no-cache"),
+            ("etag", "\"p1\""),
+        ];
+        headers.extend(PAGE_LINKS);
+        reply(200, &headers, "<!doctype html><title>page</title>")
+    }))
+    .await;
+    let extra = format!("[cache]\nearly_hints = {early_hints}\n");
+    let config = common::node_config("edge-a", &[origin.addr], &extra);
+    let node = cachet::node::start(&config, &common::secrets())
+        .await
+        .unwrap();
+    // The first request stores the page; the delay starts after it.
+    let mut conn = tokio::net::TcpStream::connect(node.proxy_addr)
+        .await
+        .unwrap();
+    let first = exchange(&mut conn, "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(
+        first.heads.len(),
+        1,
+        "nothing stored, so no hints: {:?}",
+        first.heads
+    );
+    origin.set_delay(think);
+    (origin, node)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn early_hints_arrive_before_the_origin_answers_a_revalidation() {
+    let think = Duration::from_millis(300);
+    let (origin, node) = page_node(true, think).await;
+    let mut conn = tokio::net::TcpStream::connect(node.proxy_addr)
+        .await
+        .unwrap();
+    // Twice on one connection: each request gets its own hints.
+    for round in 0..2 {
+        let got = exchange(&mut conn, "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        let statuses: Vec<u16> = got.heads.iter().map(|h| h.0).collect();
+        assert_eq!(statuses, [103, 200], "round {round}");
+        let (_, hints, hinted_at) = &got.heads[0];
+        assert!(hints.starts_with("HTTP/1.1 103 Early Hints\r\n"), "{hints}");
+        assert!(
+            hints.contains("link: </app.css>; rel=preload; as=style"),
+            "{hints}"
+        );
+        assert!(
+            hints.contains("link: </app.js>; rel=modulepreload"),
+            "{hints}"
+        );
+        assert!(!hints.contains("rel=next"), "{hints}");
+        let (_, last, final_at) = &got.heads[1];
+        assert!(
+            last.to_ascii_lowercase().contains("link: </app.css>"),
+            "the final response keeps them"
+        );
+        assert_eq!(got.body, b"<!doctype html><title>page</title>");
+        let gain = final_at.saturating_sub(*hinted_at);
+        println!(
+            "round {round}: 103 after {:.1} ms, 200 after {:.1} ms, first-byte gain {:.1} ms (origin think time {} ms)",
+            hinted_at.as_secs_f64() * 1e3,
+            final_at.as_secs_f64() * 1e3,
+            gain.as_secs_f64() * 1e3,
+            think.as_millis()
+        );
+        assert!(
+            gain >= think,
+            "gain {gain:?} under the think time {think:?}"
+        );
+    }
+    assert_eq!(
+        node.proxy
+            .metrics
+            .early_hints
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert_eq!(origin.hits(), 3);
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clients_that_cannot_take_hints_get_the_final_response_alone() {
+    let think = Duration::from_millis(100);
+    // HTTP/1.0 forbids 1xx responses.
+    let (_origin, node) = page_node(true, think).await;
+    let mut conn = tokio::net::TcpStream::connect(node.proxy_addr)
+        .await
+        .unwrap();
+    let got = exchange(&mut conn, "GET /page HTTP/1.0\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(got.heads.iter().map(|h| h.0).collect::<Vec<_>>(), [200]);
+    assert!(
+        got.heads[0].2 >= think,
+        "the first byte waits for the origin"
+    );
+    node.shutdown().await;
+    // With early_hints off, the first byte waits for the origin too.
+    let (_origin, node) = page_node(false, think).await;
+    let mut conn = tokio::net::TcpStream::connect(node.proxy_addr)
+        .await
+        .unwrap();
+    let got = exchange(&mut conn, "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+    assert_eq!(got.heads.iter().map(|h| h.0).collect::<Vec<_>>(), [200]);
+    assert!(got.heads[0].2 >= think);
+    println!(
+        "without hints the first byte came after {:.1} ms",
+        got.heads[0].2.as_secs_f64() * 1e3
+    );
+    node.shutdown().await;
+}

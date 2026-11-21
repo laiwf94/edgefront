@@ -201,6 +201,9 @@ pub struct CacheConfig {
     pub disk: Option<DiskConfig>,
     /// Compressed variants of stored responses ([`crate::variants`]).
     pub compression: CompressionConfig,
+    /// Send `103 Early Hints` from a stored HTML page's preload links
+    /// while it is revalidated or fetched again ([`crate::early_hints`]).
+    pub early_hints: bool,
     /// The routes the cache serves, each with its overrides.
     pub routes: Vec<RouteCacheConfig>,
 }
@@ -271,6 +274,7 @@ impl Default for CacheConfig {
             slice_bytes: crate::slice::DEFAULT_SLICE_BYTES,
             disk: None,
             compression: CompressionConfig::default(),
+            early_hints: false,
             routes: Vec::new(),
         }
     }

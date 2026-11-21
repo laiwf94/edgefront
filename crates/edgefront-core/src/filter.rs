@@ -58,6 +58,10 @@ pub struct RequestHead<'a> {
     pub uri: &'a Uri,
     /// The request's headers. Changes here are what goes upstream.
     pub headers: &'a mut HeaderMap,
+    /// The request's extensions: what the server learnt about it, such as
+    /// its TLS session or the [`crate::interim::Interim`] that sends
+    /// `103 Early Hints` ahead of the response.
+    pub extensions: &'a http::Extensions,
 }
 
 /// What the request phase decided.
@@ -216,6 +220,7 @@ where
             method: &parts.method,
             uri: &parts.uri,
             headers: &mut parts.headers,
+            extensions: &parts.extensions,
         })
         .await;
     let req = Request::from_parts(parts, body);

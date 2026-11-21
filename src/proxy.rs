@@ -85,6 +85,8 @@ pub struct ProxySettings {
     pub compress: bool,
     pub compression: edgefront_cache::variants::CompressionSettings,
     pub dictionaries: edgefront_cache::dictionary::DictionarySettings,
+    /// Send 103 Early Hints from stored HTML's preload links.
+    pub early_hints: bool,
 }
 
 impl Default for ProxySettings {
@@ -99,6 +101,7 @@ impl Default for ProxySettings {
             compress: false,
             compression: Default::default(),
             dictionaries: Default::default(),
+            early_hints: false,
         }
     }
 }
@@ -164,6 +167,7 @@ impl Proxy {
                 via: Some(via.clone()),
                 compression: settings.compression.clone(),
                 dictionaries: settings.dictionaries.clone(),
+                early_hints: settings.early_hints,
             },
             clock,
             metrics.clone(),

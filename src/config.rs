@@ -74,6 +74,7 @@ impl Settings for Config {
             compress: self.cache.compression.enabled,
             compression: self.cache.compression.settings(),
             dictionaries: self.cache.compression.dictionaries(),
+            early_hints: self.cache.early_hints,
         }
     }
 }

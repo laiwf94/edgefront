@@ -35,6 +35,7 @@ pub struct Metrics {
     not_stored: [AtomicU64; NOT_STORABLE.len()],
     pub collapsed: AtomicU64,
     pub background_refreshes: AtomicU64,
+    pub early_hints: AtomicU64,
     pub streamed_uncached: AtomicU64,
     pub purges_local: AtomicU64,
     pub purges_peer: AtomicU64,
@@ -62,6 +63,10 @@ impl crate::layer::Observer for Metrics {
 
     fn background_refresh(&self) {
         self.background_refreshes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn early_hints(&self) {
+        self.early_hints.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -193,6 +198,12 @@ impl Metrics {
             "cachet_background_refreshes_total",
             "Stale-while-revalidate refreshes started.",
             get(&self.background_refreshes),
+        );
+        counter(
+            &mut out,
+            "cachet_early_hints_total",
+            "103 Early Hints sent before an origin fetch.",
+            get(&self.early_hints),
         );
         counter(
             &mut out,

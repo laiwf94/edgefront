@@ -21,6 +21,8 @@ shards = 16
 max_variants = 8              # stored variants per URL when the origin sends Vary
 heuristic_max_secs = 86400    # cap on freshness guessed from Last-Modified
 
+early_hints = false           # 103 Early Hints from stored HTML's preload links while it is refetched
+
 # Compressed variants: text-like responses stored as br, zstd and gzip too,
 # chosen by Accept-Encoding. Off by default.
 [cache.compression]

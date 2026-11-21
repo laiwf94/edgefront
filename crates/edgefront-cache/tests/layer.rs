@@ -283,6 +283,7 @@ async fn routes_without_a_policy_have_no_filter() {
             method: &method,
             uri: &uri,
             headers: &mut headers,
+            extensions: &http::Extensions::new(),
         })
         .await;
     assert!(matches!(d, Decision::Forward(None)));
@@ -296,6 +297,7 @@ async fn routes_without_a_policy_have_no_filter() {
             method: &method,
             uri: &uri,
             headers: &mut headers,
+            extensions: &http::Extensions::new(),
         })
         .await;
     assert!(matches!(d, Decision::Forward(None)));

@@ -61,6 +61,7 @@ use crate::cache_control::{CacheControl, is_tchar};
 use crate::collapse::{Collapser, Flight, Lead};
 use crate::config::{RoutePolicies, RoutePolicy};
 use crate::dictionary::{DictCoding, Dictionaries, Dictionary, DictionarySettings};
+use crate::early_hints;
 use crate::encoding::Coding;
 use crate::fill::{End, Filling};
 use crate::headers::strip_hop_by_hop;
@@ -71,6 +72,7 @@ use crate::respond;
 use crate::slice::{self, Layout, Progress, SLICES, Slicer};
 use crate::store::Cache;
 use crate::variants::{self, CompressionSettings, Compressor};
+use edgefront_core::interim::Interim;
 
 /// Wall-clock time, replaceable in tests.
 pub trait Clock: Send + Sync {
@@ -185,6 +187,8 @@ pub trait Observer: Send + Sync {
     fn collapsed(&self) {}
     /// A stale copy refreshed in the background.
     fn background_refresh(&self) {}
+    /// A `103 Early Hints` sent ahead of an upstream fetch.
+    fn early_hints(&self) {}
 }
 
 struct Quiet;
@@ -207,6 +211,9 @@ pub struct LayerSettings {
     pub compression: CompressionSettings,
     /// Limits of the shared dictionaries those routes keep.
     pub dictionaries: DictionarySettings,
+    /// Send `103 Early Hints` from a stored HTML page's preload links
+    /// while it is fetched or revalidated ([`crate::early_hints`]).
+    pub early_hints: bool,
 }
 
 impl Default for LayerSettings {
@@ -217,6 +224,7 @@ impl Default for LayerSettings {
             via: None,
             compression: CompressionSettings::default(),
             dictionaries: DictionarySettings::default(),
+            early_hints: false,
         }
     }
 }
@@ -249,6 +257,7 @@ struct Shared {
     observer: Arc<dyn Observer>,
     compressor: Arc<Compressor>,
     dictionaries: Arc<Dictionaries>,
+    early_hints: bool,
 }
 
 /// What a leading fill got from upstream, as its followers see it.
@@ -318,6 +327,7 @@ impl CacheLayer {
                 observer,
                 compressor: Arc::new(Compressor::new(settings.compression)),
                 dictionaries: Arc::new(Dictionaries::new(settings.dictionaries)),
+                early_hints: settings.early_hints,
             }),
         })
     }
@@ -679,6 +689,16 @@ impl Shared {
                 // A refresh or fill is already on its way.
                 Flight::Follow(_) => Decision::Respond(resp),
             };
+        }
+        // The page's hints go out before the origin's think time.
+        if self.early_hints
+            && *method == Method::GET
+            && let Some(page) = &stored
+            && let Some(hints) = early_hints::hints(page)
+            && let Some(interim) = req.extensions.get::<Interim>()
+            && interim.send(early_hints::EARLY_HINTS, &hints)
+        {
+            self.observer.early_hints();
         }
         loop {
             let follow = match self.collapser.lead_or_follow(key.clone()) {

@@ -39,7 +39,7 @@ use std::net::SocketAddr;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -55,6 +55,7 @@ use tokio::time::Instant;
 
 use crate::h2::server::{Rewind, sniff_preface};
 use crate::http1::{BoxError, HoldBody, server_builder};
+use crate::interim::InterimSlot;
 use crate::tls::{Acceptor, Slot, TlsInfo};
 
 /// Limits for every connection a listener accepts.
@@ -469,10 +470,45 @@ impl Drop for Busy {
     }
 }
 
-/// A stream that reports reads to its watchdog.
+/// A stream that reports reads to its watchdog, and on HTTP/1.1 writes
+/// the current request's interim responses ahead of hyper's bytes
+/// ([`crate::interim`]).
 struct Watched<S> {
     stream: S,
     watch: Arc<Watch>,
+    interim: Option<Arc<InterimSlot>>,
+}
+
+impl<S: AsyncWrite + Unpin> Watched<S> {
+    /// Writes queued interim responses. Ready when none are left.
+    fn poll_interim(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(slot) = &self.interim else {
+            return Poll::Ready(Ok(()));
+        };
+        slot.register(cx.waker());
+        let (stream, watch) = (&mut self.stream, &self.watch);
+        match slot.drain(|bytes| match Pin::new(&mut *stream).poll_write(cx, bytes) {
+            Poll::Ready(Ok(n)) => {
+                watch.bytes.fetch_add(n as u64, Ordering::Relaxed);
+                Some(Ok(n))
+            }
+            Poll::Ready(Err(e)) => Some(Err(e)),
+            Poll::Pending => None,
+        }) {
+            Some(done) => Poll::Ready(done),
+            None => Poll::Pending,
+        }
+    }
+
+    /// hyper is writing: interim responses first, then none for this
+    /// request.
+    fn poll_before_final(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.poll_interim(cx))?;
+        if let Some(slot) = &self.interim {
+            slot.close();
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
@@ -498,6 +534,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        ready!(this.poll_before_final(cx))?;
         let polled = Pin::new(&mut this.stream).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = polled {
             this.watch.bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -511,6 +548,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        ready!(this.poll_before_final(cx))?;
         let polled = Pin::new(&mut this.stream).poll_write_vectored(cx, bufs);
         if let Poll::Ready(Ok(n)) = polled {
             this.watch.bytes.fetch_add(n as u64, Ordering::Relaxed);
@@ -523,7 +561,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+        let this = self.get_mut();
+        ready!(this.poll_interim(cx))?;
+        Pin::new(&mut this.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -545,8 +585,10 @@ async fn connection<S, H: Handler>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let watch = Arc::new(Watch::with_h2(matches!(proto, Proto::Http2(_))));
+    let interim = matches!(proto, Proto::Http1).then(|| Arc::new(InterimSlot::default()));
     let service = {
         let watch = watch.clone();
+        let interim = interim.clone();
         let quota = handler.conn_quota();
         let http1 = matches!(proto, Proto::Http1);
         service_fn(move |mut req: Request<Incoming>| {
@@ -554,6 +596,14 @@ async fn connection<S, H: Handler>(
             let busy = Busy::new(watch.clone());
             if let Some(info) = &tls {
                 req.extensions_mut().insert(Arc::clone(info));
+            }
+            // A new request retires the last one's interim responses; only
+            // HTTP/1.1 clients may get any.
+            if let Some(slot) = &interim {
+                let handle = slot.begin();
+                if req.version() == http::Version::HTTP_11 {
+                    req.extensions_mut().insert(handle);
+                }
             }
             let handler = handler.clone();
             async move {
@@ -571,6 +621,7 @@ async fn connection<S, H: Handler>(
     let io = TokioIo::new(Watched {
         stream,
         watch: watch.clone(),
+        interim,
     });
     match proto {
         Proto::Http1 => {

@@ -1335,6 +1335,7 @@ impl Proxy {
                     method: &parts.method,
                     uri: &parts.uri,
                     headers: &mut parts.headers,
+                    extensions: &parts.extensions,
                 })
                 .await;
             let resp = match decision {
