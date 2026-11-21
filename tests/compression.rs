@@ -647,3 +647,38 @@ async fn compression_over_the_budget_is_skipped_and_the_responses_still_served()
     assert_eq!(got.header("content-encoding"), "");
     assert_eq!(got.body.len(), len);
 }
+
+#[tokio::test]
+async fn clients_without_compression_support_get_identity_from_every_feature() {
+    let origin = bundle_origin().await;
+    let h = compressing(&origin);
+    h.get("/js/app.v1.js", &[]).await;
+    h.get("/js/app.v2.js", &[]).await;
+    settled(&h).await;
+    // A dictionary without a coding to use it, no Accept-Encoding at all,
+    // identity only, and codings the cache does not make: the bundle as
+    // the origin sent it, with Vary telling caches downstream why.
+    let mut no_ae = with_dictionary(APP_V1, "");
+    no_ae.remove(0);
+    let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+        ("dictionary, no Accept-Encoding", no_ae),
+        (
+            "dictionary, identity only",
+            with_dictionary(APP_V1, "identity"),
+        ),
+        ("no headers", vec![]),
+        (
+            "deflate and compress",
+            vec![("accept-encoding".into(), "deflate, compress".into())],
+        ),
+    ];
+    for (what, headers) in cases {
+        let got = get_with(&h, "/js/app.v2.js", &headers).await;
+        assert_eq!(got.status, 200, "{what}");
+        assert_eq!(got.header("content-encoding"), "", "{what}");
+        assert_eq!(got.header("vary"), "accept-encoding", "{what}");
+        assert_eq!(got.body, APP_V2.as_bytes(), "{what}");
+        assert_eq!(got.header("etag"), "", "{what}: the origin sent none");
+    }
+    assert_eq!(origin.hits(), 2);
+}
