@@ -1,0 +1,2 @@
+match="app\\*.js", type=raw, x=?1
+/app*.js

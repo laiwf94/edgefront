@@ -100,6 +100,7 @@ jobs:
           - { crate: edgefront-cache, target: disk_record }
           - { crate: edgefront-cache, target: purge_messages }
           - { crate: edgefront-cache, target: accept_encoding }
+          - { crate: edgefront-cache, target: use_as_dictionary }
           - { crate: edgefront-core, target: request_id }
           - { crate: edgefront-core, target: base_url }
           - { crate: edgefront-core, target: bearer_token }

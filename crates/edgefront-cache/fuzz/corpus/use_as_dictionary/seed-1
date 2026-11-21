@@ -1,0 +1,2 @@
+match="/js/app.*.js", match-dest=("script"), id="v1"
+/js/app.v2.js

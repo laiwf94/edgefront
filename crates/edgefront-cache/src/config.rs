@@ -216,22 +216,38 @@ pub struct CompressionConfig {
     pub brotli_quality: u32,
     pub zstd_level: i32,
     pub gzip_level: u32,
+    /// The largest response kept as a shared dictionary (RFC 9842).
+    pub dictionary_max_bytes: usize,
+    /// The longest a dictionary is kept, however long it is fresh.
+    pub dictionary_max_ttl_secs: u64,
 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         let s = crate::variants::CompressionSettings::default();
+        let d = crate::dictionary::DictionarySettings::default();
         CompressionConfig {
             enabled: false,
             min_bytes: s.min_bytes,
             brotli_quality: s.brotli_quality,
             zstd_level: s.zstd_level,
             gzip_level: s.gzip_level,
+            dictionary_max_bytes: d.max_dictionary_bytes,
+            dictionary_max_ttl_secs: d.max_ttl.as_secs(),
         }
     }
 }
 
 impl CompressionConfig {
+    /// The dictionary store's limits.
+    pub fn dictionaries(&self) -> crate::dictionary::DictionarySettings {
+        crate::dictionary::DictionarySettings {
+            max_dictionary_bytes: self.dictionary_max_bytes,
+            max_ttl: Duration::from_secs(self.dictionary_max_ttl_secs),
+            ..crate::dictionary::DictionarySettings::default()
+        }
+    }
+
     /// The settings the compressor runs with.
     pub fn settings(&self) -> crate::variants::CompressionSettings {
         crate::variants::CompressionSettings {
@@ -678,6 +694,16 @@ impl Config {
         }
         if !(1..=9).contains(&z.gzip_level) {
             return Err("cache.compression.gzip_level must be between 1 and 9".into());
+        }
+        if !(1..=64 << 20).contains(&z.dictionary_max_bytes) {
+            return Err(
+                "cache.compression.dictionary_max_bytes must be between 1 and 64 MiB".into(),
+            );
+        }
+        if !(1..=MAX_TTL_SECS).contains(&z.dictionary_max_ttl_secs) {
+            return Err(
+                "cache.compression.dictionary_max_ttl_secs must be between 1 and one year".into(),
+            );
         }
         if z.min_bytes == 0 {
             return Err("cache.compression.min_bytes must be positive".into());

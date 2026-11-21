@@ -218,3 +218,140 @@ async fn variants_are_purged_and_refreshed_together() {
     assert!(fresh.cache_status().contains("hit"));
     assert_eq!(h.proxy.cache.memory().get(key).unwrap().variants.len(), 4);
 }
+
+/// The two releases of the fixture bundle (tests/fixtures/compression).
+const APP_V1: &str = include_str!("fixtures/compression/app.v1.js");
+const APP_V2: &str = include_str!("fixtures/compression/app.v2.js");
+
+/// An origin serving the bundle's releases, v1 offered as a dictionary for
+/// every later release.
+async fn bundle_origin() -> TestOrigin {
+    TestOrigin::start(handler(|parts, _| {
+        let mut headers = vec![
+            ("content-type", "text/javascript"),
+            ("cache-control", "max-age=3600"),
+        ];
+        let body = match parts.uri.path() {
+            "/js/app.v1.js" => {
+                headers.push((
+                    "use-as-dictionary",
+                    r#"match="/js/app.*.js", match-dest=("script"), id="app""#,
+                ));
+                APP_V1
+            }
+            "/js/app.v2.js" => APP_V2,
+            _ => return reply(404, &[], ""),
+        };
+        reply(200, &headers, body)
+    }))
+    .await
+}
+
+fn with_dictionary(dict: &str, ae: &str) -> Vec<(String, String)> {
+    let hash = edgefront_cache::dictionary::hash(dict.as_bytes());
+    vec![
+        ("accept-encoding".into(), ae.into()),
+        (
+            "available-dictionary".into(),
+            format!(":{}:", edgefront_cache::dictionary::base64(&hash)),
+        ),
+        ("dictionary-id".into(), "\"app\"".into()),
+        ("sec-fetch-dest".into(), "script".into()),
+    ]
+}
+
+async fn get_with(h: &Harness, path: &str, headers: &[(String, String)]) -> common::Got {
+    let pairs: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    h.get(path, &pairs).await
+}
+
+#[tokio::test]
+async fn a_repeat_bundle_download_with_a_dictionary_is_a_fraction_of_brotli() {
+    use edgefront_cache::dictionary::{DictCoding, decompress as dict_decompress};
+    let origin = bundle_origin().await;
+    let h = compressing(&origin);
+    // The first visit loads v1, which offers itself as a dictionary.
+    let v1 = h.get("/js/app.v1.js", &[("accept-encoding", "br")]).await;
+    assert_eq!(v1.body, APP_V1.as_bytes());
+    assert!(v1.header("use-as-dictionary").contains("app.*.js"));
+    // The release after it, plain brotli for a client without v1.
+    h.get("/js/app.v2.js", &[]).await;
+    settled(&h).await;
+    let br = h.get("/js/app.v2.js", &[("accept-encoding", "br")]).await;
+    assert_eq!(br.header("content-encoding"), "br");
+    // The same release for a client that holds v1.
+    let mut sizes = Vec::new();
+    for (ae, coding) in [
+        ("gzip, br, zstd, dcb, dcz", DictCoding::Dcb),
+        ("zstd, dcz", DictCoding::Dcz),
+    ] {
+        let got = get_with(&h, "/js/app.v2.js", &with_dictionary(APP_V1, ae)).await;
+        assert_eq!(got.status, 200);
+        assert_eq!(got.header("content-encoding"), coding.as_str());
+        assert_eq!(got.header("vary"), "accept-encoding, available-dictionary");
+        assert!(
+            got.cache_status()
+                .contains(&format!("detail={}", coding.as_str())),
+            "{}",
+            got.cache_status()
+        );
+        assert_eq!(got.header("content-length"), got.body.len().to_string());
+        let plain = dict_decompress(coding, APP_V1.as_bytes(), &got.body, APP_V2.len()).unwrap();
+        assert_eq!(plain, APP_V2.as_bytes());
+        // A second request is answered from the kept body, byte for byte.
+        let again = get_with(&h, "/js/app.v2.js", &with_dictionary(APP_V1, ae)).await;
+        assert_eq!(again.body, got.body);
+        sizes.push((coding, got.body.len()));
+    }
+    let saved = |n: usize| 100.0 * (1.0 - n as f64 / br.body.len() as f64);
+    println!(
+        "app.v2.js: identity {} bytes, br {} bytes, dcb {} bytes ({:.1}% under br), dcz {} bytes ({:.1}% under br)",
+        APP_V2.len(),
+        br.body.len(),
+        sizes[0].1,
+        saved(sizes[0].1),
+        sizes[1].1,
+        saved(sizes[1].1)
+    );
+    for (coding, n) in &sizes {
+        assert!(saved(*n) >= 60.0, "{coding:?} saved only {:.1}%", saved(*n));
+    }
+    // One origin request per release, however it was asked for.
+    assert_eq!(origin.hits(), 2);
+}
+
+#[tokio::test]
+async fn requests_a_dictionary_does_not_apply_to_get_the_usual_coding() {
+    let origin = bundle_origin().await;
+    let h = compressing(&origin);
+    h.get("/js/app.v1.js", &[]).await;
+    h.get("/js/app.v2.js", &[]).await;
+    settled(&h).await;
+    let mut cases: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+    cases.push((
+        "another dictionary",
+        with_dictionary("not the bundle", "br, dcb"),
+    ));
+    cases.push(("no dictionary coding", with_dictionary(APP_V1, "br")));
+    let mut style = with_dictionary(APP_V1, "br, dcb");
+    style[3].1 = "style".into();
+    cases.push(("another destination", style));
+    let mut id = with_dictionary(APP_V1, "br, dcb");
+    id[2].1 = "\"old\"".into();
+    cases.push(("another id", id));
+    let mut ranged = with_dictionary(APP_V1, "br, dcb");
+    ranged.push(("range".into(), "bytes=0-99".into()));
+    cases.push(("a range", ranged));
+    for (what, headers) in cases {
+        let got = get_with(&h, "/js/app.v2.js", &headers).await;
+        assert!(
+            matches!(got.header("content-encoding"), "br" | ""),
+            "{what}: {}",
+            got.header("content-encoding")
+        );
+        assert!(!got.cache_status().contains("detail=dc"), "{what}");
+    }
+}

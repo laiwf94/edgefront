@@ -84,6 +84,7 @@ pub struct ProxySettings {
     /// variants, and how ([`edgefront_cache::variants`]).
     pub compress: bool,
     pub compression: edgefront_cache::variants::CompressionSettings,
+    pub dictionaries: edgefront_cache::dictionary::DictionarySettings,
 }
 
 impl Default for ProxySettings {
@@ -97,6 +98,7 @@ impl Default for ProxySettings {
             slice_bytes: edgefront_cache::slice::DEFAULT_SLICE_BYTES,
             compress: false,
             compression: Default::default(),
+            dictionaries: Default::default(),
         }
     }
 }
@@ -161,6 +163,7 @@ impl Proxy {
                 body_timeout: settings.body_timeout,
                 via: Some(via.clone()),
                 compression: settings.compression.clone(),
+                dictionaries: settings.dictionaries.clone(),
             },
             clock,
             metrics.clone(),

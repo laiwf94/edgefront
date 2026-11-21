@@ -80,7 +80,7 @@ type Q = u16;
 
 /// Parses a weight: `0`, `1`, or `0.` / `1.` followed by up to three
 /// digits, `1.` only by zeros (RFC 9110 section 12.4.2).
-fn parse_q(v: &str) -> Option<Q> {
+pub(crate) fn parse_q(v: &str) -> Option<Q> {
     let (int, frac) = match v.split_once('.') {
         Some((i, f)) => (i, f),
         None => (v, ""),

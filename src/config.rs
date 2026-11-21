@@ -73,6 +73,7 @@ impl Settings for Config {
             slice_bytes: self.cache.slice_bytes,
             compress: self.cache.compression.enabled,
             compression: self.cache.compression.settings(),
+            dictionaries: self.cache.compression.dictionaries(),
         }
     }
 }

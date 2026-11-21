@@ -71,3 +71,10 @@ path = "fuzz_targets/accept_encoding.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "use_as_dictionary"
+path = "fuzz_targets/use_as_dictionary.rs"
+test = false
+doc = false
+bench = false

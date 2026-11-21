@@ -60,6 +60,8 @@ use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use crate::cache_control::{CacheControl, is_tchar};
 use crate::collapse::{Collapser, Flight, Lead};
 use crate::config::{RoutePolicies, RoutePolicy};
+use crate::dictionary::{DictCoding, Dictionaries, Dictionary, DictionarySettings};
+use crate::encoding::Coding;
 use crate::fill::{End, Filling};
 use crate::headers::strip_hop_by_hop;
 use crate::object::{CachedObject, Key, SURROGATE_KEY, primary_key};
@@ -203,6 +205,8 @@ pub struct LayerSettings {
     pub via: Option<HeaderValue>,
     /// How routes with `compress` compress what they store.
     pub compression: CompressionSettings,
+    /// Limits of the shared dictionaries those routes keep.
+    pub dictionaries: DictionarySettings,
 }
 
 impl Default for LayerSettings {
@@ -212,6 +216,7 @@ impl Default for LayerSettings {
             body_timeout: Duration::from_secs(30),
             via: None,
             compression: CompressionSettings::default(),
+            dictionaries: DictionarySettings::default(),
         }
     }
 }
@@ -243,6 +248,7 @@ struct Shared {
     collapser: Arc<Collapser<Fetched>>,
     observer: Arc<dyn Observer>,
     compressor: Arc<Compressor>,
+    dictionaries: Arc<Dictionaries>,
 }
 
 /// What a leading fill got from upstream, as its followers see it.
@@ -311,6 +317,7 @@ impl CacheLayer {
                 collapser: Arc::default(),
                 observer,
                 compressor: Arc::new(Compressor::new(settings.compression)),
+                dictionaries: Arc::new(Dictionaries::new(settings.dictionaries)),
             }),
         })
     }
@@ -568,6 +575,12 @@ impl Shared {
             .map(|obj| (obj, policy::decide(&obj.freshness, &obj.cc, &req_cc, now)));
         match usable {
             Some((obj, Use::Fresh)) => {
+                if policy.compress
+                    && *method == Method::GET
+                    && let Some(resp) = self.dictionary_hit(&key, obj, req.headers).await
+                {
+                    return Decision::Respond(resp);
+                }
                 return Decision::Respond(self.hit(obj, method, req.headers, "", Outcome::Hit));
             }
             // A HEAD answered from a copy max-stale accepts is reported as
@@ -748,10 +761,110 @@ impl Shared {
         kept
     }
 
-    /// Compresses a stored source into its variants in the background.
+    /// Compresses a stored source into its variants in the background,
+    /// and keeps it as a dictionary when it offers itself as one.
     fn compress(&self, key: &Key, obj: &Arc<CachedObject>, epoch: u64) {
+        self.dictionaries.record(key, obj, self.clock.now());
         self.compressor
             .submit(self.cache.clone(), key.clone(), obj.clone(), epoch);
+    }
+
+    /// The fresh copy `obj` compressed with a dictionary the client holds
+    /// (RFC 9842), or `None` when no dictionary applies or the request
+    /// needs the whole stored copy (conditionals, ranges).
+    async fn dictionary_hit(
+        &self,
+        key: &Key,
+        obj: &Arc<CachedObject>,
+        req: &HeaderMap,
+    ) -> Option<Response<Body>> {
+        if needs_whole(req) || !cfg!(feature = "compression") {
+            return None;
+        }
+        let now = self.clock.now();
+        let (dict, coding) = self.dictionaries.select(key, req, now)?;
+        let source = if obj.derived || obj.coding != Some(Coding::Identity) {
+            let mut identity = req.clone();
+            identity.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+            self.cache
+                .lookup(key, &identity)
+                .await
+                .filter(|o| !o.derived && o.coding == Some(Coding::Identity))?
+        } else {
+            obj.clone()
+        };
+        if !variants::compressible(&source, self.compressor.settings()) {
+            return None;
+        }
+        let body = match self.dictionaries.compressed(key, &source, &dict, coding) {
+            Some(body) => body,
+            None => {
+                let body = self.dictionary_compress(&source, &dict, coding).await?;
+                self.dictionaries
+                    .keep(key, &source, &dict, coding, body.clone());
+                body
+            }
+        };
+        let (mut parts, _) = respond::from_cache(&source, &Method::GET, req, now).into_parts();
+        let h = &mut parts.headers;
+        h.insert(
+            header::CONTENT_ENCODING,
+            HeaderValue::from_static(coding.as_str()),
+        );
+        h.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+        h.remove(header::ACCEPT_RANGES);
+        if let Some(etag) = source.headers.get(header::ETAG) {
+            h.insert(header::ETAG, variants::weakened(etag));
+        }
+        h.remove(header::VARY);
+        for v in crate::headers::field_list(&source.headers, &header::VARY) {
+            if !v.eq_ignore_ascii_case("accept-encoding")
+                && let Ok(v) = HeaderValue::from_str(&v)
+            {
+                h.append(header::VARY, v);
+            }
+        }
+        h.append(
+            header::VARY,
+            HeaderValue::from_static("accept-encoding, available-dictionary"),
+        );
+        let mut resp = Response::from_parts(parts, edgefront_core::body::full(body));
+        let status = format!(
+            "hit; ttl={}; detail={}",
+            source.freshness.ttl_secs(now),
+            coding.as_str()
+        );
+        self.mark(&mut resp, &status, Outcome::Hit);
+        Some(resp)
+    }
+
+    /// Compresses `source` with `dict` on the blocking pool.
+    async fn dictionary_compress(
+        &self,
+        source: &Arc<CachedObject>,
+        dict: &Arc<Dictionary>,
+        coding: DictCoding,
+    ) -> Option<Bytes> {
+        #[cfg(feature = "compression")]
+        {
+            let (source, dict) = (source.clone(), dict.clone());
+            let settings = self.compressor.settings().clone();
+            tokio::task::spawn_blocking(move || {
+                crate::dictionary::compress(coding, &dict, &source.body, &settings)
+            })
+            .await
+            .ok()?
+            .ok()
+            .map(Bytes::from)
+        }
+        #[cfg(not(feature = "compression"))]
+        {
+            let _ = (source, dict, coding);
+            None
+        }
     }
 
     /// Removes framing and stored-only fields from a response that passes
