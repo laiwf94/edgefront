@@ -1,0 +1,131 @@
+{
+  "command": "edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 --target-cpus 1 --out target/bench/h2-grpc --run h2-grpc",
+  "extra": {
+    "binary_bytes": 17317592.0
+  },
+  "machine": {
+    "arch": "x86_64",
+    "cpus": 4,
+    "description": "4-core x86_64, Docker 29",
+    "kernel": "7.0.0-1019-azure",
+    "loadgen_cpus": "2-3",
+    "memory_bytes": 16758398976,
+    "origin_cpus": "1",
+    "runtime": "docker 29.4.2",
+    "target_cpus": "0"
+  },
+  "measured": {
+    "body_bytes": 614400000,
+    "completed": 150000,
+    "errors": {
+      "connect": 0,
+      "grpc": 0,
+      "other": 0,
+      "timeout": 0
+    },
+    "hit_ratio": 0.0,
+    "latency": {
+      "max_ms": 208.442489,
+      "mean_ms": 200.86425335170665,
+      "p50_ms": 200.933375,
+      "p90_ms": 201.326591,
+      "p999_ms": 206.438399,
+      "p99_ms": 202.244095
+    },
+    "origin_requests": 150200,
+    "peak_in_flight": 1039,
+    "scheduled": 150000,
+    "service_latency": {
+      "max_ms": 208.437796,
+      "mean_ms": 200.85835448524665,
+      "p50_ms": 200.933375,
+      "p90_ms": 201.326591,
+      "p999_ms": 206.438399,
+      "p99_ms": 202.244095
+    },
+    "status_classes": [
+      0,
+      150000,
+      0,
+      0,
+      0
+    ],
+    "throughput_rps": 5000.0
+  },
+  "phases": [
+    {
+      "completed": 5000,
+      "duration_secs": 5.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 204.251659,
+        "mean_ms": 201.16741379,
+        "p50_ms": 201.195519,
+        "p90_ms": 201.195519,
+        "p999_ms": 202.768383,
+        "p99_ms": 201.326591
+      },
+      "name": "warmup",
+      "rate": 1000.0,
+      "scheduled": 5000,
+      "throughput_rps": 1000.0,
+      "warmup": true
+    },
+    {
+      "completed": 150000,
+      "duration_secs": 30.0,
+      "errors": 0,
+      "latency": {
+        "max_ms": 208.442489,
+        "mean_ms": 200.86425335170665,
+        "p50_ms": 200.933375,
+        "p90_ms": 201.326591,
+        "p999_ms": 206.438399,
+        "p99_ms": 202.244095
+      },
+      "name": "load",
+      "rate": 5000.0,
+      "scheduled": 150000,
+      "throughput_rps": 5000.0,
+      "warmup": false
+    }
+  ],
+  "resources": {
+    "cpu_cores": 0.3429168090326579,
+    "cpu_seconds": 10.356202,
+    "cpuset": "0",
+    "peak_memory_bytes": 24424448,
+    "peak_rss_bytes": 22863872
+  },
+  "run": "h2-grpc",
+  "scenario": {
+    "connections": 10,
+    "description": "HTTP/2 through the proxy to the origin over 10 connections, 5,000 requests a second each held 200 ms by the origin: 1,000 concurrent streams.",
+    "hit_ratio_target": 0.9,
+    "measured_secs": 30.0,
+    "name": "h2-1000-streams",
+    "origin_delay_ms": 200.0,
+    "protocol": "http2",
+    "rate": 5000.0,
+    "seed": 1,
+    "warmup_secs": 5.0,
+    "working_set_bytes": 4096000
+  },
+  "schema": "edgefront-bench/result/v1",
+  "started_at": "2026-11-21T04:06:24Z",
+  "target": {
+    "image_size_bytes": 17222804,
+    "images": [
+      {
+        "id": "sha256:ad235863111de95e4e1380edeaf508fda8da78948860ee2faf98599950d4d2c5",
+        "reference": "edgefront-bench/edgefront:local",
+        "size_bytes": 17222804
+      }
+    ],
+    "kind": "proxy",
+    "name": "edgefront-proxy-h2",
+    "product": "edgefront proxy",
+    "version": "0.1.0"
+  },
+  "track": "proxy"
+}

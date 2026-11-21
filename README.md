@@ -138,7 +138,7 @@ gRPC (`content-type: application/grpc...`) needs `protocol` `http2` or `auto`. M
 
 On this Mac (16-core arm64), the release build added a 45 to 57 µs p50 to a loopback HTTP/2 call over three runs of `crates/edgefront/tests/e2e_h2_grpc.rs`. That test also runs all four gRPC call types through the binary, and a page with 60 assets over one TLS connection.
 
-`crates/edgefront-bench/scenarios/h2_grpc.toml` benchmarks HTTP/2 GETs and unary gRPC calls through edgefront proxy, Envoy and HAProxy at 1,000 concurrent streams, HTTP/2 on both sides (`edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 --target-cpus 1`). The bench workflow's `h2-grpc` job runs it on every push to main and checks that every request was answered and about 1,000 streams were open at once.
+`crates/edgefront-bench/scenarios/h2_grpc.toml` benchmarks HTTP/2 GETs and unary gRPC calls through edgefront proxy, Envoy and HAProxy at 1,000 concurrent streams, HTTP/2 on both sides (`edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 --target-cpus 1`). The bench workflow's `h2-grpc` job runs it on every push to main and checks that every request was answered and about 1,000 streams were open at once. On a 4-core hosted runner, each proxy on one CPU, all three answered every request at a 201 ms p50 (the origin holds each 200 ms); edgefront peaked at 21.8 MiB RSS for GETs and 22.4 MiB for gRPC against Envoy's 33.2 and 35.7 MiB and HAProxy's 16.4 and 16.3 MiB, using 0.34 and 0.45 cores against Envoy's 0.45 and 0.52 and HAProxy's 0.20 and 0.24 ([docs/benchmarks/h2-grpc.md](docs/benchmarks/h2-grpc.md)).
 
 ### Migrating from steer
 
