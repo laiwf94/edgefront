@@ -8,16 +8,45 @@
 use std::net::TcpListener;
 use std::process::Command;
 
-/// The first of five consecutive ports that were all free a moment ago.
+/// The lowest port the kernel hands out for `:0` and outgoing
+/// connections.
+fn ephemeral_low() -> u16 {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse().ok())
+        .unwrap_or(32768)
+}
+
+/// The first of five consecutive ports that are free now, below the
+/// ephemeral range (#259): a port the kernel never assigns on its own, so
+/// another test binding `:0` or connecting out cannot take one between
+/// this check and the script binding it. Above 20000, clear of the demos'
+/// fixed defaults, and from an offset by process id so two runs at once
+/// start apart.
 fn free_ports() -> u16 {
-    for _ in 0..50 {
-        let a = TcpListener::bind("127.0.0.1:0").unwrap();
-        let p = a.local_addr().unwrap().port();
-        if p < u16::MAX - 4 && (1..5).all(|i| TcpListener::bind(("127.0.0.1", p + i)).is_ok()) {
+    let low = 20_000u32;
+    let high = u32::from(ephemeral_low()).max(low + 100) - 5;
+    let span = (high - low) / 5;
+    let start = std::process::id() % span;
+    for k in 0..span {
+        let p = (low + ((start + k) % span) * 5) as u16;
+        if (0..5).all(|i| TcpListener::bind(("127.0.0.1", p + i)).is_ok()) {
             return p;
         }
     }
-    panic!("no five consecutive free ports");
+    panic!("no five consecutive free ports below the ephemeral range");
+}
+
+#[test]
+fn the_ports_are_free_and_below_the_ephemeral_range() {
+    let p = free_ports();
+    assert!(
+        p >= 20_000 && u32::from(p) + 4 < u32::from(ephemeral_low()),
+        "{p}"
+    );
+    for i in 0..5 {
+        TcpListener::bind(("127.0.0.1", p + i)).unwrap();
+    }
 }
 
 #[test]
