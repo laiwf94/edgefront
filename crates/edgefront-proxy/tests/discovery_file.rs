@@ -143,7 +143,6 @@ async fn edits_in_place_and_failures_keep_the_last_good_set() {
     let kind = next(&mut rx).await;
     assert!(matches!(&kind, UpdateKind::Failed(_)), "{kind:?}");
     assert!(apply(kind).is_empty());
-    drop(apply);
     let addrs: Vec<_> = merger.endpoints().map(|e| e.address.clone()).collect();
     assert_eq!(addrs, ["a.internal:80", "b.internal:80"]);
     let status = merger.status().next().unwrap();
