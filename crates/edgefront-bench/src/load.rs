@@ -26,12 +26,20 @@
 //!
 //! A request whose response has not fully arrived `timeout` after it was
 //! due is counted as a timeout and kept out of the histograms, as is any
-//! other failure; [`Errors`] counts them by kind.
+//! other failure; [`Errors`] counts them by kind. With
+//! [`LoadConfig::grpc`] every request is a gRPC call, and one whose answer
+//! is not HTTP 200 with `grpc-status: 0` (in the trailers, or the headers
+//! of a Trailers-Only answer) is a gRPC error.
+//!
+//! Each phase also reports the most requests that were on the wire at once
+//! while it ran ([`PhaseReport::peak_in_flight`]): over HTTP/2, the most
+//! concurrent streams.
 
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -211,6 +219,8 @@ pub struct LoadConfig {
     pub schedule: Schedule,
     /// Speak TLS to the target, with this client; `None` is cleartext.
     pub tls: Option<TlsClient>,
+    /// Hold every answer to gRPC's rules: HTTP 200 and `grpc-status: 0`.
+    pub grpc: bool,
 }
 
 impl LoadConfig {
@@ -225,6 +235,7 @@ impl LoadConfig {
             timeout: Duration::from_secs(10),
             schedule,
             tls: None,
+            grpc: false,
         }
     }
 }
@@ -274,18 +285,21 @@ pub struct Errors {
     pub timeout: u64,
     /// The connection failed while sending or reading.
     pub other: u64,
+    /// A gRPC call answered without HTTP 200 and `grpc-status: 0`.
+    pub grpc: u64,
 }
 
 impl Errors {
     /// Every failed request.
     pub fn total(&self) -> u64 {
-        self.connect + self.timeout + self.other
+        self.connect + self.timeout + self.other + self.grpc
     }
 
     fn add(&mut self, other: &Errors) {
         self.connect += other.connect;
         self.timeout += other.timeout;
         self.other += other.other;
+        self.grpc += other.grpc;
     }
 }
 
@@ -316,6 +330,9 @@ pub struct PhaseReport {
     /// Nanoseconds from the moment each request was written to the end of
     /// its response, the latency a closed-loop tool reports.
     pub service_time: Histogram,
+    /// The most requests written and not yet answered at once, counted
+    /// when one of this phase's requests was written.
+    pub peak_in_flight: u64,
 }
 
 impl PhaseReport {
@@ -332,6 +349,7 @@ impl PhaseReport {
             body_bytes: 0,
             response_time: Histogram::default(),
             service_time: Histogram::default(),
+            peak_in_flight: 0,
         }
     }
 
@@ -363,6 +381,7 @@ impl PhaseReport {
             Err(Failure::Connect) => self.errors.connect += 1,
             Err(Failure::Timeout) => self.errors.timeout += 1,
             Err(Failure::Other) => self.errors.other += 1,
+            Err(Failure::Grpc) => self.errors.grpc += 1,
         }
     }
 
@@ -377,6 +396,7 @@ impl PhaseReport {
         self.body_bytes += other.body_bytes;
         self.response_time.merge(&other.response_time);
         self.service_time.merge(&other.service_time);
+        self.peak_in_flight = self.peak_in_flight.max(other.peak_in_flight);
     }
 }
 
@@ -417,6 +437,7 @@ pub async fn run(
     source: Arc<dyn RequestSource>,
 ) -> Result<RunReport, LoadError> {
     let target = Target::new(&config, source)?;
+    let in_flight = Arc::new(InFlight::new(config.schedule.phases.len()));
     let (job_tx, job_rx) = mpsc::unbounded_channel();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let jobs = Arc::new(Mutex::new(job_rx));
@@ -425,6 +446,7 @@ pub async fn run(
             Arc::clone(&target),
             Arc::clone(&jobs),
             out_tx.clone(),
+            Arc::clone(&in_flight),
         ));
     }
     drop(out_tx);
@@ -441,12 +463,46 @@ pub async fn run(
         let phase = outcome.phase;
         phases[phase].record(outcome);
     }
+    for (report, peak) in phases.iter_mut().zip(&in_flight.peaks) {
+        report.peak_in_flight = peak.load(Ordering::Relaxed);
+    }
     Ok(RunReport {
         protocol: config.protocol,
         connections: config.connections,
         phases,
         elapsed: start.elapsed(),
     })
+}
+
+/// Requests on the wire now, and the most there were at once while each
+/// phase's requests were being written.
+struct InFlight {
+    now: AtomicU64,
+    peaks: Vec<AtomicU64>,
+}
+
+impl InFlight {
+    fn new(phases: usize) -> Self {
+        InFlight {
+            now: AtomicU64::new(0),
+            peaks: (0..phases).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// One more request of `phase` on the wire, until the guard drops.
+    fn start(self: &Arc<Self>, phase: usize) -> InFlightGuard {
+        let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peaks[phase].fetch_max(now, Ordering::Relaxed);
+        InFlightGuard(Arc::clone(self))
+    }
+}
+
+struct InFlightGuard(Arc<InFlight>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.now.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The validated config every worker shares.
@@ -458,6 +514,7 @@ struct Target {
     timeout: Duration,
     source: Arc<dyn RequestSource>,
     tls: Option<TlsClient>,
+    grpc: bool,
 }
 
 impl Target {
@@ -492,6 +549,7 @@ impl Target {
             timeout: config.timeout,
             source,
             tls: config.tls.clone(),
+            grpc: config.grpc,
         }))
     }
 
@@ -594,6 +652,7 @@ enum Failure {
     Connect,
     Timeout,
     Other,
+    Grpc,
 }
 
 struct Answer {
@@ -662,6 +721,7 @@ async fn worker(
     target: Arc<Target>,
     jobs: Arc<Mutex<mpsc::UnboundedReceiver<Job>>>,
     out: mpsc::UnboundedSender<Outcome>,
+    in_flight: Arc<InFlight>,
 ) {
     let mut conn: Option<Conn> = None;
     loop {
@@ -687,9 +747,15 @@ async fn worker(
             Ok(()) => match conn.as_mut() {
                 Some(Conn::Http1(sender)) => {
                     let sent = Instant::now();
-                    let result =
-                        exchange(sender.send_request(target.request(job.seq)), sent, deadline)
-                            .await;
+                    let guard = in_flight.start(job.phase);
+                    let result = exchange(
+                        sender.send_request(target.request(job.seq)),
+                        sent,
+                        deadline,
+                        target.grpc,
+                    )
+                    .await;
+                    drop(guard);
                     if result.is_err() {
                         // A response may still be on its way; never read it
                         // as the next request's.
@@ -701,11 +767,19 @@ async fn worker(
                     let mut sender = sender.clone();
                     let request = target.request(job.seq);
                     let out = out.clone();
+                    let in_flight = Arc::clone(&in_flight);
+                    let grpc = target.grpc;
                     tokio::spawn(async move {
                         let result = match timeout_at(deadline, sender.ready()).await {
                             Ok(Ok(())) => {
-                                exchange(sender.send_request(request), Instant::now(), deadline)
-                                    .await
+                                let _guard = in_flight.start(job.phase);
+                                exchange(
+                                    sender.send_request(request),
+                                    Instant::now(),
+                                    deadline,
+                                    grpc,
+                                )
+                                .await
                             }
                             Ok(Err(_)) => Err(Failure::Other),
                             Err(_) => Err(Failure::Timeout),
@@ -753,28 +827,49 @@ async fn ready(target: &Target, conn: &mut Option<Conn>, deadline: Instant) -> R
 }
 
 /// Waits for the response and reads its body to the end, by the deadline.
-async fn exchange<F>(response: F, sent: Instant, deadline: Instant) -> Result<Answer, Failure>
+/// With `grpc`, an answer without HTTP 200 and `grpc-status: 0` fails.
+async fn exchange<F>(
+    response: F,
+    sent: Instant,
+    deadline: Instant,
+    grpc: bool,
+) -> Result<Answer, Failure>
 where
     F: Future<Output = hyper::Result<Response<Incoming>>>,
 {
     let read = async {
         let response = response.await?;
         let status = response.status().as_u16();
+        let mut grpc_status = response.headers().get("grpc-status").cloned();
         let mut body = response.into_body();
         let mut body_bytes = 0u64;
         while let Some(frame) = body.frame().await {
-            if let Some(data) = frame?.data_ref() {
+            let frame = frame?;
+            if let Some(data) = frame.data_ref() {
                 body_bytes += data.len() as u64;
+            } else if let Some(trailers) = frame.trailers_ref()
+                && let Some(value) = trailers.get("grpc-status")
+            {
+                grpc_status = Some(value.clone());
             }
         }
-        Ok::<_, hyper::Error>(Answer {
-            status,
-            body_bytes,
-            sent,
-        })
+        Ok::<_, hyper::Error>((
+            Answer {
+                status,
+                body_bytes,
+                sent,
+            },
+            grpc_status,
+        ))
     };
     match timeout_at(deadline, read).await {
-        Ok(Ok(answer)) => Ok(answer),
+        Ok(Ok((answer, grpc_status))) => {
+            if grpc && (answer.status != 200 || grpc_status.as_ref().is_none_or(|v| v != "0")) {
+                Err(Failure::Grpc)
+            } else {
+                Ok(answer)
+            }
+        }
         Ok(Err(_)) => Err(Failure::Other),
         Err(_) => Err(Failure::Timeout),
     }
@@ -901,6 +996,89 @@ mod tests {
         assert_eq!(state.http2.load(Ordering::Relaxed), 0);
         assert_eq!(report.protocol, Protocol::Http1);
         assert_eq!(report.connections, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grpc_calls_count_only_with_status_zero() {
+        let origin = crate::origin::Origin::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        // Every third call asks for a path that is not an object (NOT_FOUND
+        // in a Trailers-Only answer) and every third a GET with no gRPC
+        // status at all; the rest are good calls.
+        let source: Arc<dyn RequestSource> = Arc::new(|seq: u64| match seq % 3 {
+            0 => crate::origin::grpc_request("/obj/100/k1"),
+            1 => crate::origin::grpc_request("/elsewhere"),
+            _ => {
+                let mut r = Request::new(Full::new(Bytes::new()));
+                *r.uri_mut() = Uri::from_static("/obj/100/k2");
+                r
+            }
+        });
+        let mut config = LoadConfig::new(
+            origin.addr(),
+            Protocol::Http2,
+            Schedule::constant(300.0, Duration::from_millis(500)),
+        );
+        config.grpc = true;
+        let report = run(config.clone(), Arc::clone(&source)).await.unwrap();
+        let m = report.measured();
+        assert_eq!(m.scheduled, 150);
+        assert_eq!(m.completed, 50);
+        assert_eq!(m.errors.grpc, 100);
+        assert_eq!(m.errors.total(), 100);
+        // Each good answer is one 100-byte message and its 5-byte prefix.
+        assert_eq!(m.body_bytes, 50 * 105);
+        assert_eq!(m.response_time.len(), 50);
+
+        // Without the gRPC rules every answer is a complete 200.
+        config.grpc = false;
+        let m = run(config, source).await.unwrap().measured();
+        assert_eq!((m.completed, m.errors.total()), (150, 0));
+        assert_eq!(m.status_classes[1], 150);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn counts_the_most_streams_in_flight_at_once() {
+        // Held 100 ms each at 2,000 a second, about 200 are open at once
+        // (Little's law), over two connections.
+        let origin = crate::origin::Origin::bind_with_delay(
+            "127.0.0.1:0".parse().unwrap(),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let schedule = Schedule::constant(2000.0, Duration::from_secs(1))
+            .with_warmup(100.0, Duration::from_millis(500));
+        let mut config = LoadConfig::new(origin.addr(), Protocol::Http2, schedule);
+        config.connections = 2;
+        let report = run(config, get("/obj/10/k1")).await.unwrap();
+        let measured = report.measured();
+        assert_eq!(measured.completed, 2000);
+        // At least what Little's law says, less a margin for a slow
+        // machine; at most a few times it, as a stall that let requests
+        // pile up would show.
+        assert!(
+            (160..=800).contains(&measured.peak_in_flight),
+            "{}",
+            measured.peak_in_flight
+        );
+        // Warm-up: 100 a second held 100 ms is about 10.
+        assert!(
+            (5..=100).contains(&report.phases[0].peak_in_flight),
+            "{}",
+            report.phases[0].peak_in_flight
+        );
+
+        // Over HTTP/1.1 each connection carries one request at a time.
+        let mut config = LoadConfig::new(
+            origin.addr(),
+            Protocol::Http1,
+            Schedule::constant(200.0, Duration::from_millis(500)),
+        );
+        config.connections = 3;
+        let report = run(config, get("/obj/10/k1")).await.unwrap();
+        assert_eq!(report.measured().peak_in_flight, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1068,7 +1246,8 @@ mod tests {
                 Errors {
                     connect: 10,
                     timeout: 0,
-                    other: 0
+                    other: 0,
+                    grpc: 0
                 }
             );
         }
@@ -1115,7 +1294,8 @@ mod tests {
             Errors {
                 connect: 0,
                 timeout: 0,
-                other: 2
+                other: 2,
+                grpc: 0
             }
         );
     }

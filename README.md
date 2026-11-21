@@ -138,6 +138,8 @@ gRPC (`content-type: application/grpc...`) needs `protocol` `http2` or `auto`. M
 
 On this Mac (16-core arm64), the release build added a 45 to 57 µs p50 to a loopback HTTP/2 call over three runs of `crates/edgefront/tests/e2e_h2_grpc.rs`. That test also runs all four gRPC call types through the binary, and a page with 60 assets over one TLS connection.
 
+`crates/edgefront-bench/scenarios/h2_grpc.toml` benchmarks HTTP/2 GETs and unary gRPC calls through edgefront proxy, Envoy and HAProxy at 1,000 concurrent streams, HTTP/2 on both sides (`edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 --target-cpus 1`). The bench workflow's `h2-grpc` job runs it on every push to main and checks that every request was answered and about 1,000 streams were open at once.
+
 ### Migrating from steer
 
 steer is fully ported, and `legacy/steer` is deleted. Its history stays reachable: `git log -- legacy/steer` lists every commit that touched it in this repository, and `git log c57a076^2` lists its own 23 commits from before the merge. `make steer-src` extracts it at its last commit. To move a steer deployment to `edgefront proxy`:

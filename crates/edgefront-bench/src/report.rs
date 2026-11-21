@@ -32,7 +32,7 @@ use serde_json::Value;
 use crate::histogram::Histogram;
 use crate::load::{PhaseReport, Protocol};
 use crate::measure::Resources;
-use crate::scenario::Scenario;
+use crate::scenario::{RequestKind, Scenario};
 
 /// The schema every result names, and the file that defines it.
 pub const SCHEMA: &str = "edgefront-bench/result/v1";
@@ -99,6 +99,12 @@ pub struct ScenarioInfo {
     /// The SNI the load went over TLS with; absent for cleartext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_server_name: Option<String>,
+    /// `grpc` when every request was a unary gRPC call; absent for `GET`s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<String>,
+    /// How long the origin held each object request; absent for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_delay_ms: Option<f64>,
 }
 
 impl ScenarioInfo {
@@ -127,6 +133,9 @@ impl ScenarioInfo {
             hit_ratio_target: scenario.keys.hit_ratio,
             working_set_bytes: scenario.working_set(),
             tls_server_name: scenario.tls.clone(),
+            requests: (scenario.kind != RequestKind::Get).then(|| scenario.kind.name().to_owned()),
+            origin_delay_ms: (!scenario.origin_delay.is_zero())
+                .then_some(scenario.origin_delay.as_secs_f64() * 1e3),
         }
     }
 }
@@ -239,6 +248,9 @@ pub struct ErrorCounts {
     pub timeout: u64,
     /// Failed while sending or reading.
     pub other: u64,
+    /// gRPC calls answered without HTTP 200 and `grpc-status: 0`.
+    #[serde(default)]
+    pub grpc: u64,
 }
 
 /// The measured phases.
@@ -266,6 +278,10 @@ pub struct Measured {
     pub latency: Latency,
     /// Service time from each request's write.
     pub service_latency: Latency,
+    /// The most requests on the wire at once (over HTTP/2, concurrent
+    /// streams); 0 in results from before it was counted.
+    #[serde(default)]
+    pub peak_in_flight: u64,
 }
 
 impl Measured {
@@ -283,6 +299,7 @@ impl Measured {
                 connect: report.errors.connect,
                 timeout: report.errors.timeout,
                 other: report.errors.other,
+                grpc: report.errors.grpc,
             },
             status_classes: report.status_classes,
             body_bytes: report.body_bytes,
@@ -291,6 +308,7 @@ impl Measured {
             hit_ratio,
             latency: Latency::of(&report.response_time),
             service_latency: Latency::of(&report.service_time),
+            peak_in_flight: report.peak_in_flight,
         }
     }
 }
@@ -500,7 +518,9 @@ pub fn merge_repeats(results: &[BenchResult]) -> Vec<BenchResult> {
                 connect: g.iter().map(|r| r.measured.errors.connect).sum(),
                 timeout: g.iter().map(|r| r.measured.errors.timeout).sum(),
                 other: g.iter().map(|r| r.measured.errors.other).sum(),
+                grpc: g.iter().map(|r| r.measured.errors.grpc).sum(),
             };
+            m.peak_in_flight = med(&|r| r.measured.peak_in_flight as f64) as u64;
             out.resources.peak_rss_bytes = med(&|r| r.resources.peak_rss_bytes as f64) as u64;
             out.resources.peak_memory_bytes = med(&|r| r.resources.peak_memory_bytes as f64) as u64;
             out.resources.cpu_seconds = med(&|r| r.resources.cpu_seconds);
@@ -617,7 +637,7 @@ pub fn render_with(title: &str, intro: &str, results: &[BenchResult], sections: 
             let _ = writeln!(out, "{header}\n{rule}");
             for row in rows {
                 let m = &row.measured;
-                let errors = m.errors.connect + m.errors.timeout + m.errors.other;
+                let errors = m.errors.connect + m.errors.timeout + m.errors.other + m.errors.grpc;
                 let _ = write!(
                     out,
                     "| {} | {} | {} req/s | {} | {} | {} | {:.1}% | {} | {} | {} | {:.1} s ({:.2} cores) | {} |",
@@ -788,6 +808,8 @@ pub(crate) mod tests {
                 hit_ratio_target: 0.9,
                 working_set_bytes: 1 << 20,
                 tls_server_name: None,
+                requests: None,
+                origin_delay_ms: None,
             },
             target: TargetInfo {
                 name: target.into(),
@@ -830,6 +852,7 @@ pub(crate) mod tests {
                     mean_ms: 0.3,
                 },
                 service_latency: Latency::default(),
+                peak_in_flight: 0,
             },
             phases: vec![],
             resources: Resources {

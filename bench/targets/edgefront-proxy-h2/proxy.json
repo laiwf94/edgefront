@@ -1,0 +1,4 @@
+{"listen":":8080","admin_listen":"127.0.0.1:9901",
+ "http2":{"cleartext":true,"max_concurrent_streams":1000},
+ "routes":[{"cluster":"origin"}],
+ "clusters":[{"name":"origin","protocol":"http2","max_requests":100000,"endpoints":[{"address":"{{origin}}"}]}]}

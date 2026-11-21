@@ -1,0 +1,20 @@
+# edgefront proxy speaking HTTP/2 on both sides: prior-knowledge HTTP/2
+# (h2c) from the load generator beside HTTP/1.1 on one port, and HTTP/2 to
+# the origin from its multiplexed upstream pool. The proxy track's HTTP/2
+# and gRPC target (crates/edgefront-bench/scenarios/h2_grpc.toml).
+product = "edgefront proxy"
+version = "0.1.0"
+kind = "proxy"
+track = "proxy"
+image = "edgefront-bench/edgefront:local"
+build = { dockerfile = "bench/Dockerfile", stage = "edgefront" }
+port = 8080
+command = ["proxy", "--config", "/etc/edgefront-proxy.json"]
+binary = "/edgefront"
+
+[env]
+EDGEFRONT_LOG = "warn"
+EDGEFRONT_DRAIN_PERIOD = "0s"
+
+[files]
+"/etc/edgefront-proxy.json" = "proxy.json"

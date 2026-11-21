@@ -166,6 +166,15 @@
         "tls_server_name": {
           "type": "string",
           "minLength": 1
+        },
+        "requests": {
+          "description": "grpc when every request was a unary gRPC call; absent for GETs.",
+          "enum": ["grpc"]
+        },
+        "origin_delay_ms": {
+          "description": "How long the origin held each object request; absent for none.",
+          "type": "number",
+          "exclusiveMinimum": 0
         }
       }
     },
@@ -309,6 +318,11 @@
             "other": {
               "type": "integer",
               "minimum": 0
+            },
+            "grpc": {
+              "description": "gRPC calls answered without HTTP 200 and grpc-status 0.",
+              "type": "integer",
+              "minimum": 0
             }
           }
         },
@@ -343,6 +357,11 @@
         },
         "service_latency": {
           "$ref": "#/$defs/latency"
+        },
+        "peak_in_flight": {
+          "description": "The most requests on the wire at once: over HTTP/2, concurrent streams.",
+          "type": "integer",
+          "minimum": 0
         }
       }
     },

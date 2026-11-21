@@ -87,6 +87,53 @@ jobs:
           done
           cat target/bench/smoke/report.md >> "$GITHUB_STEP_SUMMARY"
 
+  # HTTP/2 on both sides and unary gRPC at 1,000 concurrent streams
+  # (crates/edgefront-bench/scenarios/h2_grpc.toml, #92): edgefront proxy,
+  # Envoy and HAProxy, each on one CPU, for 30 seconds a scenario after 5
+  # of warm-up. Every request is answered, the most streams open at once is
+  # close to the 1,000 the scenarios are built for, and the results are
+  # printed and uploaded.
+  h2-grpc:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build edgefront and the harness
+        run: cargo build --release --locked --bin edgefront --bin edgefront-bench
+      - name: Build the benchmark images
+        run: |
+          mkdir -p target/bench-images
+          cp target/release/edgefront target/release/edgefront-bench target/bench-images/
+          docker build -f bench/Dockerfile.prebuilt --target harness -t edgefront-bench/harness:local target/bench-images
+          docker build -f bench/Dockerfile.prebuilt --target edgefront -t edgefront-bench/edgefront:local target/bench-images
+      - name: HTTP/2 and gRPC at 1,000 streams against each proxy
+        run: |
+          target/release/edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml \
+            --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 \
+            --target-cpus 1 --out target/bench/h2-grpc --run h2-grpc
+      - name: Results match bench/schema/result.schema.json
+        run: pipx run check-jsonschema==0.38.2 --schemafile bench/schema/result.schema.json target/bench/h2-grpc/*/*.json
+      - name: Every request answered, about 1,000 streams at once
+        run: |
+          for f in target/bench/h2-grpc/*/*.json; do
+            echo "== $f"
+            cat "$f"
+            echo
+            jq -e '.measured.completed == .measured.scheduled
+                   and (.measured.errors | [.[]] | add) == 0
+                   and .measured.peak_in_flight >= 900' "$f" >/dev/null \
+              || { echo "$f:"; jq .measured "$f"; exit 1; }
+          done
+          cat target/bench/h2-grpc/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-h2-grpc
+          path: target/bench/h2-grpc
+
   # The regression gate (bench/gates.toml): the gate scenario `runs` (10)
   # times against edgefront on one CPU, judged with a Mann-Whitney U test
   # and the measured tolerances. On a CPU model whose committed samples are

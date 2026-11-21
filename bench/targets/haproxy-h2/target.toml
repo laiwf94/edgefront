@@ -1,0 +1,14 @@
+# HAProxy as an HTTP/2 proxy with no cache: prior-knowledge HTTP/2 (which
+# a clear-text bind detects beside HTTP/1.1) from the load generator and
+# HTTP/2 to the origin. The proxy track's HTTP/2 and gRPC comparison
+# (crates/edgefront-bench/scenarios/h2_grpc.toml).
+product = "HAProxy"
+version = "3.2.26"
+kind = "proxy"
+track = "proxy"
+image = "haproxy:3.2.26@sha256:1242e4006ac3f1ed15871efadca3d8d089e76f720017a1c51747133ee40cc953"
+port = 8080
+command = ["haproxy", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+
+[files]
+"/usr/local/etc/haproxy/haproxy.cfg" = "haproxy.cfg"

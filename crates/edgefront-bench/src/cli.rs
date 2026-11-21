@@ -3,7 +3,8 @@
 //! ```text
 //! edgefront-bench run --scenario FILE [--scenario FILE]... --targets a,b [options]
 //!     Runs each scenario against each target and writes
-//!     <out>/<scenario>/<target>.json, then <out>/report.md.
+//!     <out>/<scenario>/<target>.json, then <out>/report.md. A FILE with
+//!     [[scenarios]] runs each of them.
 //!     --targets-dir DIR   default bench/targets
 //!     --out DIR           default target/bench/<run>
 //!     --run NAME          default <date>-<first scenario>
@@ -28,11 +29,14 @@
 //!     default the gate's target), keeping the other models' already there.
 //! edgefront-bench validate FILE...
 //!     Checks result files against bench/schema/result.schema.json.
-//! edgefront-bench origin [--listen ADDR]
-//!     Serves /obj/<size>/<name>, default on 0.0.0.0:9000.
-//! edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT
+//! edgefront-bench origin [--listen ADDR] [--delay DURATION]
+//!     Serves /obj/<size>/<name> and the gRPC object method over HTTP/1.1
+//!     and h2c, default on 0.0.0.0:9000, holding each object request for
+//!     --delay (default none).
+//! edgefront-bench load --scenario FILE [--name NAME] --target HOST:PORT --origin HOST:PORT
 //!                      [--cgroup-root DIR] [--cgroup ID]...
 //!     The load generator's side of a run, inside the network; prints JSON.
+//!     --name picks one scenario of a file with [[scenarios]].
 //! edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
 //!     Limiter decisions per second, Rust and optionally libpacer's
 //!     bench_limiter, at each thread count; prints a Markdown table.
@@ -70,8 +74,8 @@ pub const USAGE: &str = "usage: edgefront-bench run --scenario FILE... --targets
        edgefront-bench baseline --config bench/gates.toml --results DIR... --machine CPU --commit SHA [--target NAME] [--out FILE]
        edgefront-bench report --results DIR... --out FILE [--title TEXT] [--intro FILE] [--limiter DIR]
        edgefront-bench validate FILE...
-       edgefront-bench origin [--listen ADDR]
-       edgefront-bench load --scenario FILE --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
+       edgefront-bench origin [--listen ADDR] [--delay DURATION]
+       edgefront-bench load --scenario FILE [--name NAME] --target HOST:PORT --origin HOST:PORT [--cgroup-root DIR] [--cgroup ID]...
        edgefront-bench limiter --scenario FILE [--c-bench BIN] [--json FILE]
        edgefront-bench l4 --scenario FILE [--pacerd BIN] [--edgefront BIN] [--json FILE]
        edgefront-bench memory --keys N [--diffdrive BIN] [--difftest BIN] [--json FILE]
@@ -271,10 +275,18 @@ fn run_targets(args: &[String]) -> Result<(), Failure> {
             .ok_or_else(|| usage(format!("--repeat {n:?} must be a whole number above 0")))?,
         None => 1,
     };
-    let scenarios: Vec<(Scenario, PathBuf)> = scenario_paths
-        .iter()
-        .map(|p| read_scenario(p).map(|s| (s, PathBuf::from(p))))
-        .collect::<Result<_, _>>()?;
+    let mut scenarios: Vec<(Scenario, PathBuf)> = Vec::new();
+    for path in &scenario_paths {
+        for scenario in Scenario::load_all(path).map_err(|e| failed(e.to_string()))? {
+            if scenarios.iter().any(|(s, _)| s.name == scenario.name) {
+                return Err(usage(format!(
+                    "two scenarios are named {:?}",
+                    scenario.name
+                )));
+            }
+            scenarios.push((scenario, PathBuf::from(path)));
+        }
+    }
     let all = Target::load_all(&targets_dir).map_err(failed)?;
     let mut targets = Vec::new();
     for name in &names {
@@ -382,14 +394,15 @@ pub fn round_order<T>(targets: &[T], round: usize) -> impl Iterator<Item = &T> {
 pub fn summary(result: &BenchResult) -> String {
     let m = &result.measured;
     format!(
-        "  {}: {} req/s, p50 {:.3} ms, p99 {:.3} ms, p99.9 {:.3} ms, hit ratio {:.1}%, {} errors, peak RSS {:.1} MiB, {:.1} CPU s, image {:.1} MiB",
+        "  {}: {} req/s, p50 {:.3} ms, p99 {:.3} ms, p99.9 {:.3} ms, hit ratio {:.1}%, {} errors, {} in flight at peak, peak RSS {:.1} MiB, {:.1} CPU s, image {:.1} MiB",
         result.target.name,
         report::grouped(m.throughput_rps),
         m.latency.p50_ms,
         m.latency.p99_ms,
         m.latency.p999_ms,
         m.hit_ratio * 100.0,
-        m.errors.connect + m.errors.timeout + m.errors.other,
+        m.errors.connect + m.errors.timeout + m.errors.other + m.errors.grpc,
+        m.peak_in_flight,
         result.resources.peak_rss_bytes as f64 / (1 << 20) as f64,
         result.resources.cpu_seconds,
         result.target.image_size_bytes as f64 / (1 << 20) as f64
@@ -537,14 +550,20 @@ fn validate(args: &[String]) -> Result<(), Failure> {
 }
 
 fn serve_origin(args: &[String]) -> Result<(), Failure> {
-    let flags = Flags::parse(args, &["listen"], &[])?;
+    let flags = Flags::parse(args, &["listen", "delay"], &[])?;
     flags.no_positional()?;
     let listen = flags.one("listen")?.unwrap_or("0.0.0.0:9000");
     let addr = listen
         .parse()
         .map_err(|_| usage(format!("--listen {listen:?} is not an address")))?;
+    let delay = match flags.one("delay")? {
+        None => Duration::ZERO,
+        Some(text) => crate::scenario::parse_duration(text)
+            .filter(|d| *d <= crate::scenario::MAX_ORIGIN_DELAY)
+            .ok_or_else(|| usage(format!("--delay {text:?} is not a duration of 0 to 10s")))?,
+    };
     runtime()?.block_on(async {
-        let origin = crate::origin::Origin::bind(addr)
+        let origin = crate::origin::Origin::bind_with_delay(addr, delay)
             .await
             .map_err(|e| failed(format!("cannot listen on {listen}: {e}")))?;
         eprintln!("edgefront-bench origin on {}", origin.addr());
@@ -572,11 +591,22 @@ async fn wait_for_signal() {
 fn load(args: &[String]) -> Result<(), Failure> {
     let flags = Flags::parse(
         args,
-        &["scenario", "target", "origin", "cgroup-root", "cgroup"],
+        &[
+            "scenario",
+            "name",
+            "target",
+            "origin",
+            "cgroup-root",
+            "cgroup",
+        ],
         &[],
     )?;
     flags.no_positional()?;
-    let scenario = read_scenario(flags.required("scenario")?)?;
+    let path = flags.required("scenario")?;
+    let scenario = match flags.one("name")? {
+        Some(name) => Scenario::load_named(path, name).map_err(|e| failed(e.to_string()))?,
+        None => read_scenario(path)?,
+    };
     let options = LoadOptions {
         target: flags.required("target")?.to_owned(),
         origin: flags.required("origin")?.to_owned(),
@@ -759,6 +789,8 @@ mod tests {
             vec!["report", "--out", "c"],
             vec!["validate"],
             vec!["origin", "--listen", "nowhere"],
+            vec!["origin", "--delay", "soon"],
+            vec!["origin", "--delay", "11s"],
             vec!["load", "--target", "x"],
         ] {
             let err = run(&strings(&args)).unwrap_err();
@@ -955,8 +987,91 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, Failure::Failed(_)));
+
+        // One scenario of a file of several, by name.
+        let several = dir.join("several.toml");
+        std::fs::write(
+            &several,
+            "connections = 2\nprotocol = \"http2\"\n[load]\nrate = 50\nduration = \"200ms\"\n[keys]\ncount = 5\nzipf = 1.0\nhit_ratio = 0.0\n[[objects]]\nsize = 10\n[[scenarios]]\nname = \"a\"\n[[scenarios]]\nname = \"b\"\nrequests = \"grpc\"\n",
+        )
+        .unwrap();
+        let several = several.display().to_string();
+        for (name, ok) in [("b", true), ("c", false)] {
+            let args = strings(&[
+                "load",
+                "--scenario",
+                &several,
+                "--name",
+                name,
+                "--target",
+                &addr,
+                "--origin",
+                &addr,
+            ]);
+            let result = std::thread::spawn(move || run(&args)).join().unwrap();
+            assert_eq!(result.is_ok(), ok, "{name}: {result:?}");
+        }
+        // Without --name, a file of several is refused.
+        let args = strings(&[
+            "load",
+            "--scenario",
+            &several,
+            "--target",
+            &addr,
+            "--origin",
+            &addr,
+        ]);
+        let err = std::thread::spawn(move || run(&args))
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(&err, Failure::Failed(m) if m.contains("load_all")),
+            "{err:?}"
+        );
+        // run reads every scenario of it, and refuses two of one name.
+        let err = run(&strings(&[
+            "run",
+            "--scenario",
+            &several,
+            "--scenario",
+            &several,
+            "--targets",
+            "varnish",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(&err, Failure::Usage(m) if m.contains("two scenarios are named \"a\"")),
+            "{err:?}"
+        );
         drop(origin);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_origin_serves_with_a_delay() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let args = strings(&["origin", "--listen", &addr.to_string(), "--delay", "150ms"]);
+        // It serves until a signal; this thread is left to the process.
+        std::thread::spawn(move || run(&args));
+        let rt = runtime().unwrap();
+        rt.block_on(async {
+            crate::client::wait_ready_over(
+                addr,
+                "/__origin/healthz",
+                Duration::from_secs(10),
+                None,
+            )
+            .await
+            .unwrap();
+            let start = std::time::Instant::now();
+            crate::client::get(addr, "/obj/1/k1", Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(150));
+        });
     }
 
     #[test]

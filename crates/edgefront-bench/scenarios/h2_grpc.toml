@@ -1,0 +1,49 @@
+# Proxy week 6: HTTP/2 on both sides, and gRPC, at 1,000 concurrent
+# streams, against edgefront proxy, Envoy and HAProxy:
+#
+#   edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml \
+#     --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 --target-cpus 1
+#
+# Each target takes prior-knowledge HTTP/2 from the load generator over 10
+# connections and speaks HTTP/2 to the origin (bench/targets/*-h2). The
+# origin holds every request 200 ms, so at 5,000 requests a second about
+# 1,000 streams are open through the target at once (Little's law), 100 a
+# connection; each result's measured.peak_in_flight is the most there were.
+# The proxies cache nothing, so the keys only spread the requests over
+# distinct paths.
+description = "HTTP/2 through the proxy to the origin over 10 connections, 5,000 requests a second each held 200 ms by the origin: 1,000 concurrent streams."
+protocol = "http2"
+connections = 10
+timeout = "5s"
+seed = 1
+origin_delay = "200ms"
+
+[warmup]
+rate = 1000
+duration = "5s"
+
+[load]
+rate = 5000
+duration = "30s"
+
+[keys]
+count = 1000
+zipf = 1.0
+hit_ratio = 0.9
+
+[[objects]]
+size = "4KiB"
+
+# Plain HTTP/2 GETs of 4 KiB objects.
+[[scenarios]]
+name = "h2-1000-streams"
+
+# Unary gRPC calls: each asks for a 1 KiB object by its path and gets it
+# back as one message, with grpc-status 0 in the trailers. A call that
+# ends with any other status, or none, counts in measured.errors.grpc.
+[[scenarios]]
+name = "grpc-1000-streams"
+description = "Unary gRPC through the proxy to the origin over 10 connections, 5,000 calls a second each held 200 ms by the origin: 1,000 concurrent streams."
+requests = "grpc"
+[[scenarios.objects]]
+size = "1KiB"

@@ -52,6 +52,23 @@
 //! Every request is a pure function of the scenario and its sequence
 //! number, so two runs of a scenario ask for exactly the same objects in
 //! the same order, whatever the workers' interleaving.
+//!
+//! **gRPC.** With `requests = "grpc"` (HTTP/2 only) each request is a
+//! unary gRPC call instead of a `GET`: `POST` [`crate::origin::GRPC_METHOD`]
+//! whose one message is the object's path, answered by one message of the
+//! object's size and `grpc-status: 0` in the trailers. A call that ends
+//! with any other status counts as a gRPC error.
+//!
+//! **Streams.** `origin_delay = "200ms"` has the origin hold every object
+//! request that long before answering, so the streams a run keeps open at
+//! once are about its rate times the delay (Little's law): 5,000 a second
+//! held 200 ms is 1,000 concurrent streams through the target.
+//!
+//! **Several scenarios in one file.** A file with `[[scenarios]]` holds one
+//! scenario per entry; the keys outside them are defaults every entry
+//! starts from, a table such as `[load]` replaced whole by an entry's own.
+//! [`Scenario::load_all`] reads them, [`Scenario::load_named`] one of them
+//! by name, and [`Scenario::load`] a file of one.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -64,6 +81,29 @@ use http_body_util::Full;
 use serde::Deserialize;
 
 use crate::load::{Phase, Protocol, RequestSource, Schedule};
+use crate::origin;
+
+/// The longest `origin_delay` a scenario may ask for.
+pub const MAX_ORIGIN_DELAY: Duration = Duration::from_secs(10);
+
+/// What each request of a scenario is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestKind {
+    /// `GET /obj/<size>/<name>`.
+    Get,
+    /// A unary gRPC call for the object, over HTTP/2.
+    Grpc,
+}
+
+impl RequestKind {
+    /// `get` or `grpc`, as scenarios and results name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            RequestKind::Get => "get",
+            RequestKind::Grpc => "grpc",
+        }
+    }
+}
 
 /// The most popular objects a scenario may have.
 pub const MAX_KEYS: u64 = 10_000_000;
@@ -164,6 +204,10 @@ pub struct Scenario {
     pub objects: Vec<ObjectClass>,
     /// Load the target over TLS with this SNI; `None` is cleartext.
     pub tls: Option<String>,
+    /// `GET`s or unary gRPC calls.
+    pub kind: RequestKind,
+    /// How long the origin holds each object request before answering.
+    pub origin_delay: Duration,
     /// The probability a measured request asks for a once-only object.
     once_only: f64,
     /// The expected hit ratio of the measured requests.
@@ -185,6 +229,8 @@ struct RawScenario {
     keys: RawKeys,
     objects: Vec<RawObject>,
     tls: Option<RawTls>,
+    requests: Option<String>,
+    origin_delay: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -273,10 +319,82 @@ impl Scenario {
         paths.iter().map(Scenario::load).collect()
     }
 
+    /// Reads and validates every scenario in a file: each entry of its
+    /// `[[scenarios]]`, or the file itself when it has none.
+    pub fn load_all(path: impl AsRef<Path>) -> Result<Vec<Scenario>, ScenarioError> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path).map_err(|e| ScenarioError::Io {
+            path: path.to_owned(),
+            reason: e.to_string(),
+        })?;
+        Scenario::all_from_toml(&text).map_err(|e| match e {
+            ScenarioError::Parse(reason) => {
+                ScenarioError::Parse(format!("{}: {reason}", path.display()))
+            }
+            other => other,
+        })
+    }
+
+    /// The scenario named `name` in a file of one or several.
+    pub fn load_named(path: impl AsRef<Path>, name: &str) -> Result<Scenario, ScenarioError> {
+        let path = path.as_ref();
+        Scenario::load_all(path)?
+            .into_iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| {
+                invalid(
+                    "name",
+                    format!("{} has no scenario {name:?}", path.display()),
+                )
+            })
+    }
+
+    /// Every scenario in `text`: each `[[scenarios]]` entry over the keys
+    /// outside them, or `text` itself when it has no entries.
+    pub fn all_from_toml(text: &str) -> Result<Vec<Scenario>, ScenarioError> {
+        let parse = |e: toml::de::Error| ScenarioError::Parse(e.to_string());
+        let mut table: toml::Table = toml::from_str(text).map_err(parse)?;
+        let Some(entries) = table.remove("scenarios") else {
+            return Ok(vec![Scenario::from_toml(text)?]);
+        };
+        let toml::Value::Array(entries) = entries else {
+            return Err(invalid("scenarios", "must be an array of tables"));
+        };
+        if entries.is_empty() {
+            return Err(invalid("scenarios", "has no entries"));
+        }
+        let mut out: Vec<Scenario> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let toml::Value::Table(entry) = entry else {
+                return Err(invalid("scenarios", "must be an array of tables"));
+            };
+            let mut merged = table.clone();
+            merged.extend(entry);
+            let raw: RawScenario = toml::Value::Table(merged).try_into().map_err(parse)?;
+            let scenario = Scenario::from_raw(raw)?;
+            if out.iter().any(|s| s.name == scenario.name) {
+                return Err(invalid(
+                    "scenarios.name",
+                    format!("{:?} names two scenarios", scenario.name),
+                ));
+            }
+            out.push(scenario);
+        }
+        Ok(out)
+    }
+
     /// Parses and validates a scenario.
     pub fn from_toml(text: &str) -> Result<Scenario, ScenarioError> {
-        let raw: RawScenario =
-            toml::from_str(text).map_err(|e| ScenarioError::Parse(e.to_string()))?;
+        let raw: RawScenario = toml::from_str(text).map_err(|e| {
+            if toml::from_str::<toml::Table>(text).is_ok_and(|t| t.contains_key("scenarios")) {
+                ScenarioError::Parse(
+                    "holds several scenarios ([[scenarios]]); read it with Scenario::load_all"
+                        .into(),
+                )
+            } else {
+                ScenarioError::Parse(e.to_string())
+            }
+        })?;
         Scenario::from_raw(raw)
     }
 
@@ -391,8 +509,36 @@ impl Scenario {
                 Some(t.server_name)
             }
         };
+        let kind = match raw.requests.as_deref() {
+            None | Some("get") => RequestKind::Get,
+            Some("grpc") => RequestKind::Grpc,
+            Some(other) => {
+                return Err(invalid(
+                    "requests",
+                    format!("{other:?} is not \"get\" or \"grpc\""),
+                ));
+            }
+        };
+        if kind == RequestKind::Grpc && protocol != Protocol::Http2 {
+            return Err(invalid("requests", "gRPC needs protocol = \"http2\""));
+        }
+        let origin_delay = match raw.origin_delay {
+            None => Duration::ZERO,
+            Some(text) => match parse_duration(&text) {
+                Some(d) if d <= MAX_ORIGIN_DELAY => d,
+                Some(_) => return Err(invalid("origin_delay", "must be at most 10s")),
+                None => {
+                    return Err(invalid(
+                        "origin_delay",
+                        format!("{text:?} is not a duration like 500ms, 10s or 2m"),
+                    ));
+                }
+            },
+        };
         let mut scenario = Scenario {
             tls,
+            kind,
+            origin_delay,
             name: raw.name,
             description: raw.description,
             protocol,
@@ -656,6 +802,7 @@ pub struct ScenarioRequests {
     cdf: Vec<f64>,
     warmup: u64,
     once_only: f64,
+    kind: RequestKind,
 }
 
 /// What one request asks for.
@@ -701,6 +848,7 @@ impl ScenarioRequests {
             cdf,
             warmup: scenario.warmup_requests(),
             once_only: scenario.once_only,
+            kind: scenario.kind,
         }
     }
 
@@ -723,10 +871,16 @@ impl ScenarioRequests {
 
 impl RequestSource for ScenarioRequests {
     fn request(&self, seq: u64) -> Request<Full<Bytes>> {
-        let mut request = Request::new(Full::new(Bytes::new()));
-        // The path is ASCII digits and letters, so it always parses.
-        *request.uri_mut() = self.object(seq).path().parse().expect("a valid path");
-        request
+        let path = self.object(seq).path();
+        match self.kind {
+            RequestKind::Get => {
+                let mut request = Request::new(Full::new(Bytes::new()));
+                // The path is ASCII digits and letters, so it always parses.
+                *request.uri_mut() = path.parse().expect("a valid path");
+                request
+            }
+            RequestKind::Grpc => origin::grpc_request(&path),
+        }
     }
 }
 
@@ -1254,6 +1408,196 @@ mod tests {
         ] {
             assert_eq!(parse_size(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn grpc_calls_and_an_origin_delay() {
+        let s = Scenario::from_toml(BASIC).unwrap();
+        assert_eq!((s.kind, s.origin_delay), (RequestKind::Get, Duration::ZERO));
+        let grpc = with(
+            BASIC,
+            "connections = 4",
+            "connections = 4\nprotocol = \"http2\"\nrequests = \"grpc\"\norigin_delay = \"200ms\"",
+        );
+        let s = Scenario::from_toml(&grpc).unwrap();
+        assert_eq!(s.kind, RequestKind::Grpc);
+        assert_eq!(s.kind.name(), "grpc");
+        assert_eq!(s.origin_delay, Duration::from_millis(200));
+        // Each request is the unary call for the object a GET would ask for.
+        let requests = s.requests();
+        let object = requests.object(5000);
+        let request = requests.request(5000);
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(request.uri().path(), origin::GRPC_METHOD);
+        assert_eq!(
+            request.headers()[http::header::CONTENT_TYPE],
+            "application/grpc"
+        );
+        let body = futures_body(request.into_body());
+        assert_eq!(&body[5..], object.path().as_bytes());
+        assert_eq!(body[4] as usize, object.path().len());
+        let get = Scenario::from_toml(BASIC).unwrap().requests().request(5000);
+        assert_eq!(get.method(), http::Method::GET);
+        assert_eq!(get.uri().path(), object.path());
+
+        assert_eq!(
+            field(&with(BASIC, "seed = 7", "seed = 7\nrequests = \"grpc\"")),
+            "requests"
+        );
+        assert_eq!(
+            field(&with(BASIC, "seed = 7", "seed = 7\nrequests = \"put\"")),
+            "requests"
+        );
+        assert_eq!(
+            field(&with(BASIC, "seed = 7", "seed = 7\norigin_delay = \"11s\"")),
+            "origin_delay"
+        );
+        assert_eq!(
+            field(&with(
+                BASIC,
+                "seed = 7",
+                "seed = 7\norigin_delay = \"soon\""
+            )),
+            "origin_delay"
+        );
+        let zero = Scenario::from_toml(&with(BASIC, "seed = 7", "seed = 7\norigin_delay = \"0s\""))
+            .unwrap();
+        assert_eq!(zero.origin_delay, Duration::ZERO);
+    }
+
+    /// The bytes of a request body that is already whole.
+    fn futures_body(body: Full<Bytes>) -> Bytes {
+        use http_body_util::BodyExt;
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(body.collect())
+            .unwrap()
+            .to_bytes()
+    }
+
+    #[test]
+    fn a_file_may_hold_several_scenarios_over_shared_defaults() {
+        let text = r#"
+            description = "Shared."
+            protocol = "http2"
+            connections = 10
+            origin_delay = "100ms"
+            [load]
+            rate = 1000
+            duration = "5s"
+            [keys]
+            count = 100
+            zipf = 1.0
+            hit_ratio = 0.0
+            [[objects]]
+            size = "1KiB"
+
+            [[scenarios]]
+            name = "plain"
+
+            [[scenarios]]
+            name = "calls"
+            requests = "grpc"
+            connections = 4
+            [scenarios.load]
+            rate = 500
+            duration = "2s"
+        "#;
+        let all = Scenario::all_from_toml(text).unwrap();
+        assert_eq!(all.len(), 2);
+        let (plain, calls) = (&all[0], &all[1]);
+        assert_eq!(plain.name, "plain");
+        assert_eq!(plain.kind, RequestKind::Get);
+        assert_eq!(plain.connections, 10);
+        assert_eq!(plain.measured_requests(), 5000);
+        assert_eq!(plain.description, "Shared.");
+        assert_eq!(calls.kind, RequestKind::Grpc);
+        assert_eq!(calls.connections, 4);
+        // A table is replaced whole.
+        assert_eq!(calls.measured_requests(), 1000);
+        assert_eq!(calls.origin_delay, Duration::from_millis(100));
+
+        // A file of one reads as one.
+        assert_eq!(
+            Scenario::all_from_toml(BASIC).unwrap(),
+            vec![Scenario::from_toml(BASIC).unwrap()]
+        );
+        // from_toml and load point a file of several at load_all.
+        let ScenarioError::Parse(reason) = Scenario::from_toml(text).unwrap_err() else {
+            panic!("a file of several is not one scenario");
+        };
+        assert!(reason.contains("load_all"), "{reason}");
+
+        let dup = text.replace("name = \"calls\"", "name = \"plain\"");
+        assert!(matches!(
+            Scenario::all_from_toml(&dup).unwrap_err(),
+            ScenarioError::Invalid {
+                field: "scenarios.name",
+                ..
+            }
+        ));
+        assert!(matches!(
+            Scenario::all_from_toml(&format!("scenarios = 3\n{BASIC}")).unwrap_err(),
+            ScenarioError::Invalid {
+                field: "scenarios",
+                ..
+            }
+        ));
+        assert!(matches!(
+            Scenario::all_from_toml(&format!("scenarios = []\n{BASIC}")).unwrap_err(),
+            ScenarioError::Invalid {
+                field: "scenarios",
+                ..
+            }
+        ));
+        assert!(matches!(
+            Scenario::all_from_toml(&format!("scenarios = [1]\n{BASIC}")).unwrap_err(),
+            ScenarioError::Invalid {
+                field: "scenarios",
+                ..
+            }
+        ));
+        // An entry is validated like any scenario.
+        let bad = text.replace(
+            "requests = \"grpc\"",
+            "requests = \"grpc\"\nprotocol = \"http1\"",
+        );
+        assert!(matches!(
+            Scenario::all_from_toml(&bad).unwrap_err(),
+            ScenarioError::Invalid {
+                field: "requests",
+                ..
+            }
+        ));
+        assert!(matches!(
+            Scenario::all_from_toml(
+                &text.replace("name = \"plain\"", "name = \"plain\"\nbogus = 1")
+            )
+            .unwrap_err(),
+            ScenarioError::Parse(_)
+        ));
+
+        let dir = std::env::temp_dir().join(format!("edgefront-several-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("several.toml");
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(Scenario::load_all(&file).unwrap(), all);
+        assert_eq!(Scenario::load_named(&file, "calls").unwrap(), all[1]);
+        assert!(matches!(
+            Scenario::load_named(&file, "other").unwrap_err(),
+            ScenarioError::Invalid { field: "name", .. }
+        ));
+        std::fs::write(&file, "name = ").unwrap();
+        let ScenarioError::Parse(reason) = Scenario::load_all(&file).unwrap_err() else {
+            panic!("malformed");
+        };
+        assert!(reason.contains("several.toml"), "{reason}");
+        assert!(matches!(
+            Scenario::load_all(dir.join("missing.toml")).unwrap_err(),
+            ScenarioError::Io { .. }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

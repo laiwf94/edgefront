@@ -876,11 +876,7 @@ impl<R: Runtime> Runner<R> {
         command.extend(network_args(network, "origin"));
         command.push(origin_cpus.docker_arg());
         command.push(harness.clone());
-        command.extend(args(&[
-            "origin",
-            "--listen",
-            &format!("0.0.0.0:{ORIGIN_PORT}"),
-        ]));
+        command.extend(origin_args(scenario));
         self.runtime.exec(&command)?;
         created.push(origin.clone());
         self.runtime.exec(&args(&["start", &origin]))?;
@@ -910,6 +906,8 @@ impl<R: Runtime> Runner<R> {
             "load",
             "--scenario",
             "/scenario.toml",
+            "--name",
+            &scenario.name,
             "--target",
             &format!("target:{}", target.port),
             "--origin",
@@ -1030,6 +1028,17 @@ impl<R: Runtime> Runner<R> {
     }
 }
 
+/// The origin's command line for `scenario`: its listen address, and the
+/// scenario's `origin_delay` when it has one.
+pub fn origin_args(scenario: &Scenario) -> Vec<String> {
+    let mut out = args(&["origin", "--listen", &format!("0.0.0.0:{ORIGIN_PORT}")]);
+    if !scenario.origin_delay.is_zero() {
+        out.push("--delay".into());
+        out.push(format!("{}ms", scenario.origin_delay.as_secs_f64() * 1e3));
+    }
+    out
+}
+
 fn network_args(network: &str, alias: &str) -> Vec<String> {
     vec![
         format!("--network={network}"),
@@ -1120,6 +1129,7 @@ pub async fn load_and_measure(
     config.connections = scenario.connections;
     config.timeout = scenario.timeout;
     config.tls = tls;
+    config.grpc = scenario.kind == crate::scenario::RequestKind::Grpc;
     let report = load::run(config, scenario.requests())
         .await
         .map_err(|e| e.to_string())?;
@@ -1271,6 +1281,27 @@ mod tests {
     }
 
     #[test]
+    fn the_origin_holds_requests_for_the_scenarios_delay() {
+        let mut s = scenario();
+        assert_eq!(origin_args(&s), ["origin", "--listen", "0.0.0.0:9000"]);
+        s.origin_delay = Duration::from_millis(200);
+        let with = origin_args(&s);
+        assert_eq!(
+            with,
+            ["origin", "--listen", "0.0.0.0:9000", "--delay", "200ms"]
+        );
+        assert_eq!(
+            crate::scenario::parse_duration(&with[4]),
+            Some(Duration::from_millis(200))
+        );
+        s.origin_delay = Duration::from_micros(1500);
+        assert_eq!(
+            crate::scenario::parse_duration(&origin_args(&s)[4]),
+            Some(Duration::from_micros(1500))
+        );
+    }
+
+    #[test]
     fn templates_fill_every_value_and_refuse_unknown_ones() {
         let vars = Vars::new(&scenario(), 8080, 4);
         assert_eq!(
@@ -1417,7 +1448,9 @@ mod tests {
         let origin = find("origin --listen 0.0.0.0:9000");
         let helper = find("--network-alias=helper");
         let thing = find("--network-alias=target");
-        let load = find(" load --scenario /scenario.toml --target target:80");
+        let load = find(" load --scenario /scenario.toml --name tiny --target target:80");
+        // No origin_delay, no --delay.
+        assert!(log[origin].ends_with("origin --listen 0.0.0.0:9000"));
         assert!(net < origin && origin < helper && helper < thing && thing < load);
         assert!(log[origin].contains("--cpuset-cpus=4-9"));
         assert!(log[thing].contains("--cpuset-cpus=0-3"));
