@@ -525,6 +525,25 @@ nodes = ["shield-1"]
 
 It needs `CACHET_CLUSTER_SECRET`. `examples/tiered.sh` starts five edges and a shield and prints the origin's request counts: 20 concurrent requests for one cold URL over the five edges make one origin request, and 1,000 requests for 200 objects make 200. After an edge is killed with SIGKILL, the others notice within about 2 s, and its keys are fetched again from the shield. In `tests/tier.rs`, with ten nodes, a Zipf 1.0 trace offloads 97.5% of requests (82.7% without tiers), and killing a node moves only its own keys, under 10% of them. `/metrics` counts owner and shield fetches, fallbacks, hot promotions and demotions, and members. See [docs/DESIGN.md](docs/DESIGN.md#tiers-owners-a-shield-and-hot-keys-over-swim).
 
+## Compression, shared dictionaries and Early Hints
+
+With `[cache.compression] enabled = true`, a stored text-like response (HTML, CSS, JavaScript, JSON, XML, SVG, WebAssembly) of at least 256 bytes is compressed after it is stored, off the request path, into br, zstd and gzip. Each is kept as its own variant of the URL and chosen by Accept-Encoding, so a URL holds at most four variants however clients spell the header. A client without Accept-Encoding, or one that accepts none of them, gets the response as the origin sent it. A response that offers itself with `Use-As-Dictionary` is also kept as a shared dictionary (RFC 9842): a later request that holds it (`Available-Dictionary`) and accepts `dcb` or `dcz` gets its fresh copy compressed against it. With `early_hints = true`, a stored HTML page that must be revalidated or fetched again first sends its preload links as `103 Early Hints`, so the browser starts on the page's styles and scripts during the origin's think time.
+
+```toml
+[cache]
+early_hints = true            # 103 from stored HTML's preload links (HTTP/1.1 clients)
+
+[cache.compression]
+enabled = true
+min_bytes = 256
+brotli_quality = 5            # zstd_level = 3, gzip_level = 6
+queue_limit = 64              # compression jobs at once; past it, compression is skipped
+dictionary_max_bytes = 4194304
+dictionary_max_ttl_secs = 2592000
+```
+
+`examples/compression.sh` runs the release binary in front of the example origin. It loads a 160 KiB JavaScript bundle, then its next release twice, and prints the bytes on the wire: 163,532 as identity, 24,934 as br and 24,378 as gzip without the dictionary, then 892 as dcb and 965 as dcz with it, 96% under brotli. `/metrics` reports per coding the bytes in and out, the time spent per MiB (in a release build here about 9 to 13 ms for br, 15 ms for gzip, 1.5 to 2 ms for zstd, 2 ms for dcb and 1.4 ms for dcz), a compression ratio histogram, and the compressions skipped because the queue was full. In `tests/compression.rs`, the 103 reaches the client 0.2 to 1.0 ms after the request, while the page's revalidation takes 300 ms at the origin. Routes that do not compress keep cachet 0.1's raw Vary matching. See [docs/DESIGN.md](docs/DESIGN.md#compressed-variants-shared-dictionaries-and-early-hints).
+
 ## How fast the hit path is
 
 On an Apple Silicon laptop (16 cores) that was also running other work (load average around 70), so read these as lower bounds. Reproduce with `cargo bench` and `examples/load.sh`.

@@ -192,6 +192,8 @@ jobs:
         run: examples/shadow_replay.sh
       - name: Tiered caching demo (five edges and a shield)
         run: examples/tiered.sh
+      - name: Compression demo (variants and a shared dictionary)
+        run: examples/compression.sh
 
   # steer's failover drill against edgefront: 100.00% of requests in all
   # four phases with the resilience features on, and every fault showing

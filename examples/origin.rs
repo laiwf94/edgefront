@@ -5,6 +5,9 @@
 //!   /slow                  cacheable, takes 300 ms (shows request collapsing)
 //!   /versioned             max-age=2 with an entity tag; answers 304 when it matches
 //!   /news                  max-age=2, stale-if-error=600, tagged "news"
+//!   /js/app.v1.js          a JavaScript bundle offered as a shared dictionary
+//!                          (Use-As-Dictionary) for later releases
+//!   /js/app.v2.js          the next release of the bundle
 //!   /stats                 JSON count of requests per path
 //!   /healthz               200
 //!   POST /bump             changes the /versioned and /news content
@@ -25,6 +28,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+
+/// Two releases of a JavaScript bundle (tests/fixtures/compression).
+const APP_V1: &str = include_str!("../tests/fixtures/compression/app.v1.js");
+const APP_V2: &str = include_str!("../tests/fixtures/compression/app.v2.js");
 
 #[derive(Default)]
 struct State {
@@ -104,6 +111,24 @@ async fn answer(state: Arc<State>, req: Request<Incoming>) -> Response<Full<Byte
                 &headers,
                 format!("headlines, edition {version}\n"),
             )
+        }
+        (&Method::GET, "/js/app.v1.js") => {
+            let headers = [
+                ("cache-control", "public, max-age=3600".to_string()),
+                ("content-type", "text/javascript".to_string()),
+                (
+                    "use-as-dictionary",
+                    r#"match="/js/app.*.js", match-dest=("script"), id="app""#.to_string(),
+                ),
+            ];
+            reply(StatusCode::OK, &headers, APP_V1)
+        }
+        (&Method::GET, "/js/app.v2.js") => {
+            let headers = [
+                ("cache-control", "public, max-age=3600".to_string()),
+                ("content-type", "text/javascript".to_string()),
+            ];
+            reply(StatusCode::OK, &headers, APP_V2)
         }
         (&Method::GET, p) if p.starts_with("/static/") => {
             let size = req

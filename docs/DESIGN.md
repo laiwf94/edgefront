@@ -811,9 +811,29 @@ The admin listener binds to localhost by default. Without `CACHET_ADMIN_TOKEN` t
 | A forged hop header | Removed before the cache sees the request. |
 | Shutdown | Stops accepting and closes idle connections at once. Open requests get up to 10 s (`shutdown_ms`) to finish, each answered with `Connection: close`; connections still open after that are closed. Then the disk queue is flushed. Queued purge deliveries are lost. |
 
+## Compressed variants, shared dictionaries and Early Hints
+
+**Which coding.** `encoding.rs` reduces Accept-Encoding to the one coding a response will use, among identity, gzip, br and zstd: q weights, `*`, an excluded identity, ties to the server's order (br, zstd, gzip, identity). A variant stored by a compressing route carries a stored-only `edgefront-variant` field (`source`, or the coding it was compressed into), which the disk format keeps and no client sees. `Entry::find` leaves Accept-Encoding out of such variants' Vary match and picks among the codings held with `encoding::negotiate`, so one URL has at most four, and a collapsed follower is matched the same way. Routes that do not compress match Accept-Encoding raw, as cachet 0.1 did, which keeps `make difftest-cache` unchanged.
+
+**Compressing on fill** (`variants.rs`). A source is a `200` with a text-like type, at least `min_bytes`, no content coding, no `Content-Range` and no `no-transform`. It gets `Vary: Accept-Encoding` before it is stored, and is then compressed on tokio's blocking pool, so a fill never waits, into br (quality 5), zstd (3) and gzip (6). A coding is kept only when its output is smaller than the source. Each is its own variant in the same entry as the source, with `Content-Encoding`, its own length and a weak entity tag (`"v1"` becomes `W/"v1"`, since it is another representation). Being in one entry, the variants are evicted and purged together. A newer response from upstream drops the ones compressed from the copy it replaces, `Cache::store_derived` refuses variants of a source no longer held, and compressed variants do not count against `max_variants`. A stale compressed variant is never revalidated on its own: the request goes upstream with its source's validators, and the refreshed source is compressed again.
+
+**The budget.** `queue_limit` caps the jobs queued or running on the blocking pool, compression on fill and dictionary compression together. Past it a job is skipped and counted, and the response is served as stored. `CompressionStats` counts, per coding, jobs, bytes in and out, the time spent compressing on blocking threads (the work keeps them busy, so it stands for CPU; there is no thread CPU clock without `unsafe`), and a ratio histogram, all on `/metrics`.
+
+**Shared dictionaries** (`dictionary.rs`, RFC 9842). A stored identity `200` with `Use-As-Dictionary` is kept under the SHA-256 of its body, with its pattern resolved against its URL, its `match-dest` and `id`. It is kept while fresh and at most `dictionary_max_ttl_secs`, within `dictionary_max_bytes` each and 64 MiB in all; past that, the soonest to expire goes. A fresh hit uses one when the request:
+
+- names its hash in `Available-Dictionary`;
+- accepts `dcb` or `dcz`;
+- is for its host and pattern;
+- has a `Sec-Fetch-Dest` among `match-dest`, when that is set;
+- echoes its `Dictionary-ID`, if it sends one.
+
+dcb is brotli with the dictionary as a raw prefix, and dcz is zstd with it as raw content and a window that reaches over it. Both start with their magic and the dictionary's hash, and the response varies on `accept-encoding, available-dictionary`. The compressed body is kept per URL, dictionary and coding, tied to the stored copy it came from (64 MiB, oldest out). Patterns are a subset of URL Pattern: paths, relative paths and same-origin URLs with `*` and `\` escapes. Groups, named parameters, regular expressions and search parts are not used, nor dictionary types other than `raw`. Conditional and range requests, and misses, get the usual coding.
+
+**Early Hints** (`early_hints.rs`, RFC 8297). A stored HTML page's hints are its `preload`, `modulepreload` and `preconnect` `Link` values, at most 32. When such a page must go upstream, the hints are sent as a `103` first, and the final response keeps its `Link` fields. hyper's HTTP/1.1 server cannot send a 1xx: it refuses one from a service, and its only informational support is the client's `on_informational`. So `edgefront_core::interim` puts an `Interim` in each HTTP/1.1 request's extensions (not HTTP/1.0's, which RFC 9110 section 15.2 forbids), and the listener's connection stream writes what it queues ahead of hyper's next write or flush. This is safe because hyper writes nothing on a connection between reading a request and the response being returned, and does not read the next request until the response is written. Once hyper starts the final response, that request's `Interim` refuses more (16 KiB at most). Filters reach it through `RequestHead::extensions`. HTTP/2 clients get no hints, because hyper's HTTP/2 server does not expose h2's `send_informational`.
+
 ## What it does not do well
 
-HTTP/1.1 only, plain HTTP to origins and peers. Peer messages are signed, not encrypted; purge targets are not secret, but deployments that care should put the admin listener on a private network.
+HTTP/1.1 only, plain HTTP to origins and peers; 103 Early Hints only to HTTP/1.1 clients. Peer messages are signed, not encrypted; purge targets are not secret, but deployments that care should put the admin listener on a private network.
 
 Objects are kept whole in memory up to the per-object limit; a fill over 64 KiB with a declared length streams to its clients while it arrives, but a body without a `Content-Length` is still read whole before anyone sees it. Responses over the per-object limit stream through uncached.
 
