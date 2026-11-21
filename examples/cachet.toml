@@ -31,6 +31,7 @@ min_bytes = 256               # smaller bodies are stored as they are
 brotli_quality = 5            # 0 to 11
 zstd_level = 3                # 1 to 19
 gzip_level = 6                # 1 to 9
+queue_limit = 64              # CPU budget: compression jobs at once; past it compression is skipped
 dictionary_max_bytes = 4194304  # largest response kept as a shared dictionary (Use-As-Dictionary)
 dictionary_max_ttl_secs = 2592000  # 30 days at most, however long it is fresh
 

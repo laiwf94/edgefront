@@ -23,6 +23,9 @@
 //! When no coding the cache can serve is acceptable, [`negotiate`] says so
 //! and the request should be answered with 406 or sent to the origin.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use http::header::{self, HeaderMap};
 
 /// The content codings the cache serves.
@@ -209,6 +212,192 @@ pub fn normalise(headers: &HeaderMap) -> Option<Coding> {
     negotiate(headers, &Coding::PREFERENCE)
 }
 
+/// The codings compression is counted under: the four served ones but
+/// identity, and RFC 9842's two dictionary codings.
+pub const COUNTED: [&str; 5] = ["br", "zstd", "gzip", "dcb", "dcz"];
+
+/// Upper bounds of the compression ratio buckets: compressed bytes over
+/// source bytes.
+pub const RATIO_BUCKETS: [f64; 9] = [0.02, 0.05, 0.1, 0.2, 0.3, 0.4, 0.6, 0.8, 1.0];
+
+#[derive(Debug, Default)]
+struct CodingStats {
+    jobs: AtomicU64,
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+    nanos: AtomicU64,
+    ratio: [AtomicU64; RATIO_BUCKETS.len() + 1],
+    ratio_sum_millis: AtomicU64,
+}
+
+/// What compression cost and saved, per coding, and what it skipped
+/// because the blocking pool was over its budget. The time is the time
+/// spent compressing on a blocking-pool thread, which compression keeps
+/// busy, so it stands for the CPU it used.
+#[derive(Debug, Default)]
+pub struct CompressionStats {
+    codings: [CodingStats; COUNTED.len()],
+    skipped: AtomicU64,
+}
+
+impl CompressionStats {
+    fn of(&self, coding: &str) -> Option<&CodingStats> {
+        COUNTED
+            .iter()
+            .position(|c| *c == coding)
+            .map(|i| &self.codings[i])
+    }
+
+    /// Records one compression of `bytes_in` into `bytes_out` in `took`.
+    pub fn record(&self, coding: &str, bytes_in: usize, bytes_out: usize, took: Duration) {
+        let Some(c) = self.of(coding) else { return };
+        c.jobs.fetch_add(1, Ordering::Relaxed);
+        c.bytes_in.fetch_add(bytes_in as u64, Ordering::Relaxed);
+        c.bytes_out.fetch_add(bytes_out as u64, Ordering::Relaxed);
+        let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        c.nanos.fetch_add(nanos, Ordering::Relaxed);
+        let ratio = bytes_out as f64 / bytes_in.max(1) as f64;
+        let i = RATIO_BUCKETS
+            .iter()
+            .position(|&b| ratio <= b)
+            .unwrap_or(RATIO_BUCKETS.len());
+        c.ratio[i].fetch_add(1, Ordering::Relaxed);
+        c.ratio_sum_millis
+            .fetch_add((ratio * 1000.0).round() as u64, Ordering::Relaxed);
+    }
+
+    /// Counts one compression not done because the pool was busy.
+    pub fn skip(&self) {
+        self.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Compressions skipped for the budget.
+    pub fn skipped(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
+    }
+
+    /// Source bytes compressed in `coding`, and the bytes that came out.
+    pub fn bytes(&self, coding: &str) -> (u64, u64) {
+        self.of(coding).map_or((0, 0), |c| {
+            (
+                c.bytes_in.load(Ordering::Relaxed),
+                c.bytes_out.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// Microseconds of compression per MiB of source in `coding`, `None`
+    /// before any.
+    pub fn micros_per_mib(&self, coding: &str) -> Option<f64> {
+        let c = self.of(coding)?;
+        let bytes = c.bytes_in.load(Ordering::Relaxed);
+        (bytes > 0).then(|| {
+            c.nanos.load(Ordering::Relaxed) as f64 / 1e3 / (bytes as f64 / (1 << 20) as f64)
+        })
+    }
+
+    /// Writes the compression families in the Prometheus text format under
+    /// `prefix` (`cachet` makes `cachet_compression_...`).
+    pub fn render(&self, out: &mut String, prefix: &str) {
+        use std::fmt::Write as _;
+        let fam = |out: &mut String, name: &str, help: &str, kind: &str| {
+            let _ = writeln!(
+                out,
+                "# HELP {prefix}_{name} {help}\n# TYPE {prefix}_{name} {kind}"
+            );
+        };
+        let per = |out: &mut String,
+                   name: &str,
+                   help: &str,
+                   kind: &str,
+                   value: &dyn Fn(&CodingStats) -> String| {
+            fam(out, name, help, kind);
+            for (coding, c) in COUNTED.iter().zip(&self.codings) {
+                let _ = writeln!(out, "{prefix}_{name}{{coding=\"{coding}\"}} {}", value(c));
+            }
+        };
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        per(
+            out,
+            "compression_jobs_total",
+            "Bodies compressed, by coding.",
+            "counter",
+            &|c| load(&c.jobs).to_string(),
+        );
+        per(
+            out,
+            "compression_input_bytes_total",
+            "Source bytes compressed, by coding.",
+            "counter",
+            &|c| load(&c.bytes_in).to_string(),
+        );
+        per(
+            out,
+            "compression_output_bytes_total",
+            "Compressed bytes produced, by coding.",
+            "counter",
+            &|c| load(&c.bytes_out).to_string(),
+        );
+        per(
+            out,
+            "compression_seconds_total",
+            "Time spent compressing on blocking-pool threads, by coding.",
+            "counter",
+            &|c| format!("{}", load(&c.nanos) as f64 / 1e9),
+        );
+        fam(
+            out,
+            "compression_cpu_microseconds_per_mib",
+            "Compression time per MiB of source, by coding, since start.",
+            "gauge",
+        );
+        for coding in COUNTED {
+            let v = self.micros_per_mib(coding).unwrap_or(0.0);
+            let _ = writeln!(
+                out,
+                "{prefix}_compression_cpu_microseconds_per_mib{{coding=\"{coding}\"}} {v:.1}"
+            );
+        }
+        fam(
+            out,
+            "compression_ratio",
+            "Compressed size over source size, by coding.",
+            "histogram",
+        );
+        for (coding, c) in COUNTED.iter().zip(&self.codings) {
+            let mut cumulative = 0;
+            for (i, bound) in RATIO_BUCKETS.iter().enumerate() {
+                cumulative += load(&c.ratio[i]);
+                let _ = writeln!(
+                    out,
+                    "{prefix}_compression_ratio_bucket{{coding=\"{coding}\",le=\"{bound}\"}} {cumulative}"
+                );
+            }
+            cumulative += load(&c.ratio[RATIO_BUCKETS.len()]);
+            let _ = writeln!(
+                out,
+                "{prefix}_compression_ratio_bucket{{coding=\"{coding}\",le=\"+Inf\"}} {cumulative}"
+            );
+            let _ = writeln!(
+                out,
+                "{prefix}_compression_ratio_sum{{coding=\"{coding}\"}} {}",
+                load(&c.ratio_sum_millis) as f64 / 1e3
+            );
+            let _ = writeln!(
+                out,
+                "{prefix}_compression_ratio_count{{coding=\"{coding}\"}} {cumulative}"
+            );
+        }
+        fam(
+            out,
+            "compression_skipped_total",
+            "Compressions skipped because the blocking pool was over its queue limit.",
+            "counter",
+        );
+        let _ = writeln!(out, "{prefix}_compression_skipped_total {}", self.skipped());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +495,40 @@ mod tests {
         assert_eq!(parse_q("1.001"), None);
         assert_eq!(Coding::Zstd.as_str(), "zstd");
         assert_eq!(Coding::Identity.as_str(), "identity");
+    }
+
+    #[test]
+    fn compression_stats_add_up_and_render() {
+        let stats = CompressionStats::default();
+        assert_eq!(stats.micros_per_mib("br"), None);
+        stats.record("br", 1 << 20, 100_000, Duration::from_millis(4));
+        stats.record("br", 1 << 20, 900_000, Duration::from_millis(2));
+        stats.record("identity", 10, 10, Duration::from_millis(1));
+        stats.skip();
+        assert_eq!(stats.bytes("br"), (2 << 20, 1_000_000));
+        assert_eq!(stats.bytes("identity"), (0, 0));
+        assert_eq!(stats.micros_per_mib("br"), Some(3000.0));
+        assert_eq!(stats.skipped(), 1);
+        let mut out = String::new();
+        stats.render(&mut out, "cachet");
+        for line in [
+            "# TYPE cachet_compression_input_bytes_total counter",
+            "cachet_compression_jobs_total{coding=\"br\"} 2",
+            "cachet_compression_input_bytes_total{coding=\"br\"} 2097152",
+            "cachet_compression_output_bytes_total{coding=\"br\"} 1000000",
+            "cachet_compression_seconds_total{coding=\"br\"} 0.006",
+            "cachet_compression_cpu_microseconds_per_mib{coding=\"br\"} 3000.0",
+            "cachet_compression_cpu_microseconds_per_mib{coding=\"dcz\"} 0.0",
+            // 0.095 and 0.858 of the source.
+            "cachet_compression_ratio_bucket{coding=\"br\",le=\"0.1\"} 1",
+            "cachet_compression_ratio_bucket{coding=\"br\",le=\"0.8\"} 1",
+            "cachet_compression_ratio_bucket{coding=\"br\",le=\"1\"} 2",
+            "cachet_compression_ratio_bucket{coding=\"br\",le=\"+Inf\"} 2",
+            "cachet_compression_ratio_count{coding=\"br\"} 2",
+            "cachet_compression_skipped_total 1",
+        ] {
+            assert!(out.lines().any(|l| l == line), "missing {line:?} in\n{out}");
+        }
+        assert!(!out.contains("identity"));
     }
 }

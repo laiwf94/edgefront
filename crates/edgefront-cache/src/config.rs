@@ -219,6 +219,9 @@ pub struct CompressionConfig {
     pub brotli_quality: u32,
     pub zstd_level: i32,
     pub gzip_level: u32,
+    /// Compression jobs queued or running at once; past it, compression
+    /// is skipped.
+    pub queue_limit: usize,
     /// The largest response kept as a shared dictionary (RFC 9842).
     pub dictionary_max_bytes: usize,
     /// The longest a dictionary is kept, however long it is fresh.
@@ -235,6 +238,7 @@ impl Default for CompressionConfig {
             brotli_quality: s.brotli_quality,
             zstd_level: s.zstd_level,
             gzip_level: s.gzip_level,
+            queue_limit: s.queue_limit,
             dictionary_max_bytes: d.max_dictionary_bytes,
             dictionary_max_ttl_secs: d.max_ttl.as_secs(),
         }
@@ -258,6 +262,7 @@ impl CompressionConfig {
             brotli_quality: self.brotli_quality,
             zstd_level: self.zstd_level,
             gzip_level: self.gzip_level,
+            queue_limit: self.queue_limit,
         }
     }
 }
@@ -708,6 +713,9 @@ impl Config {
             return Err(
                 "cache.compression.dictionary_max_ttl_secs must be between 1 and one year".into(),
             );
+        }
+        if !(1..=4096).contains(&z.queue_limit) {
+            return Err("cache.compression.queue_limit must be between 1 and 4096".into());
         }
         if z.min_bytes == 0 {
             return Err("cache.compression.min_bytes must be positive".into());

@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 use http::StatusCode;
@@ -29,7 +30,7 @@ use http::header::{self, HeaderMap, HeaderValue};
 use tokio::sync::Notify;
 
 use crate::cache_control::CacheControl;
-use crate::encoding::Coding;
+use crate::encoding::{Coding, CompressionStats};
 use crate::headers::field_list;
 use crate::object::{CachedObject, Key, SOURCE, VARIANT};
 use crate::slice::Layout;
@@ -50,6 +51,9 @@ pub struct CompressionSettings {
     pub zstd_level: i32,
     /// gzip level, 1 to 9.
     pub gzip_level: u32,
+    /// The CPU budget: compression jobs queued or running on the blocking
+    /// pool at once. Past it, compression is skipped and counted.
+    pub queue_limit: usize,
 }
 
 impl Default for CompressionSettings {
@@ -61,6 +65,7 @@ impl Default for CompressionSettings {
             brotli_quality: 5,
             zstd_level: 3,
             gzip_level: 6,
+            queue_limit: 64,
         }
     }
 }
@@ -191,25 +196,50 @@ pub fn derived_variant(source: &CachedObject, coding: Coding, body: Vec<u8>) -> 
 }
 
 /// Compresses `source` into every coding of [`CODINGS`] that makes it
-/// smaller. Blocking: run it on the blocking pool.
-pub fn derive(source: &CachedObject, settings: &CompressionSettings) -> Vec<Arc<CachedObject>> {
+/// smaller, recording each in `stats`. Blocking: run it on the blocking
+/// pool.
+pub fn derive(
+    source: &CachedObject,
+    settings: &CompressionSettings,
+    stats: &CompressionStats,
+) -> Vec<Arc<CachedObject>> {
     CODINGS
         .into_iter()
         .filter_map(|coding| {
+            let started = Instant::now();
             let body = compress(coding, &source.body, settings)?;
+            stats.record(
+                coding.as_str(),
+                source.body.len(),
+                body.len(),
+                started.elapsed(),
+            );
             (body.len() < source.body.len())
                 .then(|| Arc::new(derived_variant(source, coding, body)))
         })
         .collect()
 }
 
-/// Runs compression on fill on tokio's blocking pool, one job per stored
-/// source.
+/// Runs compression on tokio's blocking pool within a budget: at most
+/// [`CompressionSettings::queue_limit`] jobs queued or running, beyond
+/// which compression on fill and on the fly is skipped (and counted), so a
+/// burst of fills cannot queue unbounded CPU work.
 #[derive(Debug, Default)]
 pub struct Compressor {
     settings: CompressionSettings,
     in_flight: AtomicUsize,
     idle: Notify,
+    stats: CompressionStats,
+}
+
+/// A place in the compressor's budget, given back when dropped.
+#[derive(Debug)]
+pub struct Slot<'a>(&'a Compressor);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl Compressor {
@@ -218,6 +248,7 @@ impl Compressor {
             settings,
             in_flight: AtomicUsize::new(0),
             idle: Notify::new(),
+            stats: CompressionStats::default(),
         }
     }
 
@@ -225,15 +256,58 @@ impl Compressor {
         &self.settings
     }
 
+    pub fn stats(&self) -> &CompressionStats {
+        &self.stats
+    }
+
     /// Jobs queued or running.
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Acquire)
     }
 
+    /// Takes a place in the budget, or counts a skip when the queue is at
+    /// its limit.
+    fn admit(&self) -> bool {
+        let limit = self.settings.queue_limit.max(1);
+        let mut n = self.in_flight.load(Ordering::Acquire);
+        let admitted = loop {
+            if n >= limit {
+                break false;
+            }
+            match self.in_flight.compare_exchange_weak(
+                n,
+                n + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(now) => n = now,
+            }
+        };
+        if !admitted {
+            self.stats.skip();
+        }
+        admitted
+    }
+
+    fn release(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
+
+    /// A place for one on-the-fly compression the caller runs itself, or
+    /// `None` over the budget.
+    pub fn slot(&self) -> Option<Slot<'_>> {
+        // Lazily: a Slot made and dropped would give back a place never taken.
+        self.admit().then(|| Slot(self))
+    }
+
     /// Compresses the stored `source` of `key` on the blocking pool and
     /// adds the variants to its entry, unless a newer response replaced
     /// it meanwhile or a purge since `epoch` removed it. Does nothing for
-    /// a response that is not a compression source.
+    /// a response that is not a compression source, and skips it when the
+    /// queue is at its limit: the source is still served, uncompressed.
     pub fn submit(
         self: &Arc<Self>,
         cache: Arc<Cache>,
@@ -241,23 +315,23 @@ impl Compressor {
         source: Arc<CachedObject>,
         epoch: u64,
     ) {
-        if !compressible(&source, &self.settings) || !cfg!(feature = "compression") {
+        if !compressible(&source, &self.settings) || !cfg!(feature = "compression") || !self.admit()
+        {
             return;
         }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
         let this = self.clone();
         tokio::spawn(async move {
-            let settings = this.settings.clone();
+            let job = this.clone();
             let job_source = source.clone();
-            let derived = tokio::task::spawn_blocking(move || derive(&job_source, &settings)).await;
+            let derived =
+                tokio::task::spawn_blocking(move || derive(&job_source, &job.settings, &job.stats))
+                    .await;
             if let Ok(derived) = derived
                 && !derived.is_empty()
             {
                 cache.store_derived(key, &source, &derived, epoch);
             }
-            if this.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
-                this.idle.notify_waiters();
-            }
+            this.release();
         });
     }
 
@@ -447,7 +521,11 @@ mod tests {
             &[("content-type", "text/javascript"), ("etag", "\"v1\"")],
             body.clone(),
         );
-        let out = derive(&src, &CompressionSettings::default());
+        let out = derive(
+            &src,
+            &CompressionSettings::default(),
+            &CompressionStats::default(),
+        );
         let codings: Vec<_> = out.iter().map(|v| v.coding).collect();
         assert_eq!(
             codings,
@@ -477,7 +555,12 @@ mod tests {
             text(4096),
         );
         assert_eq!(
-            derive(&weak, &CompressionSettings::default())[0].headers[header::ETAG],
+            derive(
+                &weak,
+                &CompressionSettings::default(),
+                &CompressionStats::default()
+            )[0]
+            .headers[header::ETAG],
             "W/\"w\""
         );
     }
@@ -495,7 +578,14 @@ mod tests {
             })
             .collect();
         let src = source(&[("content-type", "text/plain")], noise);
-        assert!(derive(&src, &CompressionSettings::default()).is_empty());
+        assert!(
+            derive(
+                &src,
+                &CompressionSettings::default(),
+                &CompressionStats::default()
+            )
+            .is_empty()
+        );
         assert!(compress(Coding::Identity, b"x", &CompressionSettings::default()).is_none());
         // Decompression stops at the limit.
         let big = compress(Coding::Gzip, &text(10_000), &CompressionSettings::default()).unwrap();
@@ -507,5 +597,36 @@ mod tests {
         assert!(decompress(Coding::Br, b"not brotli", 100).is_err());
         assert!(decompress(Coding::Zstd, b"not zstd", 100).is_err());
         assert_eq!(decompress(Coding::Identity, b"abc", 3).unwrap(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn compression_over_the_queue_limit_is_skipped_and_counted() {
+        let c = Arc::new(Compressor::new(CompressionSettings {
+            queue_limit: 1,
+            ..CompressionSettings::default()
+        }));
+        let cache =
+            Arc::new(crate::store::Cache::new(&crate::store::CacheSettings::default()).unwrap());
+        let src = Arc::new(source(&[("content-type", "text/css")], text(8192)));
+        let key: Key = "a.example/x.css".into();
+        assert!(cache.store(key.clone(), src.clone(), &map(&[]), cache.epoch()));
+        // The one place is taken: the fill's compression is skipped.
+        let held = c.slot().unwrap();
+        assert!(c.slot().is_none());
+        c.submit(cache.clone(), key.clone(), src.clone(), cache.epoch());
+        assert_eq!((c.in_flight(), c.stats().skipped()), (1, 2));
+        drop(held);
+        assert_eq!(c.in_flight(), 0);
+        // Free again: compressed, with every coding counted.
+        c.submit(cache.clone(), key.clone(), src.clone(), cache.epoch());
+        c.settled().await;
+        assert_eq!(cache.memory().get(&key).unwrap().variants.len(), 4);
+        for coding in ["br", "zstd", "gzip"] {
+            let (bytes_in, bytes_out) = c.stats().bytes(coding);
+            assert_eq!(bytes_in, 8192, "{coding}");
+            assert!(bytes_out > 0 && bytes_out < 8192, "{coding}");
+            assert!(c.stats().micros_per_mib(coding).unwrap() > 0.0);
+        }
+        assert_eq!(c.stats().skipped(), 2);
     }
 }

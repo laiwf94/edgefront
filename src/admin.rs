@@ -67,6 +67,7 @@ impl Admin {
         if let Some(tier) = p.tier() {
             body.push_str(&crate::metrics::render_tier(tier));
         }
+        p.compressor().stats().render(&mut body, "cachet");
         let mut resp = Response::new(full(body));
         resp.headers_mut().insert(
             header::CONTENT_TYPE,

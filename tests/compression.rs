@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Harness, TestOrigin, handler, harness, reply};
@@ -552,4 +553,97 @@ async fn clients_that_cannot_take_hints_get_the_final_response_alone() {
         got.heads[0].2.as_secs_f64() * 1e3
     );
     node.shutdown().await;
+}
+
+#[tokio::test]
+async fn compression_cpu_per_mib_is_reported_on_the_metrics_page() {
+    let origin = bundle_origin().await;
+    let h = compressing(&origin);
+    h.get("/js/app.v1.js", &[]).await;
+    h.get("/js/app.v2.js", &[]).await;
+    settled(&h).await;
+    get_with(&h, "/js/app.v2.js", &with_dictionary(APP_V1, "dcb")).await;
+    get_with(&h, "/js/app.v2.js", &with_dictionary(APP_V1, "dcz")).await;
+    let stats = h.proxy.compressor().stats();
+    let mut page = String::new();
+    stats.render(&mut page, "cachet");
+    for coding in ["br", "zstd", "gzip", "dcb", "dcz"] {
+        let (bytes_in, bytes_out) = stats.bytes(coding);
+        let per_mib = stats.micros_per_mib(coding).unwrap();
+        assert!(bytes_in > 0 && bytes_out < bytes_in, "{coding}");
+        assert!(page.contains(&format!(
+            "cachet_compression_input_bytes_total{{coding=\"{coding}\"}} {bytes_in}"
+        )));
+        println!(
+            "{coding:>4}: {bytes_in:>7} bytes in, {bytes_out:>6} out ({:.1}%), {per_mib:>9.0} µs per MiB",
+            100.0 * bytes_out as f64 / bytes_in as f64
+        );
+    }
+    assert_eq!(stats.skipped(), 0);
+}
+
+#[tokio::test]
+async fn compression_over_the_budget_is_skipped_and_the_responses_still_served() {
+    // One job at a time, and a burst of 24 fills.
+    let body = bundle(1, 64 << 10);
+    let len = body.len();
+    let origin = js_origin(body).await;
+    let h = Arc::new(harness(&[origin.addr], |_, s| {
+        s.compress = true;
+        s.compression.queue_limit = 1;
+    }));
+    let mut tasks = Vec::new();
+    for i in 0..24 {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            h.get(&format!("/app.js?v={i}"), &[("accept-encoding", "br")])
+                .await
+        }));
+    }
+    for t in tasks {
+        let got = t.await.unwrap();
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body.len(), len);
+    }
+    settled(&h).await;
+    let stats = h.proxy.compressor().stats();
+    let compressed = (0..24)
+        .filter(|i| {
+            h.proxy
+                .cache
+                .memory()
+                .get(&format!("example.com/app.js?v={i}"))
+                .unwrap()
+                .variants
+                .len()
+                == 4
+        })
+        .count();
+    println!(
+        "24 fills with queue_limit 1: {compressed} compressed, {} skipped",
+        stats.skipped()
+    );
+    assert!(stats.skipped() > 0);
+    assert_eq!(compressed as u64 + stats.skipped(), 24);
+    // A skipped URL is served as stored, uncompressed, and correctly.
+    let skipped = (0..24)
+        .find(|i| {
+            h.proxy
+                .cache
+                .memory()
+                .get(&format!("example.com/app.js?v={i}"))
+                .unwrap()
+                .variants
+                .len()
+                == 1
+        })
+        .unwrap();
+    let got = h
+        .get(
+            &format!("/app.js?v={skipped}"),
+            &[("accept-encoding", "br")],
+        )
+        .await;
+    assert_eq!(got.header("content-encoding"), "");
+    assert_eq!(got.body.len(), len);
 }

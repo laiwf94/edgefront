@@ -861,7 +861,8 @@ impl Shared {
         Some(resp)
     }
 
-    /// Compresses `source` with `dict` on the blocking pool.
+    /// Compresses `source` with `dict` on the blocking pool, within the
+    /// compressor's budget: `None` over it, and the hit is served as usual.
     async fn dictionary_compress(
         &self,
         source: &Arc<CachedObject>,
@@ -870,15 +871,24 @@ impl Shared {
     ) -> Option<Bytes> {
         #[cfg(feature = "compression")]
         {
+            let _slot = self.compressor.slot()?;
             let (source, dict) = (source.clone(), dict.clone());
-            let settings = self.compressor.settings().clone();
+            let compressor = self.compressor.clone();
             tokio::task::spawn_blocking(move || {
-                crate::dictionary::compress(coding, &dict, &source.body, &settings)
+                let started = std::time::Instant::now();
+                let body =
+                    crate::dictionary::compress(coding, &dict, &source.body, compressor.settings())
+                        .ok()?;
+                compressor.stats().record(
+                    coding.as_str(),
+                    source.body.len(),
+                    body.len(),
+                    started.elapsed(),
+                );
+                Some(Bytes::from(body))
             })
             .await
             .ok()?
-            .ok()
-            .map(Bytes::from)
         }
         #[cfg(not(feature = "compression"))]
         {
