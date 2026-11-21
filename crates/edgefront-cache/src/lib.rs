@@ -24,3 +24,4 @@ pub mod respond;
 pub mod slice;
 pub mod store;
 pub mod tier;
+pub mod variants;

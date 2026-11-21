@@ -20,6 +20,9 @@ allow = [
     # untrusted (ISC), and subtle (BSD-3-Clause).
     "ISC",
     "BSD-3-Clause",
+    # zstd-sys bundles the zstd C library (BSD-3-Clause AND BSD-2-Clause),
+    # used by edgefront-cache's compression feature.
+    "BSD-2-Clause",
 ]
 
 # libfuzzer-sys bundles LLVM's libFuzzer, which is NCSA. Only the fuzz crates

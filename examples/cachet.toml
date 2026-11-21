@@ -21,6 +21,15 @@ shards = 16
 max_variants = 8              # stored variants per URL when the origin sends Vary
 heuristic_max_secs = 86400    # cap on freshness guessed from Last-Modified
 
+# Compressed variants: text-like responses stored as br, zstd and gzip too,
+# chosen by Accept-Encoding. Off by default.
+[cache.compression]
+enabled = false
+min_bytes = 256               # smaller bodies are stored as they are
+brotli_quality = 5            # 0 to 11
+zstd_level = 3                # 1 to 19
+gzip_level = 6                # 1 to 9
+
 # Not a default: the disk tier is off unless this section is present.
 # [cache.disk]
 # path = "/var/cache/cachet"

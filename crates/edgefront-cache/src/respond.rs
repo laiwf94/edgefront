@@ -17,7 +17,7 @@ use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Response, StatusCode};
 
 use crate::headers::{EntityTag, EtagMatch, date_header, parse_http_date};
-use crate::object::{CachedObject, SURROGATE_KEY};
+use crate::object::{CachedObject, SURROGATE_KEY, VARIANT};
 use crate::range::{self, ByteRange};
 
 pub use edgefront_core::body::{Body, BoxError, empty, full, text};
@@ -70,6 +70,7 @@ pub fn from_cache(
     }
     let mut headers = obj.headers.clone();
     headers.remove(SURROGATE_KEY);
+    headers.remove(VARIANT);
     headers.insert(header::AGE, age);
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(obj.body.len()));
     if obj.status == StatusCode::OK {
@@ -158,6 +159,7 @@ fn ranged(obj: &CachedObject, req: &HeaderMap, age: &HeaderValue) -> Option<Resp
     let len = obj.body.len() as u64;
     let mut headers = obj.headers.clone();
     headers.remove(SURROGATE_KEY);
+    headers.remove(VARIANT);
     headers.insert(header::AGE, age.clone());
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     let (status, body) = match range::parse(range.as_bytes(), len) {

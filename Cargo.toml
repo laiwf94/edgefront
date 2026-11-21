@@ -37,6 +37,13 @@ edgefront-proxy = { path = "crates/edgefront-proxy", version = "0.1.0" }
 # Runtime dependencies, pinned exactly. A crate that needs one names it with
 # `workspace = true` and adds features only where it needs more.
 bytes = "=1.12.1"
+# Compression of cached responses (W07), the reference implementations, behind
+# edgefront-cache's `compression` feature: brotli in pure Rust with its custom
+# dictionary support for RFC 9842's dcb, flate2 on the pure-Rust miniz_oxide
+# backend for gzip, and zstd on the C library for zstd and dcz.
+brotli = { version = "=8.0.2", default-features = false, features = ["std"] }
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+zstd = { version = "=0.14.4", default-features = false }
 # HTTP/2 itself, for what hyper does not expose: why a stream failed
 # (refused by GOAWAY or REFUSED_STREAM, so safe to send again) in the
 # upstream pool. hyper already depends on it.

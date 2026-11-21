@@ -68,6 +68,7 @@ use crate::purge::PurgeTarget;
 use crate::respond;
 use crate::slice::{self, Layout, Progress, SLICES, Slicer};
 use crate::store::Cache;
+use crate::variants::{self, CompressionSettings, Compressor};
 
 /// Wall-clock time, replaceable in tests.
 pub trait Clock: Send + Sync {
@@ -200,6 +201,8 @@ pub struct LayerSettings {
     /// without being stored, as a caching intermediary must (RFC 9110
     /// section 7.6.3). `None` leaves `Via` to the server.
     pub via: Option<HeaderValue>,
+    /// How routes with `compress` compress what they store.
+    pub compression: CompressionSettings,
 }
 
 impl Default for LayerSettings {
@@ -208,6 +211,7 @@ impl Default for LayerSettings {
             name: "edgefront".into(),
             body_timeout: Duration::from_secs(30),
             via: None,
+            compression: CompressionSettings::default(),
         }
     }
 }
@@ -238,6 +242,7 @@ struct Shared {
     via: Option<HeaderValue>,
     collapser: Arc<Collapser<Fetched>>,
     observer: Arc<dyn Observer>,
+    compressor: Arc<Compressor>,
 }
 
 /// What a leading fill got from upstream, as its followers see it.
@@ -305,8 +310,15 @@ impl CacheLayer {
                 via: settings.via,
                 collapser: Arc::default(),
                 observer,
+                compressor: Arc::new(Compressor::new(settings.compression)),
             }),
         })
+    }
+
+    /// The compressor of routes with `compress`, for its queue and to wait
+    /// for it in tests.
+    pub fn compressor(&self) -> &Arc<Compressor> {
+        &self.shared.compressor
     }
 
     pub fn cache(&self) -> &Arc<Cache> {
@@ -581,6 +593,25 @@ impl Shared {
             }
             _ => {}
         }
+        // Served while it is refreshed, compressed or not.
+        let swr = match usable {
+            Some((obj, Use::StaleWhileRevalidate)) => Some(obj.clone()),
+            _ => None,
+        };
+        // A compressed variant is not revalidated on its own: its source
+        // is, and is compressed again once it is stored.
+        if stored.as_ref().is_some_and(|obj| obj.derived) {
+            let mut identity = req.headers.clone();
+            identity.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+            stored = self
+                .cache
+                .lookup(&key, &identity)
+                .await
+                .filter(|obj| !obj.derived);
+        }
         let fwd = match &stored {
             None => "fwd=miss",
             Some(obj) if obj.freshness.is_fresh(now) => "fwd=request",
@@ -619,9 +650,9 @@ impl Shared {
                 manifest: slice_fetch.as_ref().map(|(obj, _)| obj.clone()),
             })
         };
-        if let Some((obj, Use::StaleWhileRevalidate)) = usable {
+        if let Some(obj) = swr {
             let resp = self.hit(
-                obj,
+                &obj,
                 method,
                 &client_headers,
                 "; detail=stale-while-revalidate",
@@ -704,13 +735,23 @@ impl Shared {
     }
 
     fn store(&self, key: &Key, obj: &Arc<CachedObject>, fill: &Fill) -> bool {
-        self.cache.store_limited(
+        let kept = self.cache.store_limited(
             key.clone(),
             obj.clone(),
             &fill.client_headers,
             fill.epoch,
             fill.policy.max_variants,
-        )
+        );
+        if kept && fill.policy.compress {
+            self.compress(key, obj, fill.epoch);
+        }
+        kept
+    }
+
+    /// Compresses a stored source into its variants in the background.
+    fn compress(&self, key: &Key, obj: &Arc<CachedObject>, epoch: u64) {
+        self.compressor
+            .submit(self.cache.clone(), key.clone(), obj.clone(), epoch);
     }
 
     /// Removes framing and stored-only fields from a response that passes
@@ -739,7 +780,7 @@ impl Follower<'_> {
     async fn answer(&self, fetched: Fetched) -> Option<Response<Body>> {
         let fetched = match fetched {
             Fetched::Streaming { head, fill } => {
-                if !needs_whole(self.client_headers) && head.matches(self.client_headers) {
+                if !needs_whole(self.client_headers) && head.selected_by(self.client_headers) {
                     let now = self.shared.clock.now();
                     let len = fill.expected().unwrap_or(0);
                     let mut resp = streamed(&head, &fill, len, now);
@@ -773,7 +814,7 @@ impl Follower<'_> {
                     .iter()
                     .filter(|n| **n != header::RANGE && **n != header::IF_RANGE)
                     .any(|n| self.client_headers.contains_key(n));
-                if others || !head.matches(self.client_headers) {
+                if others || !head.selected_by(self.client_headers) {
                     return None;
                 }
                 let now = self.shared.clock.now();
@@ -833,7 +874,7 @@ impl Follower<'_> {
                 obj,
                 stored,
                 revalidated,
-            } if obj.matches(self.client_headers) => {
+            } if obj.selected_by(self.client_headers) => {
                 let now = self.shared.clock.now();
                 let resp = respond::from_cache(&obj, &Method::GET, self.client_headers, now);
                 let (fwd_status, outcome) = if revalidated {
@@ -1161,6 +1202,7 @@ impl Fill {
         };
         // The body is complete now; framing headers describe the stored copy.
         parts.headers.remove(header::CONTENT_LENGTH);
+        self.vary_if_compressed(&mut parts, bytes.len() as u64);
         let freshness = self.freshness(parts.status, &parts.headers, &resp_cc);
         let obj = Arc::new(CachedObject::new(
             parts.status,
@@ -1174,6 +1216,17 @@ impl Fill {
 }
 
 impl Fill {
+    /// Adds `Vary: Accept-Encoding` to a response that will be stored with
+    /// compressed variants, before its selecting values are recorded.
+    fn vary_if_compressed(&self, parts: &mut http::response::Parts, len: u64) {
+        if self.policy.compress
+            && len >= self.shared.compressor.settings().min_bytes as u64
+            && variants::compressible_headers(parts.status, &parts.headers)
+        {
+            variants::vary_on_encoding(&mut parts.headers);
+        }
+    }
+
     /// Answers the client with the body as it arrives, hands the same
     /// growing body to every follower, and stores the object once it is
     /// complete. The origin failing partway, sending more or fewer bytes
@@ -1187,6 +1240,7 @@ impl Fill {
         resp_cc: &CacheControl,
     ) -> Upstream {
         parts.headers.remove(header::CONTENT_LENGTH);
+        self.vary_if_compressed(&mut parts, len);
         let freshness = self.freshness(parts.status, &parts.headers, resp_cc);
         let head = Arc::new(CachedObject::new(
             parts.status,
@@ -1216,7 +1270,8 @@ impl Fill {
         let shared = self.shared.clone();
         let key = self.key.clone();
         let client_headers = self.client_headers.clone();
-        let (epoch, max_variants) = (self.epoch, self.policy.max_variants);
+        let (epoch, max_variants, compress) =
+            (self.epoch, self.policy.max_variants, self.policy.compress);
         tokio::spawn(async move {
             let feed = async {
                 let mut body = body;
@@ -1245,12 +1300,15 @@ impl Fill {
                         head.vary().clone(),
                     ));
                     let kept = shared.cache.store_limited(
-                        key,
+                        key.clone(),
                         obj.clone(),
                         &client_headers,
                         epoch,
                         max_variants,
                     );
+                    if kept && compress {
+                        shared.compress(&key, &obj, epoch);
+                    }
                     fill.finish(kept.then_some(obj));
                 }
                 Ok(Err(why)) => fill.abort(why),

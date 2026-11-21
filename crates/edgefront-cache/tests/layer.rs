@@ -157,6 +157,7 @@ fn harness_with(cache_toml: &str, body_timeout: Duration) -> Harness {
             name: "edge".into(),
             body_timeout,
             via: Some(HeaderValue::from_static("1.1 edge")),
+            ..LayerSettings::default()
         },
         clock.clone(),
     );

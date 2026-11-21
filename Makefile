@@ -28,7 +28,7 @@ cov:
 # The supply-chain gate: cargo deny's policy on the workspace and on each fuzz
 # crate's own lockfile, RustSec on every lockfile, and the direct dependency
 # budget (exact pins, at most DIRECT_DEPS runtime crates).
-DIRECT_DEPS ?= 19
+DIRECT_DEPS ?= 22
 audit:
 	cargo deny check
 	for d in $(FUZZ_DIRS); do cargo deny --manifest-path $$d/Cargo.toml check || exit 1; done

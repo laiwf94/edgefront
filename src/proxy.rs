@@ -80,6 +80,10 @@ pub struct ProxySettings {
     /// Slice size for responses over the object limit; 0 to stream them
     /// through uncached.
     pub slice_bytes: u64,
+    /// Whether text-like responses are stored with gzip, brotli and zstd
+    /// variants, and how ([`edgefront_cache::variants`]).
+    pub compress: bool,
+    pub compression: edgefront_cache::variants::CompressionSettings,
 }
 
 impl Default for ProxySettings {
@@ -91,6 +95,8 @@ impl Default for ProxySettings {
             body_timeout: Duration::from_secs(30),
             heuristic_max: Duration::from_secs(86_400),
             slice_bytes: edgefront_cache::slice::DEFAULT_SLICE_BYTES,
+            compress: false,
+            compression: Default::default(),
         }
     }
 }
@@ -145,6 +151,7 @@ impl Proxy {
                 settings.slice_bytes,
                 cache.memory().max_object_bytes() as u64,
             ),
+            compress: settings.compress,
         };
         let layer = CacheLayer::with_observer(
             cache.clone(),
@@ -153,6 +160,7 @@ impl Proxy {
                 name: cache_name.clone(),
                 body_timeout: settings.body_timeout,
                 via: Some(via.clone()),
+                compression: settings.compression.clone(),
             },
             clock,
             metrics.clone(),
@@ -184,6 +192,11 @@ impl Proxy {
     /// refreshes included.
     pub fn in_flight(&self) -> usize {
         self.layer.in_flight()
+    }
+
+    /// The compressor making the gzip, brotli and zstd variants.
+    pub fn compressor(&self) -> &Arc<edgefront_cache::variants::Compressor> {
+        self.layer.compressor()
     }
 
     /// Answers one client request.

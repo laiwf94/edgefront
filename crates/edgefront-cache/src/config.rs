@@ -199,8 +199,48 @@ pub struct CacheConfig {
     /// through uncached.
     pub slice_bytes: u64,
     pub disk: Option<DiskConfig>,
+    /// Compressed variants of stored responses ([`crate::variants`]).
+    pub compression: CompressionConfig,
     /// The routes the cache serves, each with its overrides.
     pub routes: Vec<RouteCacheConfig>,
+}
+
+/// The `[cache.compression]` section: whether cached routes store gzip,
+/// brotli and zstd variants of text-like responses, and how hard each
+/// coding works. A route can opt out or in with its own `compress`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub min_bytes: usize,
+    pub brotli_quality: u32,
+    pub zstd_level: i32,
+    pub gzip_level: u32,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        let s = crate::variants::CompressionSettings::default();
+        CompressionConfig {
+            enabled: false,
+            min_bytes: s.min_bytes,
+            brotli_quality: s.brotli_quality,
+            zstd_level: s.zstd_level,
+            gzip_level: s.gzip_level,
+        }
+    }
+}
+
+impl CompressionConfig {
+    /// The settings the compressor runs with.
+    pub fn settings(&self) -> crate::variants::CompressionSettings {
+        crate::variants::CompressionSettings {
+            min_bytes: self.min_bytes,
+            brotli_quality: self.brotli_quality,
+            zstd_level: self.zstd_level,
+            gzip_level: self.gzip_level,
+        }
+    }
 }
 
 impl Default for CacheConfig {
@@ -214,6 +254,7 @@ impl Default for CacheConfig {
             max_ttl_secs: None,
             slice_bytes: crate::slice::DEFAULT_SLICE_BYTES,
             disk: None,
+            compression: CompressionConfig::default(),
             routes: Vec::new(),
         }
     }
@@ -245,6 +286,9 @@ pub struct RouteCacheConfig {
     pub max_ttl_secs: Option<u64>,
     #[serde(default)]
     pub slice_bytes: Option<u64>,
+    /// Overrides `cache.compression.enabled` for the route.
+    #[serde(default)]
+    pub compress: Option<bool>,
 }
 
 /// What the cache does on one route, with the global values filled in.
@@ -262,6 +306,8 @@ pub struct RoutePolicy {
     /// Slice size for responses over `max_object_bytes`; 0 streams them
     /// through uncached.
     pub slice_bytes: u64,
+    /// Whether text-like responses are stored with compressed variants.
+    pub compress: bool,
 }
 
 /// The effective cache policy of every proxy route, in the routes' order.
@@ -446,6 +492,7 @@ impl CacheConfig {
                 entry.slice_bytes.unwrap_or(self.slice_bytes),
                 entry.max_object_bytes.unwrap_or(self.max_object_bytes),
             ),
+            compress: entry.compress.unwrap_or(self.compression.enabled),
         }
     }
 }
@@ -621,6 +668,19 @@ impl Config {
         }
         if !(1..=64).contains(&c.max_variants) {
             return Err("cache.max_variants must be between 1 and 64".into());
+        }
+        let z = &c.compression;
+        if z.brotli_quality > 11 {
+            return Err("cache.compression.brotli_quality must be between 0 and 11".into());
+        }
+        if !(1..=19).contains(&z.zstd_level) {
+            return Err("cache.compression.zstd_level must be between 1 and 19".into());
+        }
+        if !(1..=9).contains(&z.gzip_level) {
+            return Err("cache.compression.gzip_level must be between 1 and 9".into());
+        }
+        if z.min_bytes == 0 {
+            return Err("cache.compression.min_bytes must be positive".into());
         }
         if let Some(d) = &c.disk
             && (d.max_bytes < c.max_object_bytes || d.queue == 0)
@@ -964,6 +1024,7 @@ mod tests {
                 heuristic_max: Duration::from_secs(600),
                 max_ttl: Some(Duration::from_secs(3600)),
                 slice_bytes: 512 << 10,
+                compress: false,
             })
         );
         // The heuristic cap never outlasts the route's own lifetime cap.
@@ -975,6 +1036,7 @@ mod tests {
                 heuristic_max: Duration::from_secs(60),
                 max_ttl: Some(Duration::from_secs(60)),
                 slice_bytes: 128 << 10,
+                compress: false,
             })
         );
         // Disabled, without an entry, and out of range all bypass.
@@ -1007,6 +1069,7 @@ mod tests {
                 heuristic_max: Duration::from_secs(86_400),
                 max_ttl: None,
                 slice_bytes: 1 << 20,
+                compress: false,
             })
         );
     }
@@ -1092,6 +1155,7 @@ mod tests {
                     heuristic_max_secs: None,
                     max_ttl_secs: None,
                     slice_bytes: None,
+                    compress: None,
                 })
                 .collect(),
             ..CacheConfig::default()

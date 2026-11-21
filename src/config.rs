@@ -71,6 +71,8 @@ impl Settings for Config {
             body_timeout: Duration::from_millis(self.timeouts.body_ms),
             heuristic_max: Duration::from_secs(self.cache.heuristic_max_secs),
             slice_bytes: self.cache.slice_bytes,
+            compress: self.cache.compression.enabled,
+            compression: self.cache.compression.settings(),
         }
     }
 }

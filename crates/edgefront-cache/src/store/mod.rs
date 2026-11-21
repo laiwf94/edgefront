@@ -199,6 +199,43 @@ impl Cache {
             self.memory.remove(&key);
             return false;
         }
+        self.write_behind(key, entry, epoch);
+        true
+    }
+
+    /// Adds variants compressed from `source` to `key`'s entry. Returns
+    /// false when they were not kept: the entry no longer holds `source`
+    /// (a newer response replaced it, or it was evicted), or a purge since
+    /// `epoch` named it.
+    pub fn store_derived(
+        &self,
+        key: Key,
+        source: &Arc<CachedObject>,
+        derived: &[Arc<CachedObject>],
+        epoch: u64,
+    ) -> bool {
+        let Some(existing) = self.memory.peek(&key) else {
+            return false;
+        };
+        let Some(entry) = existing.with_derived(source, derived) else {
+            return false;
+        };
+        let entry = Arc::new(entry);
+        let out = self.memory.insert(key.clone(), entry.clone());
+        self.count_evictions(out.evicted.len());
+        if !out.stored {
+            return false;
+        }
+        if self.log.purged_since(epoch, &key, &source.tags) {
+            self.memory.remove(&key);
+            return false;
+        }
+        self.write_behind(key, entry, epoch);
+        true
+    }
+
+    /// Queues `entry` for the disk tier, when there is one.
+    fn write_behind(&self, key: Key, entry: Arc<Entry>, epoch: u64) {
         if let Some(writer) = &self.writer {
             match writer.try_send(Job::Write { key, entry, epoch }) {
                 Ok(()) => {}
@@ -210,7 +247,6 @@ impl Cache {
                 }
             }
         }
-        true
     }
 
     /// Whether either tier holds `key`, without reading it.

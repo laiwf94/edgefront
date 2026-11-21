@@ -48,6 +48,19 @@ impl Coding {
         }
     }
 
+    /// The coding of a stored or upstream response, from its
+    /// Content-Encoding: identity when there is none, `None` when it is
+    /// one the cache does not negotiate (`deflate`, a dictionary coding,
+    /// or several codings applied in turn).
+    pub fn of_response(headers: &HeaderMap) -> Option<Coding> {
+        let mut codings = crate::headers::field_list(headers, &header::CONTENT_ENCODING);
+        match codings.len() {
+            0 => Some(Coding::Identity),
+            1 => Coding::from_token(&codings.remove(0)),
+            _ => None,
+        }
+    }
+
     fn from_token(token: &str) -> Option<Coding> {
         [
             ("identity", Coding::Identity),
@@ -181,6 +194,13 @@ pub fn negotiate(headers: &HeaderMap, available: &[Coding]) -> Option<Coding> {
         return Some(Coding::Identity);
     }
     accepted.best(available)
+}
+
+/// Whether a request accepts a response in `coding`: always when it has
+/// no Accept-Encoding, else when the field gives the coding a weight.
+pub fn acceptable(headers: &HeaderMap, coding: Coding) -> bool {
+    !headers.contains_key(header::ACCEPT_ENCODING)
+        || Accepted::from_headers(headers).weight(coding) > 0
 }
 
 /// The normalised Accept-Encoding a request is cached under: the coding it
