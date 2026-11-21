@@ -33,6 +33,8 @@ pub mod rate;
 pub mod record;
 #[cfg(feature = "http")]
 pub mod replay;
+#[cfg(feature = "service")]
+pub mod service;
 pub mod shadow;
 pub mod shape;
 pub mod siphash;

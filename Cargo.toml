@@ -52,6 +52,10 @@ hmac = "=0.13.0"
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 httpdate = "=1.0.3"
+# Protocol Buffers messages for the decision service's Envoy rate limit
+# service API (envoy.service.ratelimit.v3), with the code generated once from
+# the vendored .proto files in crates/edgefront-limiter/proto and checked in.
+prost = { version = "=0.14.6", default-features = false, features = ["std", "derive"] }
 # Async DNS for service discovery (A, AAAA and SRV with their TTLs).
 hickory-resolver = "=0.26.3"
 hyper = { version = "=1.12.0", features = ["http1", "http2", "server", "client"] }
@@ -76,6 +80,11 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 # DNS messages for the discovery tests' local DNS server; hickory-resolver
 # already depends on it.
 hickory-proto = "=0.26.3"
+# The decision service's code generator, run by a test rather than a build
+# script, so no build needs protoc: protox compiles the vendored .proto files
+# in Rust and prost-build writes the code the limiter checks in.
+prost-build = { version = "=0.14.6", default-features = false, features = ["format"] }
+protox = "=0.10.0"
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 # gRPC test services and clients for the proxy's gRPC tests, with a raw
 # bytes codec instead of prost and generated code.

@@ -132,6 +132,7 @@ Changes to edgefront, newest first. Each week's entries name the roadmap issue t
 
 ### Limiter
 
+- The decision service starts with the messages of Envoy's rate limit service API (`edgefront_limiter::service::proto`, `envoy.service.ratelimit.v3` with the descriptor, header and well-known types it uses). They are generated from `.proto` files vendored from Envoy v1.40.2 under `crates/edgefront-limiter/proto`, with only the validation and versioning annotations removed and `base.proto` cut to `HeaderValue`; `proto/README.md` records each upstream file's SHA-256. The code is checked in, so no build needs protoc or a build script: `tests/proto_codegen.rs` compiles the files with protox 0.10.0 and generates the code with prost-build 0.14.6, and fails if the result differs from what is checked in by a byte, and `make proto` writes it. Hand-written wire bytes of a request and a response decode to the expected messages, a request encodes to the same bytes, unknown fields from newer Envoys are skipped, and truncated or mistyped input is an error. prost becomes a direct dependency (budget 22 to 23), behind the limiter's new `service` feature, on by default. (#106)
 - `crates/edgefront/tests/proxy_limits.rs` adds three tests:
   - `edgefront proxy --check-config --limits` on every section of a limits file, each mistake named, and the same refusal when serving.
   - A proxy with rules, a connection quota, overload, listener caps and a recording: a rate change refused for a restart, a mode change applied in place, and the recording flushed at SIGTERM.

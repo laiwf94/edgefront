@@ -1,4 +1,4 @@
-.PHONY: check fmt lint test cov audit fuzz tsan tsan-crates difftest difftest-balancer difftest-resilience difftest-pacer difftest-cache e2e-steer
+.PHONY: check fmt lint test cov audit proto fuzz tsan tsan-crates difftest difftest-balancer difftest-resilience difftest-pacer difftest-cache e2e-steer
 
 # A crate with parsers keeps its cargo-fuzz targets in crates/<crate>/fuzz:
 # a crate outside the workspace, with its own Cargo.lock.
@@ -28,13 +28,20 @@ cov:
 # The supply-chain gate: cargo deny's policy on the workspace and on each fuzz
 # crate's own lockfile, RustSec on every lockfile, and the direct dependency
 # budget (exact pins, at most DIRECT_DEPS runtime crates).
-DIRECT_DEPS ?= 22
+DIRECT_DEPS ?= 23
 audit:
 	cargo deny check
 	for d in $(FUZZ_DIRS); do cargo deny --manifest-path $$d/Cargo.toml check || exit 1; done
 	cargo audit
 	for d in $(FUZZ_DIRS); do cargo audit --file $$d/Cargo.lock || exit 1; done
 	scripts/direct-deps.sh $(DIRECT_DEPS)
+
+# Writes the decision service's protobuf code (crates/edgefront-limiter/
+# src/service/proto) from the vendored files in crates/edgefront-limiter/
+# proto. The gate runs the same test without the variable and fails if the
+# checked-in code differs from what it generates.
+proto:
+	EDGEFRONT_REGENERATE_PROTO=1 cargo test -p edgefront-limiter --no-default-features --test proto_codegen
 
 # Runs every target of every fuzz crate for FUZZ_SECS seconds, with the
 # target's dictionary (crates/<crate>/fuzz/<target>.dict) when it has one.

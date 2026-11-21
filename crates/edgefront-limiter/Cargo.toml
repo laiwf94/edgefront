@@ -8,10 +8,13 @@ description = "Lock-free rate limiting primitives for edgefront, ported from lib
 publish = false
 
 [features]
-default = ["http"]
+default = ["http", "service"]
 # The HTTP limiter layer for the proxy pipeline (`http` module). Without it
 # the crate is the algorithms alone, depending only on serde.
 http = ["dep:edgefront-core", "dep:edgefront-proxy", "dep:http", "dep:tokio", "dep:tracing"]
+# The decision service (`service` module): the Envoy rate limit service API's
+# messages, generated from proto/ into src/service/proto/.
+service = ["dep:prost"]
 
 [dependencies]
 serde.workspace = true
@@ -20,6 +23,7 @@ edgefront-proxy = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [dev-dependencies]
 bytes.workspace = true
@@ -27,6 +31,8 @@ http-body-util.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
 criterion.workspace = true
+prost-build.workspace = true
+protox.workspace = true
 toml = { workspace = true, features = ["display"] }
 
 [[bench]]
