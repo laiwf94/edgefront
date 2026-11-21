@@ -29,6 +29,8 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 edgefront-difftest.workspace = true
 bytes.workspace = true
+# The discovery tests' local DNS server (edgefront-proxy's tests/common).
+hickory-proto.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

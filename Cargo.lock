@@ -377,6 +377,7 @@ dependencies = [
  "edgefront-difftest",
  "edgefront-limiter",
  "edgefront-proxy",
+ "hickory-proto",
  "http",
  "http-body-util",
  "hyper",

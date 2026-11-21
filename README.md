@@ -140,6 +140,42 @@ On this Mac (16-core arm64), the release build added a 45 to 57 µs p50 to a loo
 
 `crates/edgefront-bench/scenarios/h2_grpc.toml` benchmarks HTTP/2 GETs and unary gRPC calls through edgefront proxy, Envoy and HAProxy at 1,000 concurrent streams, HTTP/2 on both sides (`edgefront-bench run --scenario crates/edgefront-bench/scenarios/h2_grpc.toml --targets edgefront-proxy-h2,envoy-h2,haproxy-h2 --target-cpus 1`). The bench workflow's `h2-grpc` job runs it on every push to main and checks that every request was answered and about 1,000 streams were open at once. On a 4-core hosted runner, each proxy on one CPU, all three answered every request at a 201 ms p50 (the origin holds each 200 ms); edgefront peaked at 21.8 MiB RSS for GETs and 22.4 MiB for gRPC against Envoy's 33.2 and 35.7 MiB and HAProxy's 16.4 and 16.3 MiB, using 0.34 and 0.45 cores against Envoy's 0.45 and 0.52 and HAProxy's 0.20 and 0.24 ([docs/benchmarks/h2-grpc.md](docs/benchmarks/h2-grpc.md)).
 
+### Service discovery
+
+A cluster can take its endpoints from DNS, SRV records, a watched file, Kubernetes EndpointSlices or a delta feed instead of, or as well as, its `endpoints` list. The `discovery` block lists the sources in order; for an address several sources name, the first wins its weight, priority, zone and readiness.
+
+```json
+"discovery": {
+  "sources": [
+    {"dns": "api.internal:8080"},
+    {"srv": "_http._tcp.api.internal"},
+    {"file": "/etc/edgefront/api.json"},
+    {"kubernetes": {"namespace": "prod", "service": "api", "port": "http"}},
+    {"delta": {"url": "http://feed:9000/v1/clusters/api"}}
+  ],
+  "dns_servers": ["10.0.0.2:53"]
+}
+```
+
+- **DNS** looks up a name's A and AAAA records on a fixed port, again when the shortest TTL runs out (at most every 500 ms). A record that goes stops taking traffic within one TTL plus one second.
+- **SRV** records give each endpoint its port, and their priorities and weights map onto edgefront's: the lowest priority serves, the next waits as a backup, and weights split the load.
+- **A file** is JSON, `{"endpoints": [{"address": "10.0.0.1:8080", "weight": 2, "priority": 0, "zone": "a", "ready": true}]}`, with only `address` required. Edits in place and atomic renames are both seen, 50 ms after the file holds still.
+- **Kubernetes** lists and watches a Service's EndpointSlices, in a pod with its service account, or against `api_server` with `ca_file` and a token or client certificate. A failing readiness probe takes an endpoint out of the balancer without removing it.
+- **A delta feed** streams endpoint changes over HTTP/2 (`edgefront_proxy::discovery::delta`): a snapshot, then one line per change, resumed from a token after a break, so large fleets change without full reloads. Over https it needs `ca_file`, and can send a `token_file`.
+
+Only ready endpoints take traffic. With discovery, `endpoints` may be empty; when it is not, the listed endpoints are one more source after the discovered ones, and serve until the sources first answer. A cluster with no endpoint yet answers 503. A source that fails (a DNS timeout, a broken file, a feed that went away) keeps its last good endpoints serving, and shows in `/metrics`:
+
+| family | labels | what |
+|---|---|---|
+| `edgefront_discovery_endpoints` | cluster | endpoints discovered, ready or not |
+| `edgefront_discovery_updates_total` | cluster, source | successful answers |
+| `edgefront_discovery_failures_total` | cluster, source | failed reads |
+| `edgefront_discovery_stale` | cluster, source | 1 while a failed source's last good set is kept |
+| `edgefront_discovery_refused_total` | cluster | sets refused (over 200,000 endpoints, or more than the balancer takes) |
+| `edgefront_discovery_apply_duration_seconds` | cluster | from an update arriving to the cluster balancing on it |
+
+A change rebuilds only the cluster it touches. Health checks and outlier detection follow the new endpoints without restarting, and a reload that keeps a cluster's sources keeps its discovery running. `crates/edgefront/tests/e2e_discovery.rs` drives live traffic through the binary from DNS, SRV, a file and a delta feed while endpoints come, go, turn not ready and their sources fail, and every request is answered 200. `cargo bench -p edgefront-proxy --bench discovery` measures a delta feed of 100,000 endpoints taking 1,000 changes a second.
+
 ### Migrating from steer
 
 steer is fully ported, and `legacy/steer` is deleted. Its history stays reachable: `git log -- legacy/steer` lists every commit that touched it in this repository, and `git log c57a076^2` lists its own 23 commits from before the merge. `make steer-src` extracts it at its last commit. To move a steer deployment to `edgefront proxy`:
