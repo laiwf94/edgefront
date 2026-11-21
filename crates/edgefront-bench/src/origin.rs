@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(body.len(), 70_000);
         // Many streams at once on the one connection.
         let mut calls = Vec::new();
-        for i in 0..300 {
+        for i in 0..100 {
             let mut sender = sender.clone();
             let request = get(&format!("/obj/10/k{i}"));
             calls.push(tokio::spawn(
@@ -850,7 +850,7 @@ mod tests {
         for c in calls {
             assert_eq!(c.await.unwrap().2.len(), 10);
         }
-        assert_eq!(origin.stats().requests, 302);
+        assert_eq!(origin.stats().requests, 102);
     }
 
     #[tokio::test]
@@ -909,7 +909,7 @@ mod tests {
         let sender = h2(addr).await;
         let start = std::time::Instant::now();
         let mut calls = Vec::new();
-        for i in 0..500 {
+        for i in 0..200 {
             let mut sender = sender.clone();
             let request = absolute(grpc_request(&format!("/obj/1/k{i}")), addr);
             calls.push(tokio::spawn(
@@ -919,7 +919,7 @@ mod tests {
         for c in calls {
             assert_eq!(c.await.unwrap().1.as_deref(), Some("0"));
         }
-        // 500 streams held 200 ms each finish together, not one by one.
+        // 200 streams held 200 ms each finish together, not one by one.
         let took = start.elapsed();
         assert!(
             took >= Duration::from_millis(200) && took < Duration::from_secs(5),

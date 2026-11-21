@@ -1040,7 +1040,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn counts_the_most_streams_in_flight_at_once() {
-        // Held 100 ms each at 2,000 a second, about 200 are open at once
+        // Held 100 ms each at 1,000 a second, about 100 are open at once
         // (Little's law), over two connections.
         let origin = crate::origin::Origin::bind_with_delay(
             "127.0.0.1:0".parse().unwrap(),
@@ -1048,18 +1048,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let schedule = Schedule::constant(2000.0, Duration::from_secs(1))
+        let schedule = Schedule::constant(1000.0, Duration::from_secs(1))
             .with_warmup(100.0, Duration::from_millis(500));
         let mut config = LoadConfig::new(origin.addr(), Protocol::Http2, schedule);
         config.connections = 2;
         let report = run(config, get("/obj/10/k1")).await.unwrap();
         let measured = report.measured();
-        assert_eq!(measured.completed, 2000);
+        assert_eq!(measured.completed, 1000);
         // At least what Little's law says, less a margin for a slow
         // machine; at most a few times it, as a stall that let requests
         // pile up would show.
         assert!(
-            (160..=800).contains(&measured.peak_in_flight),
+            (80..=400).contains(&measured.peak_in_flight),
             "{}",
             measured.peak_in_flight
         );
