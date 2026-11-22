@@ -331,6 +331,11 @@ pub async fn serve(
         let Ok((tcp, _)) = accepted else {
             continue;
         };
+        // Each change is a small line written as it happens: with Nagle's
+        // algorithm on, a line waits for the client's delayed ACK of the
+        // one before (tens of milliseconds on Linux), which batched
+        // changes into bursts.
+        let _ = tcp.set_nodelay(true);
         let feed = Arc::clone(&feed);
         conns.spawn(async move {
             let service = hyper::service::service_fn(move |req: Request<Incoming>| {

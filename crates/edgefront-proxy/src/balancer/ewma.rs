@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use edgefront_core::chunked::Chunked;
 use edgefront_core::clock::Clock;
 
 use super::Policy;
@@ -131,7 +132,9 @@ fn decay_weight(elapsed_nanos: u64) -> f64 {
 
 /// Power of two choices over a fixed set of endpoints.
 pub struct LeastLoaded<E> {
-    endpoints: Arc<[E]>,
+    /// A [`Chunked`] list, which a balancer patched by discovery shares
+    /// with the one before it.
+    endpoints: Chunked<E>,
     rng: Arc<dyn Rng>,
     clock: Arc<dyn Clock>,
 }
@@ -139,7 +142,7 @@ pub struct LeastLoaded<E> {
 impl<E> LeastLoaded<E> {
     /// A policy over `endpoints`, drawing from `rng` and reading costs as
     /// of `clock`'s time.
-    pub fn new(endpoints: Arc<[E]>, rng: Arc<dyn Rng>, clock: Arc<dyn Clock>) -> LeastLoaded<E> {
+    pub fn new(endpoints: Chunked<E>, rng: Arc<dyn Rng>, clock: Arc<dyn Clock>) -> LeastLoaded<E> {
         LeastLoaded {
             endpoints,
             rng,
@@ -148,7 +151,7 @@ impl<E> LeastLoaded<E> {
     }
 
     /// The endpoints, indexed as picks are.
-    pub fn endpoints(&self) -> &[E] {
+    pub fn endpoints(&self) -> &Chunked<E> {
         &self.endpoints
     }
 }
@@ -238,7 +241,7 @@ mod tests {
     }
 
     fn policy(n: usize, clock: &Arc<ManualClock>, seed: u64) -> LeastLoaded<Load> {
-        let eps: Arc<[Load]> = (0..n).map(|_| Load::new(clock.start())).collect();
+        let eps: Chunked<Load> = (0..n).map(|_| Load::new(clock.start())).collect();
         LeastLoaded::new(eps, Arc::new(SplitMix64::new(seed)), clock.clone())
     }
 
@@ -287,7 +290,7 @@ mod tests {
     // TestLeastLoadedSkipAndSmallSets.
     #[test]
     fn skip_and_small_sets() {
-        let eps: Arc<[Load]> = (0..3).map(|_| Load::new(Instant::now())).collect();
+        let eps: Chunked<Load> = (0..3).map(|_| Load::new(Instant::now())).collect();
         let ll = LeastLoaded::new(
             eps,
             Arc::new(SplitMix64::from_entropy()),

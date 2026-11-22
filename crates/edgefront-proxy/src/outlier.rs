@@ -38,6 +38,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Instant;
 
+use edgefront_core::chunked::Chunked;
 use edgefront_core::clock::Clock;
 use edgefront_core::config::OutlierDetection;
 
@@ -59,7 +60,7 @@ pub struct Detector {
     cfg: OutlierDetection,
     /// Replaced whole by [`Detector::set_endpoints`] when discovery
     /// changes the cluster.
-    eps: RwLock<Arc<[Endpoint]>>,
+    eps: RwLock<Chunked<Endpoint>>,
     clock: Arc<dyn Clock>,
     on_eject: Option<EjectFn>,
     /// Serialises ejection decisions so the cap holds. It also keeps the
@@ -88,14 +89,15 @@ impl Detector {
     /// each ejection.
     pub fn new(
         cfg: OutlierDetection,
-        eps: Vec<Endpoint>,
+        eps: impl Into<Chunked<Endpoint>>,
         clock: Arc<dyn Clock>,
         on_eject: Option<EjectFn>,
     ) -> Detector {
+        let eps: Chunked<Endpoint> = eps.into();
         let samples = Mutex::new(Vec::with_capacity(eps.len()));
         Detector {
             cfg,
-            eps: RwLock::new(eps.into()),
+            eps: RwLock::new(eps),
             clock,
             on_eject,
             samples,
@@ -108,14 +110,19 @@ impl Detector {
     }
 
     /// The endpoints it watches.
-    pub fn endpoints(&self) -> Arc<[Endpoint]> {
-        Arc::clone(&self.eps.read().unwrap_or_else(PoisonError::into_inner))
+    pub fn endpoints(&self) -> Chunked<Endpoint> {
+        self.eps
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Watches `eps` from now on, as when discovery adds or removes
     /// endpoints. Endpoints that stay keep their state, which lives in
-    /// each [`Endpoint`]; the running interval carries on.
-    pub fn set_endpoints(&self, eps: impl Into<Arc<[Endpoint]>>) {
+    /// each [`Endpoint`]; the running interval carries on. A [`Chunked`]
+    /// list is taken as it is, so a cluster patched by discovery hands its
+    /// detector the same list in O(1).
+    pub fn set_endpoints(&self, eps: impl Into<Chunked<Endpoint>>) {
         let _decide = self.lock();
         *self.eps.write().unwrap_or_else(PoisonError::into_inner) = eps.into();
     }

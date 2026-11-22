@@ -23,10 +23,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use edgefront_core::chunked::Chunked;
 use edgefront_core::clock::Clock;
 use edgefront_core::config::HealthCheck;
 use edgefront_core::http1::{Client, ClientError, ClientLimits};
@@ -52,12 +53,29 @@ pub const MAX_BODY_READ: usize = 4 << 10;
 /// and, when it went down, the failure that tipped it.
 pub type ChangeFn = Box<dyn Fn(&Endpoint, bool, &str) + Send + Sync>;
 
+/// The most patches [`Checker::patch`] keeps for [`Checker::run`] before
+/// it has the whole list read again instead (or the list's length, when
+/// that is more).
+pub const MAX_PENDING: usize = 4096;
+
+/// The patches [`Checker::run`] has not seen yet.
+#[derive(Debug, Default)]
+struct Pending {
+    /// The whole list is to be read again: set by
+    /// [`Checker::set_endpoints`] and when the changes grew too many.
+    whole: bool,
+    changes: Vec<(bool, Endpoint)>,
+}
+
 /// Probes a set of endpoints.
 pub struct Checker {
     cfg: HealthCheck,
-    /// The endpoints to probe; [`Checker::set_endpoints`] replaces them
-    /// and [`Checker::run`] follows.
-    eps: watch::Sender<Arc<[Endpoint]>>,
+    /// The endpoints to probe; [`Checker::set_endpoints`] replaces them,
+    /// [`Checker::patch`] changes a few, and [`Checker::run`] follows.
+    eps: watch::Sender<Chunked<Endpoint>>,
+    /// The patches since [`Checker::run`] last looked, so it follows a
+    /// few endpoints coming and going without comparing whole lists.
+    pending: Mutex<Pending>,
     clock: Arc<dyn Clock>,
     client: Client<Empty<Bytes>>,
     random: Box<dyn Fn() -> f64 + Send + Sync>,
@@ -90,7 +108,7 @@ impl Checker {
     /// inside a tokio runtime, which the probe client needs.
     pub fn new(
         cfg: HealthCheck,
-        eps: Vec<Endpoint>,
+        eps: impl Into<Chunked<Endpoint>>,
         clock: Arc<dyn Clock>,
         on_change: Option<ChangeFn>,
     ) -> Checker {
@@ -99,6 +117,7 @@ impl Checker {
         Checker {
             cfg,
             eps: watch::Sender::new(eps.into()),
+            pending: Mutex::new(Pending::default()),
             clock,
             client,
             random: Box::new(move || unit(rng.next_u64())),
@@ -120,16 +139,47 @@ impl Checker {
     }
 
     /// The endpoints being probed.
-    pub fn endpoints(&self) -> Arc<[Endpoint]> {
-        Arc::clone(&self.eps.borrow())
+    pub fn endpoints(&self) -> Chunked<Endpoint> {
+        self.eps.borrow().clone()
     }
 
     /// Probes `eps` from now on, as when discovery adds or removes
     /// endpoints: [`Checker::run`] starts probing the new ones at once and
     /// stops the removed ones, while those that stay keep their schedule
     /// and their state.
-    pub fn set_endpoints(&self, eps: impl Into<Arc<[Endpoint]>>) {
+    pub fn set_endpoints(&self, eps: impl Into<Chunked<Endpoint>>) {
+        let mut pending = self.pending();
+        pending.whole = true;
+        pending.changes.clear();
         self.eps.send_replace(eps.into());
+    }
+
+    /// Probes `eps` from now on, where `eps` is the list probed so far
+    /// with `changes` made to it, in order: `(true, ep)` for an endpoint
+    /// added, `(false, ep)` for one removed. [`Checker::run`] then starts
+    /// and stops only those probe loops, at the cost of the changes rather
+    /// than of the whole list, which matters to a cluster of 100,000
+    /// endpoints that discovery changes 1,000 times a second.
+    pub fn patch(
+        &self,
+        eps: Chunked<Endpoint>,
+        changes: impl IntoIterator<Item = (bool, Endpoint)>,
+    ) {
+        let mut pending = self.pending();
+        if !pending.whole {
+            pending.changes.extend(changes);
+            // Unread for long (nothing runs the checker yet): the whole
+            // list is cheaper to read than the changes.
+            if pending.changes.len() > MAX_PENDING.max(eps.len()) {
+                pending.whole = true;
+                pending.changes.clear();
+            }
+        }
+        self.eps.send_replace(eps);
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The wait before an endpoint's next probe: the interval plus a fresh
@@ -152,26 +202,51 @@ impl Checker {
         let key = |ep: &Endpoint| Arc::as_ptr(&ep.state) as usize;
         let mut loops = JoinSet::new();
         tokio::pin!(shutdown);
-        loop {
-            let eps = Arc::clone(&set.borrow_and_update());
-            let wanted: HashSet<usize> = eps.iter().map(key).collect();
-            stops.retain(|k, stop| {
-                let keep = wanted.contains(k);
-                if !keep {
-                    stop.send_replace(true);
-                }
-                keep
-            });
-            for ep in eps.iter() {
-                if stops.contains_key(&key(ep)) {
-                    continue;
-                }
-                let (stop, stopped) = watch::channel(false);
-                stops.insert(key(ep), stop);
-                let checker = Arc::clone(&self);
-                let ep = ep.clone();
-                loops.spawn(async move { checker.probe_loop(&ep, stopped).await });
+        let start = |ep: &Endpoint,
+                     stops: &mut HashMap<usize, watch::Sender<bool>>,
+                     loops: &mut JoinSet<()>| {
+            if stops.contains_key(&key(ep)) {
+                return;
             }
+            let (stop, stopped) = watch::channel(false);
+            stops.insert(key(ep), stop);
+            let checker = Arc::clone(&self);
+            let ep = ep.clone();
+            loops.spawn(async move { checker.probe_loop(&ep, stopped).await });
+        };
+        // The first look reads the whole list.
+        let mut whole = true;
+        loop {
+            // The list and the changes that led to it are taken together:
+            // both are written under the same lock.
+            let (eps, changes) = {
+                let mut pending = self.pending();
+                whole |= std::mem::take(&mut pending.whole);
+                let eps = set.borrow_and_update().clone();
+                (eps, std::mem::take(&mut pending.changes))
+            };
+            if whole {
+                let wanted: HashSet<usize> = eps.iter().map(key).collect();
+                stops.retain(|k, stop| {
+                    let keep = wanted.contains(k);
+                    if !keep {
+                        stop.send_replace(true);
+                    }
+                    keep
+                });
+                for ep in eps.iter() {
+                    start(ep, &mut stops, &mut loops);
+                }
+            } else {
+                for (added, ep) in &changes {
+                    if *added {
+                        start(ep, &mut stops, &mut loops);
+                    } else if let Some(stop) = stops.remove(&key(ep)) {
+                        stop.send_replace(true);
+                    }
+                }
+            }
+            whole = false;
             while loops.try_join_next().is_some() {}
             tokio::select! {
                 () = &mut shutdown => break,

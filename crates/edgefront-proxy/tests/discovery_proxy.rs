@@ -1,8 +1,9 @@
 //! Discovery wired into the proxy: a watched file and listed endpoints
 //! feeding a cluster's balancer while requests flow, readiness, a failing
 //! source that keeps its last endpoints and says so in the metrics,
-//! health checks that follow discovered endpoints without restarting, and
-//! a reload that keeps discovery running.
+//! health checks that follow discovered endpoints without restarting, a
+//! reload that keeps discovery running, and a delta feed's churn patching
+//! the cluster in place under traffic for every policy.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use edgefront_core::config::Config;
 use edgefront_core::listener::{ServerLimits, serve};
+use edgefront_proxy::discovery::Endpoint as DiscEndpoint;
+use edgefront_proxy::discovery::delta::{Feed, serve as serve_feed};
 use edgefront_proxy::server::Proxy;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -320,4 +323,168 @@ async fn a_reload_with_the_same_sources_keeps_discovery_running() {
     let before = metric(&p.proxy, applies).unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(metric(&p.proxy, applies).unwrap(), before);
+}
+
+/// The ready endpoints of `feed` as the balancer should hold them.
+fn ready_set(feed: &Feed) -> Vec<(String, u32, u32)> {
+    let mut want: Vec<_> = feed
+        .endpoints()
+        .into_iter()
+        .filter(|e| e.ready)
+        .map(|e| (e.address, e.weight, u32::from(e.priority)))
+        .collect();
+    want.sort();
+    want
+}
+
+fn balanced(proxy: &Proxy) -> Vec<(String, u32, u32)> {
+    let mut got: Vec<_> = proxy
+        .endpoints("web")
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.address.to_string(), e.weight, e.priority))
+        .collect();
+    got.sort();
+    got
+}
+
+/// A delta feed's churn patches the cluster in place rather than
+/// rebuilding it: after hundreds of random upserts, removals, weight and
+/// priority changes and readiness flips, for each policy, the balancer
+/// holds exactly the feed's ready endpoints, the endpoints that stayed
+/// throughout keep the same state, the attempt series of removed
+/// endpoints are gone while those of every endpoint balanced over are
+/// there, and every request sent meanwhile is answered by an upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delta_feed_patches_the_cluster_in_place_under_traffic() {
+    let ups = [
+        upstream("a").await,
+        upstream("b").await,
+        upstream("c").await,
+    ];
+    for policy in ["round_robin", "least_loaded", "maglev"] {
+        let feed = Feed::new(1 << 16);
+        for u in &ups {
+            feed.upsert(DiscEndpoint::new(u.addr.clone()));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let feed_addr = listener.local_addr().unwrap();
+        let (stop_feed, feed_stopped) = oneshot::channel::<()>();
+        tokio::spawn(serve_feed(
+            listener,
+            Arc::clone(&feed),
+            Duration::from_millis(200),
+            async move {
+                let _ = feed_stopped.await;
+            },
+        ));
+        let hash = if policy == "maglev" {
+            r#""hash_header":"x-user","#
+        } else {
+            ""
+        };
+        let p = start(&format!(
+            r#"{{"listen":"127.0.0.1:0","routes":[{{"path_prefix":"/","cluster":"web"}}],
+                "clusters":[{{"name":"web","policy":"{policy}",{hash}
+                "discovery":{{"sources":[{{"delta":{{"url":"http://{feed_addr}/v1/web"}}}}]}}}}]}}"#
+        ))
+        .await;
+        // Least loaded keeps away from the slowest of three for a while,
+        // so wait for the set rather than for every name to answer.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while balanced(&p.proxy) != ready_set(&feed) {
+            assert!(
+                Instant::now() < deadline,
+                "{policy}: the first set never came"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let kept: Vec<_> = p.proxy.endpoints("web").unwrap();
+        // Traffic throughout: the upstreams stay ready at priority 0, so
+        // the churn, all at priority 1 and up, never takes a request.
+        let traffic = {
+            let addr = p.addr;
+            tokio::spawn(async move {
+                let mut statuses = Vec::new();
+                for _ in 0..150 {
+                    statuses.push(get(addr).await.0);
+                }
+                statuses
+            })
+        };
+        let rng = edgefront_proxy::balancer::rng::SplitMix64::new(42);
+        use edgefront_proxy::balancer::rng::Rng;
+        let fake = |i: usize| format!("10.77.{}.{}:80", i / 250, i % 250 + 1);
+        let mut next = 0;
+        let mut live: Vec<String> = Vec::new();
+        for round in 0..40 {
+            for _ in 0..1 + rng.below(30) {
+                match rng.below(5) {
+                    0 | 1 => {
+                        live.push(fake(next));
+                        next += 1;
+                        let e = DiscEndpoint {
+                            priority: 1 + rng.below(3) as u8,
+                            weight: 1 + rng.below(9) as u32,
+                            ..DiscEndpoint::new(live.last().unwrap().clone())
+                        };
+                        feed.upsert(e);
+                    }
+                    2 if !live.is_empty() => {
+                        let gone = live.swap_remove(rng.below(live.len()));
+                        feed.remove(&gone);
+                    }
+                    3 if !live.is_empty() => {
+                        let e = DiscEndpoint {
+                            priority: 1 + rng.below(3) as u8,
+                            weight: 1 + rng.below(9) as u32,
+                            ready: rng.below(3) != 0,
+                            ..DiscEndpoint::new(live[rng.below(live.len())].clone())
+                        };
+                        feed.upsert(e);
+                    }
+                    _ => {
+                        // The upstreams' weights move too.
+                        let e = DiscEndpoint {
+                            weight: 1 + rng.below(5) as u32,
+                            ..DiscEndpoint::new(ups[rng.below(3)].addr.clone())
+                        };
+                        feed.upsert(e);
+                    }
+                }
+            }
+            let want = ready_set(&feed);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while balanced(&p.proxy) != want {
+                assert!(
+                    Instant::now() < deadline,
+                    "{policy} round {round}: the balancer never matched the feed"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // The discovered set, ready or not, is the feed's.
+            let found = p.proxy.discovered_endpoints("web").unwrap();
+            assert_eq!(found, feed.endpoints(), "{policy} round {round}");
+        }
+        let statuses = traffic.await.unwrap();
+        assert!(statuses.iter().all(|&s| s == 200), "{policy}: {statuses:?}");
+        // The upstreams kept their state throughout.
+        let now = p.proxy.endpoints("web").unwrap();
+        for k in &kept {
+            let e = now.iter().find(|e| e.address == k.address).unwrap();
+            assert!(
+                Arc::ptr_eq(&e.state, &k.state),
+                "{policy}: {} lost its state",
+                k.address
+            );
+        }
+        // Attempt series for exactly the endpoints balanced over.
+        let text = p.proxy.metrics().registry().render();
+        for i in 0..next {
+            let series = format!(r#"endpoint="{}""#, fake(i));
+            let balanced = now.iter().any(|e| *e.address == fake(i));
+            assert_eq!(text.contains(&series), balanced, "{policy}: {}", fake(i));
+        }
+        let _ = stop_feed.send(());
+    }
 }

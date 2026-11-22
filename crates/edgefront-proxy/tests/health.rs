@@ -458,3 +458,105 @@ async fn run_with_no_endpoints() {
         .await
         .unwrap();
 }
+
+/// Waits until `s` has seen at least `n` probes.
+async fn until_probed(s: &Scripted, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.probes.load(Ordering::Relaxed) < n {
+        assert!(Instant::now() < deadline, "never probed {n} times");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Patches start and stop only the probe loops they name: an endpoint
+/// added is probed at once, one removed is no longer probed, and one that
+/// stays keeps its schedule rather than being probed again on each patch.
+#[tokio::test]
+async fn patches_start_and_stop_only_the_endpoints_they_name() {
+    let (a, b) = (Scripted::new(200), Scripted::new(200));
+    let (a_addr, _a) = start(Arc::clone(&a)).await;
+    let (b_addr, _b) = start(Arc::clone(&b)).await;
+    let mut hc = cfg();
+    hc.interval = Duration::from_secs(30);
+    hc.jitter = Duration::ZERO;
+    let ea = endpoint(&a_addr.to_string());
+    let eb = endpoint(&b_addr.to_string());
+    let c = Arc::new(Checker::new(
+        hc,
+        vec![ea.clone()],
+        MonotonicClock::shared(),
+        None,
+    ));
+    let (shutdown, stopped) = oneshot::channel::<()>();
+    let running = tokio::spawn(Arc::clone(&c).run(async move {
+        let _ = stopped.await;
+    }));
+    until_probed(&a, 1).await;
+    // b joins: probed at once.
+    let mut list = c.endpoints();
+    list.push(eb.clone());
+    c.patch(list.clone(), [(true, eb.clone())]);
+    assert_eq!(c.endpoints().len(), 2);
+    until_probed(&b, 1).await;
+    // b goes and comes back as a new endpoint (fresh state) 20 times; each
+    // return is probed at once, while a, which stays, is never probed
+    // again within its 30 s interval.
+    for round in 0..20 {
+        let gone = list.swap_remove(1);
+        c.patch(list.clone(), [(false, gone)]);
+        let back = endpoint(&b_addr.to_string());
+        list.push(back.clone());
+        c.patch(list.clone(), [(true, back)]);
+        until_probed(&b, round + 2).await;
+    }
+    assert_eq!(a.probes.load(Ordering::Relaxed), 1);
+    // Removed for good: b is probed no more.
+    let gone = list.swap_remove(1);
+    c.patch(list.clone(), [(false, gone)]);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seen = b.probes.load(Ordering::Relaxed);
+    assert_eq!(seen, 21);
+    assert_eq!(c.endpoints().len(), 1);
+    let _ = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Patches made before the checker runs, more than it keeps, are not lost:
+/// it reads the whole list when it starts.
+#[tokio::test]
+async fn patches_before_run_are_read_as_a_whole_list() {
+    let a = Scripted::new(200);
+    let (a_addr, _a) = start(Arc::clone(&a)).await;
+    let c = Arc::new(Checker::new(
+        cfg(),
+        Vec::new(),
+        MonotonicClock::shared(),
+        None,
+    ));
+    // Many changes that end with only a in the list.
+    let mut list = edgefront_core::chunked::Chunked::new();
+    for _ in 0..(edgefront_proxy::health::MAX_PENDING + 10) {
+        let ep = endpoint("127.0.0.1:9");
+        list.push(ep.clone());
+        c.patch(list.clone(), [(true, ep)]);
+        let ep = list.swap_remove(0);
+        c.patch(list.clone(), [(false, ep)]);
+    }
+    let ea = endpoint(&a_addr.to_string());
+    list.push(ea.clone());
+    c.patch(list, [(true, ea)]);
+    let (shutdown, stopped) = oneshot::channel::<()>();
+    let running = tokio::spawn(Arc::clone(&c).run(async move {
+        let _ = stopped.await;
+    }));
+    until_probed(&a, 1).await;
+    assert_eq!(c.endpoints().len(), 1);
+    let _ = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap();
+}

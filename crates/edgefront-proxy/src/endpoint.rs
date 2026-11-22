@@ -30,7 +30,7 @@ pub use crate::balancer::ewma::LATENCY_DECAY;
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     /// The upstream's `host:port`.
-    pub address: Box<str>,
+    pub address: Arc<str>,
     /// Its weight within its priority level.
     pub weight: u32,
     /// Its priority level; 0 is the most preferred.

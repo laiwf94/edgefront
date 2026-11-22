@@ -220,6 +220,11 @@ impl Merger {
         self.merged.values()
     }
 
+    /// The merged endpoint at `address`, if any source names it.
+    pub fn get(&self, address: &str) -> Option<&Endpoint> {
+        self.merged.get(address)
+    }
+
     /// The merged set's version.
     pub fn version(&self) -> u64 {
         self.version

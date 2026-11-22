@@ -55,6 +55,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use crate::chunked::Chunked;
+
 /// The `Content-Type` of a rendered exposition.
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
@@ -697,7 +699,10 @@ pub struct ClusterMetrics {
     retries: Arc<Counter>,
     budget_exhausted: Arc<Counter>,
     overflow: Arc<Counter>,
-    attempts: Vec<[Arc<Counter>; 5]>,
+    /// Each endpoint's attempt series, by its index in the cluster; a
+    /// [`Chunked`] list, so a discovery change patches it without copying
+    /// the series of every endpoint.
+    attempts: Chunked<[Arc<Counter>; 5]>,
 }
 
 impl ClusterMetrics {
@@ -753,9 +758,9 @@ impl ClusterMetrics {
 impl ClusterMetrics {
     /// The same cluster's series for a new list of endpoints, given each
     /// one's attempt series.
-    pub fn with_attempts(&self, attempts: Vec<[Arc<Counter>; 5]>) -> ClusterMetrics {
+    pub fn with_attempts(&self, attempts: impl Into<Chunked<[Arc<Counter>; 5]>>) -> ClusterMetrics {
         ClusterMetrics {
-            attempts,
+            attempts: attempts.into(),
             ..self.clone()
         }
     }
@@ -763,6 +768,13 @@ impl ClusterMetrics {
     /// The attempt series of the endpoint at `endpoint`.
     pub fn endpoint_attempts(&self, endpoint: usize) -> Option<&[Arc<Counter>; 5]> {
         self.attempts.get(endpoint)
+    }
+
+    /// Every endpoint's attempt series, by index, to patch as the cluster's
+    /// endpoints change and give back through
+    /// [`ClusterMetrics::with_attempts`].
+    pub fn attempt_series(&self) -> &Chunked<[Arc<Counter>; 5]> {
+        &self.attempts
     }
 }
 

@@ -518,7 +518,7 @@ pub fn execute_outlier(t: &OutlierTrace) -> (Answer, OutlierStats) {
     let eps: Vec<Endpoint> = (0..t.hosts)
         .map(|i| Endpoint::new(&host_address(i), 1, 0, epoch))
         .collect();
-    let index: BTreeMap<Box<str>, usize> = eps
+    let index: BTreeMap<Arc<str>, usize> = eps
         .iter()
         .enumerate()
         .map(|(i, e)| (e.address.clone(), i))

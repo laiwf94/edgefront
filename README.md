@@ -174,7 +174,7 @@ Only ready endpoints take traffic. With discovery, `endpoints` may be empty; whe
 | `edgefront_discovery_refused_total` | cluster | sets refused (over 200,000 endpoints, or more than the balancer takes) |
 | `edgefront_discovery_apply_duration_seconds` | cluster | from an update arriving to the cluster balancing on it |
 
-A change rebuilds only the cluster it touches. Health checks and outlier detection follow the new endpoints without restarting, and a reload that keeps a cluster's sources keeps its discovery running. `crates/edgefront/tests/e2e_discovery.rs` drives live traffic through the binary from DNS, SRV, a file and a delta feed while endpoints come, go, turn not ready and their sources fail, and every request is answered 200. `cargo bench -p edgefront-proxy --bench discovery` measures a delta feed of 100,000 endpoints taking 1,000 changes a second.
+A change patches only the cluster it touches, at the cost of the change rather than of the cluster: removed endpoints go out, added ones come in, and the balancer, health checks and metrics are updated by the same changes. Health checks and outlier detection follow the new endpoints without restarting, and a reload that keeps a cluster's sources keeps its discovery running. `crates/edgefront/tests/e2e_discovery.rs` drives live traffic through the binary from DNS, SRV, a file and a delta feed while endpoints come, go, turn not ready and their sources fail, and every request is answered 200. `cargo bench -p edgefront-proxy --bench discovery` measures a delta feed of 100,000 endpoints taking 1,000 changes a second: each change reaches the balancer with a p99 of 2.1 to 4.4 ms (docs/DESIGN.md, *Service discovery*).
 
 ### Migrating from steer
 

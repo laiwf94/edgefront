@@ -32,6 +32,19 @@ pub struct RoundRobin {
     state: Mutex<State>,
 }
 
+/// One change to the endpoints a [`RoundRobin`] covers, for
+/// [`RoundRobin::patched`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// The endpoint at this index goes, and the last one takes its index,
+    /// as in [`Vec::swap_remove`].
+    SwapRemove(usize),
+    /// The endpoint at this index takes this weight.
+    Reweight(usize, u32),
+    /// A new endpoint of this weight joins at the end.
+    Push(u32),
+}
+
 #[derive(Debug)]
 struct State {
     /// The running score of every endpoint. While replaying, the scores as
@@ -65,6 +78,52 @@ impl RoundRobin {
             weights: weights.iter().map(|&w| i64::from(w)).collect(),
             state: Mutex::new(State {
                 current: vec![0; weights.len()].into(),
+                set: Vec::new(),
+                total: 0,
+                start: Vec::new(),
+                picks: Vec::new(),
+                phase: Phase::Idle,
+            }),
+        }
+    }
+
+    /// The same round robin after `changes`, applied in order, as a
+    /// balancer is patched when discovery changes its endpoints. Every
+    /// endpoint that stays keeps its weight and its running score, so the
+    /// rotation carries on where it was instead of starting again from the
+    /// first endpoint; a new endpoint starts at zero, as a new peer does in
+    /// nginx. Costs one copy of the weights and scores (eight bytes each
+    /// per endpoint) plus the changes. `self` is left as it was, apart
+    /// from any replay being turned back into scores.
+    ///
+    /// # Panics
+    ///
+    /// If a change names an index past the endpoints as they are when it
+    /// applies.
+    pub fn patched(&self, changes: &[Change]) -> RoundRobin {
+        let mut current = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.materialize(&self.weights);
+            state.current.to_vec()
+        };
+        let mut weights = self.weights.to_vec();
+        for &change in changes {
+            match change {
+                Change::SwapRemove(i) => {
+                    weights.swap_remove(i);
+                    current.swap_remove(i);
+                }
+                Change::Reweight(i, w) => weights[i] = i64::from(w),
+                Change::Push(w) => {
+                    weights.push(i64::from(w));
+                    current.push(0);
+                }
+            }
+        }
+        RoundRobin {
+            weights: weights.into(),
+            state: Mutex::new(State {
+                current: current.into(),
                 set: Vec::new(),
                 total: 0,
                 start: Vec::new(),
@@ -225,6 +284,54 @@ mod tests {
 
     fn all(n: usize) -> Vec<usize> {
         (0..n).collect()
+    }
+
+    #[test]
+    fn patched_keeps_the_rotation_and_applies_changes() {
+        let rr = RoundRobin::new(&[1, 1, 1, 1]);
+        let picks = |rr: &RoundRobin, n: usize, k: usize| -> Vec<usize> {
+            (0..k)
+                .map(|_| rr.pick(&all(n), &[], None).unwrap())
+                .collect()
+        };
+        assert_eq!(picks(&rr, 4, 2), [0, 1]);
+        // Removing endpoint 3 (nobody moves) and adding a fifth endpoint
+        // carries the rotation on at 2, not back at 0.
+        let next = rr.patched(&[Change::SwapRemove(3), Change::Push(1)]);
+        assert_eq!(next.len(), 4);
+        assert_eq!(picks(&next, 4, 4), [2, 3, 0, 1]);
+        // The original is untouched by the patch.
+        assert_eq!(picks(&rr, 4, 2), [2, 3]);
+        // A swap removal moves the last endpoint, with its score, into the
+        // hole; a reweight changes the share from then on.
+        let next = next.patched(&[Change::SwapRemove(0), Change::Reweight(1, 3)]);
+        assert_eq!(next.len(), 3);
+        let mut counts = [0; 3];
+        for i in picks(&next, 3, 500) {
+            counts[i] += 1;
+        }
+        assert_eq!(counts, [100, 300, 100]);
+    }
+
+    #[test]
+    fn patched_turns_a_replay_back_into_scores() {
+        let rr = RoundRobin::new(&[2, 1]);
+        for _ in 0..7 {
+            rr.pick(&[0, 1], &[], None);
+        }
+        assert!(rr.replaying());
+        let reference = RoundRobin::new(&[2, 1]);
+        for _ in 0..7 {
+            reference.pick(&[0, 1], &[], None);
+        }
+        let next = rr.patched(&[]);
+        assert!(!next.replaying());
+        for _ in 0..12 {
+            assert_eq!(
+                next.pick(&[0, 1], &[], None),
+                reference.pick(&[0, 1], &[], None)
+            );
+        }
     }
 
     // TestSmoothRoundRobinSequence.

@@ -19,6 +19,8 @@
 //!   limits and graceful drain, which the proxy and the cache both serve
 //!   on, and the pooled HTTP/1.1 client;
 //! - [`body`]: the boxed response body handlers return;
+//! - [`chunked`]: a list that is cheap to copy and to patch by a few
+//!   items, which holds a cluster's endpoints;
 //! - [`metrics`]: atomic counters and histograms in the Prometheus text
 //!   format, and in [`telemetry::metrics`] steer's labelled registry and
 //!   its metric families, rendered as steer rendered them;
@@ -36,6 +38,7 @@
 pub mod acme;
 pub mod admin;
 pub mod body;
+pub mod chunked;
 pub mod clock;
 pub mod cluster;
 pub mod config;

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
+use edgefront_core::chunked::Chunked;
 use edgefront_core::clock::{Clock, ManualClock};
 use edgefront_proxy::balancer::Policy;
 use edgefront_proxy::balancer::ewma::{Cost, LeastLoaded, PeakEwma, cost};
@@ -125,17 +126,14 @@ fn rust_policies_make_steers_picks() {
                 let seed: u64 = f[1].parse().unwrap();
                 let n: usize = f[2].parse().unwrap();
                 let clock = Arc::new(ManualClock::new());
-                let eps: Arc<[Load]> = (0..n)
+                let eps: Chunked<Load> = (0..n)
                     .map(|_| Load {
                         latency: PeakEwma::new(clock.start()),
                         in_flight: AtomicI64::new(0),
                     })
                     .collect();
-                let ll = LeastLoaded::new(
-                    Arc::clone(&eps),
-                    Arc::new(SplitMix64::new(seed)),
-                    clock.clone(),
-                );
+                let ll =
+                    LeastLoaded::new(eps.clone(), Arc::new(SplitMix64::new(seed)), clock.clone());
                 for (at, line) in lines.by_ref() {
                     let f: Vec<&str> = line.split_whitespace().collect();
                     let num = |k: usize| -> u64 { f[k].parse().unwrap() };

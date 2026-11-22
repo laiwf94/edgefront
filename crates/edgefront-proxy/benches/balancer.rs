@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use edgefront_core::chunked::Chunked;
 use edgefront_core::clock::MonotonicClock;
 use edgefront_proxy::balancer::Policy;
 use edgefront_proxy::balancer::ewma::{Cost, LeastLoaded, PeakEwma, cost};
@@ -53,7 +54,7 @@ fn peak_ewma(c: &mut Criterion) {
     let mut g = c.benchmark_group("peak_ewma");
     for n in SIZES {
         let now = Instant::now();
-        let eps: Arc<[Load]> = (0..n)
+        let eps: Chunked<Load> = (0..n)
             .map(|i| {
                 let latency = PeakEwma::new(now);
                 latency.observe(Duration::from_micros(500 + 37 * i as u64), now);
