@@ -13,6 +13,8 @@ RUN mkdir -p src benches examples \
 COPY src ./src
 COPY benches ./benches
 COPY examples ./examples
+# examples/origin.rs serves the compression demo's two bundle releases.
+COPY tests/fixtures/compression ./tests/fixtures/compression
 RUN touch src/lib.rs src/main.rs examples/origin.rs \
     && cargo build --release --locked --bin cachet --example origin \
     && mkdir -p /cache
