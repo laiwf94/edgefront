@@ -703,6 +703,22 @@ The paper counts objects; cachet counts bytes. Each object is charged its body, 
 
 The store is split into 16 shards by key hash, each with its own lock and an equal slice of the budget. An object larger than the per-object limit or than a shard is refused. Removal leaves stale queue entries behind, which eviction skips; a shard compacts its queues when stale entries outnumber live ones.
 
+### Simulating eviction on traces
+
+`cache_sim` (`crates/edgefront-cache/src/bin/cache_sim.rs`, the library in `edgefront_cache::sim`) replays a request trace through eviction policies at several cache sizes. For each (policy, size) pair it reports requests, hits, hit ratio, bytes, bytes hit, byte hit ratio, and the misses it stored and their bytes, which is what a write-through disk tier would write. A request is a lookup, and a miss is stored, as the cache does after a fetch.
+
+A policy in the simulator is the eviction algorithm alone, over 64-bit object ids and byte sizes, with no entries, locks or headers. `sim::s3fifo` models one shard of the memory tier, with the same constants and the same rule for which queue gives up the next victim. A property test replays random skewed traces through it and through a one-shard `MemoryStore`, and requires the same hit or miss, bytes held and object count after every request. `sim::lru` is the usual baseline, held by a property test to a list-based reference. A trace leaves some things out: replacement in place, removal, purge and the 16-way sharding. An object larger than the cache is never stored.
+
+Traces are read as a stream, one record at a time through a 1 MiB buffer, so the length of a trace never changes memory use. Two formats are supported:
+- **oracleGeneral:** libCacheSim's binary format, in which the public CDN traces are published. Each record is 24 bytes: a u32 timestamp, a u64 id, a u32 size and an i64 next access.
+- **CSV:** the delimiter and the 1-based columns of the time, id and size are given on the command line. An id that is not a number is hashed with FNV-1a.
+
+Files ending `.zst` (with a window of up to 2^31 for `--long` traces) or `.gz` are decompressed as they are read. Cache sizes are bytes, or a share of the trace's footprint, which costs one more pass over the trace.
+
+The reading thread hands the trace in chunks of 65,536 requests to worker threads, each running a share of the simulations. So every simulation sees the same requests in order, and one pass over the trace serves them all. A test checks that the results match a sequential run on 1, 3 and 64 threads.
+
+Measured on a 4-core Linux container: 100 million generated requests (Zipf 0.9 over 50 million objects, 100 B to 200 KB) went through 2 policies at 5 sizes in 60 to 67 s, at 1.5 to 1.7 million requests a second for all ten together, with a peak RSS of 889 MiB.
+
 ## Large objects as slices
 
 A response over the route's `max_object_bytes` used to stream through uncached, so media and downloads never hit the cache. With `slice_bytes` set, it is cut into slices as it arrives (`slice.rs`). The default is 1 MiB, held to at most half of `max_object_bytes` so a slice with its headers is always storable, and slicing is off when that leaves less than 64 KiB. Each slice is stored as an object of its own under the URL's key plus its index. Once every slice is in, a manifest is stored under the URL itself: the response's status and headers, no body, and an internal `edgefront-slices: <slice size> <total>` field that never reaches a client. Each slice carries the object's surrogate keys plus one of its own (a hash of the URL key), so a purge by tag removes the slices with the object. `Cache::purge` adds that tag to every purge by URL.

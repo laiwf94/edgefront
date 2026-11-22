@@ -5,8 +5,9 @@
 //! stores, request collapsing, streaming fills that collapsed requests
 //! read while they arrive ([`fill`]), purge and its propagation between nodes,
 //! the cache's config file sections, and in [`layer`] the cache as a
-//! filter on proxy routes. The binary wires them to the runtime in
-//! edgefront-core.
+//! filter on proxy routes. [`sim`] replays request traces through eviction
+//! policies, as the `cache_sim` binary. The edgefront binary wires the rest
+//! to the runtime in edgefront-core.
 
 pub mod cache_control;
 pub mod cluster;
@@ -23,6 +24,7 @@ pub mod policy;
 pub mod purge;
 pub mod range;
 pub mod respond;
+pub mod sim;
 pub mod slice;
 pub mod store;
 pub mod tier;
