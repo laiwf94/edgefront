@@ -13,8 +13,9 @@ default = ["http", "service"]
 # the crate is the algorithms alone, depending only on serde.
 http = ["dep:edgefront-core", "dep:edgefront-proxy", "dep:http", "dep:tokio", "dep:tracing"]
 # The decision service (`service` module): the Envoy rate limit service API's
-# messages, generated from proto/ into src/service/proto/.
-service = ["dep:prost"]
+# messages, generated from proto/ into src/service/proto/, and its gRPC
+# service on tonic's framing.
+service = ["dep:http", "dep:prost", "dep:tonic"]
 
 [dependencies]
 serde.workspace = true
@@ -24,16 +25,23 @@ http = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
 bytes.workspace = true
 http-body-util.workspace = true
+hyper.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
 criterion.workspace = true
 prost-build.workspace = true
 protox.workspace = true
 toml = { workspace = true, features = ["display"] }
+tonic = { workspace = true, features = ["transport"] }
+
+[[test]]
+name = "rls"
+required-features = ["http", "service"]
 
 [[bench]]
 name = "decisions"

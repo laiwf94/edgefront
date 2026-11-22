@@ -56,6 +56,12 @@ httpdate = "=1.0.3"
 # service API (envoy.service.ratelimit.v3), with the code generated once from
 # the vendored .proto files in crates/edgefront-limiter/proto and checked in.
 prost = { version = "=0.14.6", default-features = false, features = ["std", "derive"] }
+# gRPC for the decision service's Envoy rate limit service API, with no
+# features: the limiter uses its request and response framing, status codes
+# and codec traits and serves them on edgefront's own listener, so tonic's
+# transport, router and codegen stay out of the binary. Tests that need a
+# gRPC client or server add `transport` themselves.
+tonic = { version = "=0.14.9", default-features = false }
 # Async DNS for service discovery (A, AAAA and SRV with their TTLs).
 hickory-resolver = "=0.26.3"
 hyper = { version = "=1.12.0", features = ["http1", "http2", "server", "client"] }
@@ -86,9 +92,6 @@ hickory-proto = "=0.26.3"
 prost-build = { version = "=0.14.6", default-features = false, features = ["format"] }
 protox = "=0.10.0"
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
-# gRPC test services and clients for the proxy's gRPC tests, with a raw
-# bytes codec instead of prost and generated code.
-tonic = { version = "=0.14.9", default-features = false, features = ["transport", "codegen"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

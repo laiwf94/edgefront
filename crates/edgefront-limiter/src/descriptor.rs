@@ -49,6 +49,7 @@
 //! descriptor composite key 'test-domain.key1_value1'`, so a config
 //! written for envoyproxy/ratelimit loads unchanged or fails the same way.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -118,6 +119,9 @@ pub struct RateLimit {
     pub name: Option<String>,
     /// `None` only when unlimited.
     pub unit: Option<Unit>,
+    /// Units per window: a window of `unit_multiplier` units, 1 for
+    /// every configured limit and more only for a request's override.
+    pub unit_multiplier: u32,
     pub requests_per_unit: u64,
     pub unlimited: bool,
     pub shadow_mode: bool,
@@ -398,6 +402,7 @@ fn load_level(tree: &mut Tree, list: &Node, parent: &str, file: &str) -> Result<
                 full_key: full_key.clone(),
                 name,
                 unit,
+                unit_multiplier: 1,
                 requests_per_unit,
                 unlimited,
                 shadow_mode: flag(entries, "shadow_mode"),
@@ -453,8 +458,8 @@ impl Counters {
     }
 
     /// Adds `hits` to `key`'s counter for the window ending at `expires`,
-    /// returning the new count.
-    fn add(&self, key: String, expires: u64, now: u64, hits: u64) -> u64 {
+    /// or takes them off it when `negative`, returning the new count.
+    fn add(&self, key: String, expires: u64, now: u64, hits: u64, negative: bool) -> u64 {
         use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
         let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(&key) as usize;
         let mut s = self.shards[h % self.shards.len()]
@@ -474,7 +479,11 @@ impl Counters {
         if e.0 != expires {
             *e = (expires, 0);
         }
-        e.1 = e.1.saturating_add(hits);
+        e.1 = if negative {
+            e.1.saturating_sub(hits)
+        } else {
+            e.1.saturating_add(hits)
+        };
         e.1
     }
 }
@@ -516,9 +525,40 @@ impl DescriptorLimiter {
         hits: u64,
         now_secs: u64,
     ) -> Response {
-        let found: Vec<_> = descriptors
+        let queries: Vec<Query<'_>> = descriptors
             .iter()
-            .map(|d| self.config.find(domain, d))
+            .map(|entries| Query {
+                entries,
+                hits,
+                negative: false,
+                limit_override: None,
+            })
+            .collect();
+        self.decide(domain, &queries, now_secs)
+    }
+
+    /// `ShouldRateLimit` with everything a descriptor of the v3 API can
+    /// carry: its own hits (0 only checks), hits given back instead of
+    /// taken, and a limit override from the caller.
+    ///
+    /// A descriptor with an override is limited by it alone, as the
+    /// service's `GetLimit` does: never in shadow mode, never replaced,
+    /// whatever the tree says, and counted on the same counter as the tree
+    /// limit for the same entries. Negative hits take from the counter,
+    /// never below zero.
+    pub fn decide(&self, domain: &str, queries: &[Query<'_>], now_secs: u64) -> Response {
+        let found: Vec<Option<Found<'_>>> = queries
+            .iter()
+            .map(|q| match q.limit_override {
+                Some(o) => Some((
+                    Cow::Owned(o.to_limit(domain, q.entries)),
+                    vec![None; q.entries.len()],
+                )),
+                None => self
+                    .config
+                    .find(domain, q.entries)
+                    .map(|(l, shared)| (Cow::Borrowed(l), shared)),
+            })
             .collect();
         let replaced: Vec<&str> = found
             .iter()
@@ -526,10 +566,11 @@ impl DescriptorLimiter {
             .flat_map(|(l, _)| l.replaces.iter().map(String::as_str))
             .collect();
         let mut over_limit = false;
-        let mut statuses = Vec::with_capacity(descriptors.len());
-        for (d, f) in descriptors.iter().zip(found) {
-            let Some((limit, shared)) =
-                f.filter(|(l, _)| l.name.as_deref().is_none_or(|n| !replaced.contains(&n)))
+        let mut statuses = Vec::with_capacity(queries.len());
+        for (q, f) in queries.iter().zip(&found) {
+            let Some((limit, shared)) = f
+                .as_ref()
+                .filter(|(l, _)| l.name.as_deref().is_none_or(|n| !replaced.contains(&n)))
             else {
                 statuses.push(DescriptorStatus {
                     over_limit: false,
@@ -542,17 +583,17 @@ impl DescriptorLimiter {
             let Some(unit) = limit.unit.filter(|_| !limit.unlimited) else {
                 statuses.push(DescriptorStatus {
                     over_limit: false,
-                    limit: Some(limit.clone()),
+                    limit: Some(limit.as_ref().clone()),
                     limit_remaining: u64::MAX,
                     reset_secs: 0,
                 });
                 continue;
             };
-            let len = unit.secs();
+            let len = unit.secs() * u64::from(limit.unit_multiplier.max(1));
             let start = now_secs - now_secs % len;
             let mut key = String::with_capacity(64);
             key.push_str(domain);
-            for ((k, v), share) in d.iter().zip(&shared) {
+            for ((k, v), share) in q.entries.iter().zip(shared) {
                 key.push('_');
                 key.push_str(k);
                 key.push('_');
@@ -560,14 +601,16 @@ impl DescriptorLimiter {
             }
             key.push('_');
             key.push_str(&start.to_string());
-            let count = self.counters.add(key, start + len, now_secs, hits);
+            let count = self
+                .counters
+                .add(key, start + len, now_secs, q.hits, q.negative);
             let over = count > limit.requests_per_unit;
             if over && !limit.shadow_mode {
                 over_limit = true;
             }
             statuses.push(DescriptorStatus {
                 over_limit: over && !limit.shadow_mode,
-                limit: Some(limit.clone()),
+                limit: Some(limit.as_ref().clone()),
                 limit_remaining: limit.requests_per_unit.saturating_sub(count),
                 reset_secs: start + len - now_secs,
             });
@@ -575,6 +618,60 @@ impl DescriptorLimiter {
         Response {
             over_limit,
             statuses,
+        }
+    }
+}
+
+/// A descriptor's limit, and per entry the shared wildcard pattern that
+/// keys its counter instead of the value, if any.
+type Found<'a> = (Cow<'a, RateLimit>, Vec<Option<&'a str>>);
+
+/// One descriptor of a request, for [`DescriptorLimiter::decide`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Query<'a> {
+    /// The descriptor's entries, key and value.
+    pub entries: &'a [(&'a str, &'a str)],
+    /// Hits to add; 0 checks without counting.
+    pub hits: u64,
+    /// Take `hits` off the counter instead, giving back budget.
+    pub negative: bool,
+    /// The caller's limit, used instead of the configured one.
+    pub limit_override: Option<LimitOverride>,
+}
+
+/// A limit a request brings for one of its descriptors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitOverride {
+    pub requests_per_unit: u64,
+    pub unit: Unit,
+    /// Units per window, 1 when the caller sets none.
+    pub unit_multiplier: u32,
+}
+
+impl LimitOverride {
+    /// The limit, named as the service names an override's stats:
+    /// `domain.key1_value1.key2`, an entry with no value by its key.
+    fn to_limit(self, domain: &str, entries: &[(&str, &str)]) -> RateLimit {
+        let mut full_key = domain.to_owned();
+        for (k, v) in entries {
+            full_key.push('.');
+            full_key.push_str(k);
+            if !v.is_empty() {
+                full_key.push('_');
+                full_key.push_str(v);
+            }
+        }
+        RateLimit {
+            full_key,
+            name: None,
+            unit: Some(self.unit),
+            unit_multiplier: self.unit_multiplier.max(1),
+            requests_per_unit: self.requests_per_unit,
+            unlimited: false,
+            shadow_mode: false,
+            replaces: Vec::new(),
+            detailed_metric: false,
+            share_threshold: false,
         }
     }
 }

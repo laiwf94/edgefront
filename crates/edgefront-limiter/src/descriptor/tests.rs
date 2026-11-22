@@ -354,3 +354,61 @@ fn counters_stay_within_their_bound() {
         .sum();
     assert!(held <= 64, "{held}");
 }
+
+#[test]
+fn decide_takes_per_descriptor_hits_and_overrides() {
+    let l = DescriptorLimiter::new(basic(), 1024);
+    let t = 1_700_006_400;
+    let key3: &[(&str, &str)] = &[("key3", "a")];
+    let q = |hits, negative| Query {
+        entries: key3,
+        hits,
+        negative,
+        limit_override: None,
+    };
+    // key3 is 1 an hour: check-only leaves it, a hit uses it, a negative
+    // hit gives it back.
+    assert_eq!(
+        l.decide("test-domain", &[q(0, false)], t).statuses[0].limit_remaining,
+        1
+    );
+    assert!(!l.decide("test-domain", &[q(1, false)], t).over_limit);
+    assert!(l.decide("test-domain", &[q(0, false)], t).statuses[0].limit_remaining == 0);
+    assert!(!l.decide("test-domain", &[q(1, true)], t).over_limit);
+    assert!(!l.decide("test-domain", &[q(1, false)], t).over_limit);
+    // An override names its limit by the entries, a key with no value by
+    // the key alone, and counts on the configured limit's counter.
+    let o = LimitOverride {
+        requests_per_unit: 3,
+        unit: Unit::Hour,
+        unit_multiplier: 2,
+    };
+    let r = l.decide(
+        "test-domain",
+        &[Query {
+            limit_override: Some(o),
+            ..q(1, false)
+        }],
+        t,
+    );
+    let limit = r.statuses[0].limit.as_ref().unwrap();
+    assert_eq!(limit.full_key, "test-domain.key3_a");
+    assert_eq!((limit.requests_per_unit, limit.unit_multiplier), (3, 2));
+    assert_eq!(r.statuses[0].reset_secs, 7200 - t % 7200);
+    let entries: &[(&str, &str)] = &[("ip", "1.2.3.4"), ("path", "")];
+    let r = l.decide(
+        "test-domain",
+        &[Query {
+            entries,
+            hits: 1,
+            negative: false,
+            limit_override: Some(o),
+        }],
+        t,
+    );
+    assert_eq!(
+        r.statuses[0].limit.as_ref().unwrap().full_key,
+        "test-domain.ip_1.2.3.4.path"
+    );
+    assert_eq!(r.statuses[0].limit_remaining, 2);
+}

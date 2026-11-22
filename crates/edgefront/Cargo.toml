@@ -37,7 +37,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
-tonic.workspace = true
+tonic = { workspace = true, features = ["transport"] }
 
 [lints]
 workspace = true

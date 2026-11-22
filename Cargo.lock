@@ -548,6 +548,7 @@ dependencies = [
  "edgefront-proxy",
  "http",
  "http-body-util",
+ "hyper",
  "proptest",
  "prost",
  "prost-build",
@@ -555,6 +556,7 @@ dependencies = [
  "serde",
  "tokio",
  "toml",
+ "tonic",
  "tracing",
 ]
 
