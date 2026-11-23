@@ -38,6 +38,12 @@ kubectl config view --raw --minify \
   -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "$dir/ca.crt"
 server=$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}')
 
+# The source's own list request, made with the token and CA alone.
+curl -fsS --cacert "$dir/ca.crt" -H "Authorization: Bearer $(cat "$dir/token")" \
+  -H "Accept: application/json" \
+  "$server/apis/discovery.k8s.io/v1/namespaces/$ns/endpointslices?labelSelector=kubernetes.io%2Fservice-name%3Dweb&limit=500" \
+  | jq -e '.kind == "EndpointSliceList"' >/dev/null
+
 echo "EDGEFRONT_KIND_API=$server"
 echo "EDGEFRONT_KIND_CA=$dir/ca.crt"
 echo "EDGEFRONT_KIND_TOKEN=$dir/token"

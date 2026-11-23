@@ -282,10 +282,7 @@ impl KubernetesSource {
             let body = read_capped(resp.into_body(), 4096)
                 .await
                 .unwrap_or_default();
-            let message = serde_json::from_slice::<Status>(&body)
-                .map(|s| s.message)
-                .unwrap_or_default();
-            return Err(format!("{status}: {message}"));
+            return Err(format!("{status}: {}", error_message(&body)));
         }
         Ok(resp)
     }
@@ -569,9 +566,41 @@ struct Status {
     message: String,
 }
 
+/// What an error response says: a Status's message, or else the start of
+/// the body as text, since a server in front of the API (or the API
+/// server's own HTTP layer, before it routes) answers in plain text.
+fn error_message(body: &[u8]) -> String {
+    let status = serde_json::from_slice::<Status>(body).ok();
+    if let Some(message) = status.map(|s| s.message).filter(|m| !m.is_empty()) {
+        return message;
+    }
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    match text.char_indices().nth(200) {
+        Some((at, _)) => format!("{}...", &text[..at]),
+        None => text.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_messages_come_from_a_status_or_the_body() {
+        let status = br#"{"kind":"Status","code":403,"message":"endpointslices is forbidden"}"#;
+        assert_eq!(error_message(status), "endpointslices is forbidden");
+        assert_eq!(
+            error_message(b"Client sent an HTTP request to an HTTPS server.\n"),
+            "Client sent an HTTP request to an HTTPS server."
+        );
+        assert_eq!(error_message(b""), "");
+        let long = "x".repeat(300);
+        assert_eq!(
+            error_message(long.as_bytes()),
+            format!("{}...", &long[..200])
+        );
+    }
 
     /// An EndpointSlice as the API server writes one for a Service whose
     /// pods are not up yet: `endpoints` and `ports` are `null`, not
