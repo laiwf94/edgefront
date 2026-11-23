@@ -528,7 +528,11 @@ async fn a_client_sending_into_a_stalled_upstream_blocks() {
     loop {
         match tokio::time::timeout(Duration::from_millis(100), c.write(&chunk)).await {
             Ok(Ok(n)) => sent += n as u64,
-            Ok(Err(e)) => panic!("{e} after {sent} bytes in {:?}", t0.elapsed()),
+            Ok(Err(e)) => {
+                let at = t0.elapsed();
+                let out = tokio::time::timeout(Duration::from_secs(5), p.next()).await;
+                panic!("{e} after {sent} bytes in {at:?}; the relay ended {out:?}");
+            }
             Err(_) => break,
         }
     }
