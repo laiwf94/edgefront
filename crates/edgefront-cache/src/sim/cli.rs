@@ -20,7 +20,7 @@ cache size, and prints hit ratio, byte hit ratio and writes per pair.
                         unit (KiB, MiB, GiB, TiB, KB, MB, GB, TB), or a share
                         of the trace's footprint (0.1%, 10%), which reads the
                         trace once more first; required
-  -p, --policies LIST   policies to run (default: all of s3fifo, lru)
+  -p, --policies LIST   policies to run (default: all of s3fifo, lru, sieve)
       --format F        oracleGeneral or csv (default: csv when the name
                         contains .csv, else oracleGeneral)
       --columns SPEC    CSV columns, 1-based (default time=1,id=2,size=3;
@@ -620,7 +620,7 @@ mod tests {
             (&["t", "-s", "1", "--bogus"], "unknown option `--bogus`"),
             (
                 &["t", "-s", "1", "-p", "clock"],
-                "unknown policy `clock` (known: s3fifo, lru)",
+                "unknown policy `clock` (known: s3fifo, lru, sieve)",
             ),
             (&["t", "-s", "1", "-p", ","], "no policies given"),
             (
@@ -715,9 +715,9 @@ mod tests {
         let footprint_bytes = v["footprint"]["bytes"].as_u64().unwrap();
         assert_eq!(v["footprint"]["objects"], 2_520);
         let results = v["results"].as_array().unwrap();
-        assert_eq!(results.len(), 6);
+        assert_eq!(results.len(), 9);
         for (r, (policy, size)) in results.iter().zip(
-            ["s3fifo", "lru"]
+            ["s3fifo", "lru", "sieve"]
                 .iter()
                 .flat_map(|p| ["64KiB", "1%", "50%"].map(|s| (*p, s))),
         ) {
@@ -742,7 +742,7 @@ mod tests {
         assert!(results[2]["hit_ratio"].as_f64().unwrap() > 0.45);
         let bigger =
             |a: usize, b: usize| results[a]["hits"].as_u64() <= results[b]["hits"].as_u64();
-        assert!(bigger(1, 2) && bigger(4, 5));
+        assert!(bigger(1, 2) && bigger(4, 5) && bigger(7, 8));
 
         let (code, out, _) = run_str(&args(&["-s", "1MiB", p, "--output", "csv", "-p", "lru"]));
         assert_eq!(code, ExitCode::SUCCESS);
@@ -765,7 +765,7 @@ mod tests {
         ]));
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(
-            out.contains(": 1000 requests replayed through 4 simulations in "),
+            out.contains(": 1000 requests replayed through 6 simulations in "),
             "{out}"
         );
         assert!(
@@ -777,7 +777,7 @@ mod tests {
             table[0],
             "policy  size    cache  hit ratio  byte hit ratio  writes  written"
         );
-        assert_eq!(table.len(), 5);
+        assert_eq!(table.len(), 7);
         assert!(
             table[1].starts_with("s3fifo  1MiB  1.0 MiB "),
             "{}",

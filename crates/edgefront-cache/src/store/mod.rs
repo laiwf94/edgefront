@@ -12,6 +12,7 @@
 //! restart.
 
 pub mod codec;
+pub mod evict;
 pub mod index;
 pub mod memory;
 pub mod segment;

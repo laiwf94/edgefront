@@ -5,7 +5,8 @@
 //! byte sizes, with no entries, locks or headers, so a 100-million-request
 //! trace replays in minutes. [`s3fifo`] is a model of the memory tier's
 //! S3-FIFO (`store/memory.rs`) that makes the same decisions as one of its
-//! shards, which a test holds it to; [`lru`] is the usual baseline.
+//! shards, which a test holds it to; [`lru`] is the usual baseline; `sieve`
+//! is the store's own SIEVE ([`crate::store::evict::sieve`]) over ids.
 //!
 //! [`trace`] reads traces as a stream, one record at a time: libCacheSim's
 //! binary oracleGeneral format and CSV with configurable columns, either one
@@ -27,6 +28,8 @@ use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+
+use crate::store::evict::sieve::{Inserted, Sieve};
 
 /// One request of a trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,14 +63,44 @@ pub trait Policy: Send {
 }
 
 /// The policies the simulator knows, by name.
-pub const POLICIES: &[&str] = &[s3fifo::NAME, lru::NAME];
+pub const POLICIES: &[&str] = &[s3fifo::NAME, lru::NAME, SIEVE];
+
+/// SIEVE's name: the store's implementation, simulated as it is.
+pub const SIEVE: &str = "sieve";
 
 /// Builds the policy called `name` with a budget of `capacity` bytes.
 pub fn policy(name: &str, capacity: u64) -> Option<Box<dyn Policy>> {
     match name {
         s3fifo::NAME => Some(Box::new(s3fifo::S3Fifo::new(capacity))),
         lru::NAME => Some(Box::new(lru::Lru::new(capacity))),
+        SIEVE => Some(Box::new(Sieve::<u64, IdHasher>::with_hasher(
+            capacity,
+            IdHasher::default(),
+        ))),
         _ => None,
+    }
+}
+
+impl Policy for Sieve<u64, IdHasher> {
+    fn name(&self) -> &'static str {
+        SIEVE
+    }
+
+    fn get(&mut self, id: u64) -> bool {
+        Sieve::get(self, &id)
+    }
+
+    fn insert(&mut self, id: u64, size: u64) -> bool {
+        // A trace's miss is never for a held id, so this stores or refuses.
+        Sieve::insert(self, id, size, |_, _| ()) == Inserted::Stored
+    }
+
+    fn bytes(&self) -> u64 {
+        Sieve::bytes(self)
+    }
+
+    fn len(&self) -> usize {
+        Sieve::len(self)
     }
 }
 
@@ -300,6 +333,20 @@ mod tests {
             assert_eq!(p.bytes(), 0);
         }
         assert!(policy("clock-pro", 1_000).is_none());
+    }
+
+    #[test]
+    fn sieve_is_the_stores_own() {
+        let mut p = policy(SIEVE, 10).unwrap();
+        assert!(!p.get(1));
+        assert!(p.insert(1, 4));
+        assert!(!p.insert(2, 11), "larger than the cache");
+        assert!(p.insert(2, 6));
+        assert!(p.get(1));
+        // 1 was read, so the hand spares it and takes 2.
+        assert!(p.insert(3, 6));
+        assert!(p.get(1) && !p.get(2) && p.get(3));
+        assert_eq!((p.bytes(), p.len()), (10, 2));
     }
 
     #[test]
