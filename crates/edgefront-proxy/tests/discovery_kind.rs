@@ -32,9 +32,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use edgefront_core::config::Config;
+use edgefront_proxy::discovery::k8s::{ApiAccess, KubernetesSource};
+use edgefront_proxy::discovery::{Source, UpdateKind};
 use edgefront_proxy::server::Proxy;
 use serde_json::Value;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// The bound every change must meet.
 const BOUND: Duration = Duration::from_secs(2);
@@ -208,6 +210,28 @@ fn balancer_set(proxy: &Proxy) -> Set {
         .collect()
 }
 
+/// The Kubernetes source on its own, through the restricted account: its
+/// first answer must be a set, so a refused token, a certificate the CA
+/// does not sign or a missing permission fails here with its error rather
+/// than as a balancer that never fills.
+async fn source_answers(env: &Env, service: &str) {
+    let mut api = ApiAccess::new(&env.api);
+    api.ca_file = Some(env.ca.clone().into());
+    api.token_file = Some(env.token.clone().into());
+    let source = KubernetesSource::new(&env.namespace, service, Some("http")).api(api);
+    let (tx, mut rx) = mpsc::channel(8);
+    let task = tokio::spawn(Box::new(source).run(tx));
+    let first = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        .await
+        .expect("the source answers within 30 s")
+        .expect("the source is running");
+    task.abort();
+    match first {
+        UpdateKind::Set(_) => {}
+        other => panic!("the source's first answer was {other:?}, not a set"),
+    }
+}
+
 fn start(env: &Env, service: &str) -> Running {
     let config = format!(
         r#"{{"listen":"127.0.0.1:0","routes":[{{"path_prefix":"/","cluster":"web"}}],
@@ -278,11 +302,10 @@ async fn first_after(
         if let Some(found) = found {
             return found;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: no set to match within {limit:?}; last {:?}",
-            log.lock().unwrap().last().map(|(_, s)| s.clone())
-        );
+        if Instant::now() >= deadline {
+            let last = log.lock().unwrap().last().map(|(_, s)| s.clone());
+            panic!("{what}: no set to match within {limit:?}; last {last:?}");
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
@@ -300,7 +323,32 @@ async fn step(
     action.await;
     let (seen, set) = first_after(&observer.log, begun, SETTLE, what, &done).await;
     let want = set.clone();
-    let (held, _) = first_after(&p.balanced, begun, SETTLE, what, |s| *s == want).await;
+    // Past the bound, the metrics say whether the source is failing.
+    let held = loop {
+        let found = p
+            .balanced
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(at, s)| *at >= begun && *s == want)
+            .map(|(at, _)| *at);
+        if let Some(at) = found {
+            break at;
+        }
+        if seen.elapsed() > BOUND * 5 {
+            let text = p.proxy.metrics().registry().render();
+            let discovery: Vec<&str> = text
+                .lines()
+                .filter(|l| l.starts_with("edgefront_discovery") && !l.contains("_bucket"))
+                .collect();
+            panic!(
+                "{what}: the balancer never held {want:?}, {:?} after the API server published it; {}",
+                seen.elapsed(),
+                discovery.join("; ")
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
     let to_balancer_ms = if held >= seen {
         held.duration_since(seen).as_secs_f64() * 1e3
     } else {
@@ -396,6 +444,7 @@ async fn slices_written_through_the_api_reach_the_balancer_within_2s() {
     let env = env();
     let ns = env.namespace.as_str();
     let svc = "slices";
+    source_answers(&env, svc).await;
     let observer = Observer::start(ns, svc);
     let p = start(&env, svc);
     let mut steps = Vec::new();
@@ -634,6 +683,7 @@ fn exec(ns: &str, pod: &str, command: &str) -> impl std::future::Future<Output =
 async fn a_deployment_scaled_and_flipped_reaches_the_balancer_within_2s() {
     let env = env();
     let ns = env.namespace.clone();
+    source_answers(&env, "web").await;
     let observer = Observer::start(&ns, "web");
     let p = start(&env, "web");
     let mut steps = Vec::new();

@@ -480,16 +480,27 @@ impl Source for KubernetesSource {
     }
 }
 
+/// A field the API server sends as `null` when empty, as it does for an
+/// EndpointSlice's `endpoints` and `ports` (neither is `omitempty`), read
+/// as its default; a missing field is too, through `#[serde(default)]`.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// The parts of an EndpointSlice read here; the rest is ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Slice {
     pub metadata: Meta,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub address_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub ports: Vec<SlicePort>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub endpoints: Vec<SliceEndpoint>,
 }
 
@@ -510,9 +521,9 @@ pub struct SlicePort {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SliceEndpoint {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub addresses: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub conditions: Conditions,
     pub zone: Option<String>,
 }
@@ -525,7 +536,7 @@ pub struct Conditions {
 #[derive(Deserialize)]
 struct SliceList {
     metadata: ListMeta,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     items: Vec<Slice>,
 }
 
@@ -561,6 +572,39 @@ struct Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An EndpointSlice as the API server writes one for a Service whose
+    /// pods are not up yet: `endpoints` and `ports` are `null`, not
+    /// missing, and the list's `items` can be too.
+    #[test]
+    fn null_fields_read_as_empty() {
+        let s: Slice = serde_json::from_str(
+            r#"{"metadata":{"name":"web-abc","resourceVersion":"9"},
+                "addressType":"IPv4","endpoints":null,"ports":null}"#,
+        )
+        .unwrap();
+        assert!(s.endpoints.is_empty() && s.ports.is_empty());
+        let source = KubernetesSource::new("ns", "web", Some("http"));
+        assert!(source.endpoints(&s).is_empty());
+
+        let s: Slice = serde_json::from_str(
+            r#"{"metadata":{"name":"web-abc"},"addressType":"IPv4",
+                "ports":[{"name":"http","port":8080,"protocol":"TCP"}],
+                "endpoints":[{"addresses":["10.0.0.1"],"conditions":null,
+                  "nodeName":"n1","targetRef":{"kind":"Pod","name":"p"}},
+                  {"addresses":null,"conditions":{"ready":false}}]}"#,
+        )
+        .unwrap();
+        let eps = source.endpoints(&s);
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].address, "10.0.0.1:8080");
+        assert!(eps[0].ready);
+
+        let list: SliceList =
+            serde_json::from_str(r#"{"metadata":{"resourceVersion":"3"},"items":null}"#).unwrap();
+        assert!(list.items.is_empty());
+        assert_eq!(list.metadata.resource_version, "3");
+    }
 
     fn slice(kind: &str, ports: &[(Option<&str>, i32)], eps: &[(&str, Option<bool>)]) -> Slice {
         Slice {
