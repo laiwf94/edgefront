@@ -212,6 +212,32 @@ jobs:
       - name: Drill against edgefront
         run: CHECK=1 examples/failover.sh
 
+  # Kubernetes discovery against a real API server (#95): a kind cluster,
+  # the restricted service account from scripts/kind-discovery.sh, and the
+  # ignored tests of crates/edgefront-proxy/tests/discovery_kind.rs, which
+  # write EndpointSlices and scale and flip a Deployment's pods, each change
+  # reaching the balancer within 2 s.
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test --locked -p edgefront-proxy --test discovery_kind --no-run
+      - uses: helm/kind-action@v1.12.0
+        with:
+          cluster_name: edgefront
+      - name: Load the pods' image
+        run: |
+          docker pull busybox:1.37
+          kind load docker-image busybox:1.37 --name edgefront
+      - name: Namespace, service account and credentials
+        run: scripts/kind-discovery.sh "$RUNNER_TEMP/kind" >> "$GITHUB_ENV"
+      - name: EndpointSlice changes reach the balancer within 2 s
+        run: cargo test --locked -p edgefront-proxy --test discovery_kind -- --ignored --nocapture --test-threads=1
+
   docker:
     runs-on: ubuntu-latest
     steps:
