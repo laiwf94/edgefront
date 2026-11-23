@@ -1189,6 +1189,10 @@ struct RawConfig {
     #[serde(default, skip_serializing)]
     #[serde(rename = "http_limits")]
     _http_limits: Option<de::IgnoredAny>,
+    /// Read on its own by `service::rls_config::RlsSection`.
+    #[serde(default, skip_serializing)]
+    #[serde(rename = "rls")]
+    _rls: Option<de::IgnoredAny>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1347,6 +1351,7 @@ impl LimiterConfig {
             listeners: Vec::new(),
             _address_policy: None,
             _http_limits: None,
+            _rls: None,
         };
         for (i, l) in self.listeners.iter().enumerate() {
             let at = |m: String| format!("listeners[{i}].{m}");

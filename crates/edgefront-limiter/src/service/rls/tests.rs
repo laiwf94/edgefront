@@ -418,3 +418,19 @@ fn the_clock_decides_the_window() {
     assert!((1..=3600).contains(&left), "{left}");
     assert!(unix_now() > T);
 }
+
+#[test]
+fn global_shadow_mode_answers_ok_but_keeps_the_statuses() {
+    let yaml = "domain: d\ndescriptors:\n  - key: k\n    rate_limit: {unit: minute, requests_per_unit: 1}\n";
+    let s = service(yaml).with_global_shadow_mode(true);
+    let req = || request("d", vec![desc(&[("k", "v")])]);
+    let r = s.decide_at(&req(), T).unwrap();
+    assert!(ok(r.overall_code) && ok(r.statuses[0].code));
+    let r = s.decide_at(&req(), T).unwrap();
+    assert!(ok(r.overall_code), "global shadow mode is OK overall");
+    assert!(over(r.statuses[0].code), "the status still says over");
+    assert_eq!(r.statuses[0].limit_remaining, 0);
+    // Off again, the same counter is over.
+    let s = s.with_global_shadow_mode(false);
+    assert!(over(s.decide_at(&req(), T).unwrap().overall_code));
+}

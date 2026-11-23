@@ -43,6 +43,22 @@
 //! as `edgefront proxy --limits` reads it, and is checked as that alone.
 //! `--allow CLASS` drops the findings of one class, and may be repeated.
 //!
+//! An envoyproxy/ratelimit config is checked as the decision service
+//! would load it (`edgefront_limiter::service::rls_config`): a `.yaml` or
+//! `.yml` file alone, a directory as the service's config directory
+//! (every file under it), or the files a TOML config's `[rls]` section
+//! points at. The service's own refusals are a config that does not parse
+//! (exit 2); otherwise a line with what loaded comes first, then the
+//! `rls-*` findings, each on its file's line:
+//!
+//! ```text
+//! rls: 2 files, 1 domain, 9 descriptors, 6 limits, 1 unlimited, 1 in shadow mode
+//! /srv/runtime_data/current/ratelimit/config/api.yaml:14: warning[rls-zero-limit]: descriptor api.path_/login: ...
+//! ```
+//!
+//! A TOML file with an `[rls]` section and neither listeners nor HTTP rules
+//! is checked as that alone.
+//!
 //! `--print` writes the config instead, as the TOML limiter section that
 //! reads back to the same config, and exits 0. That turns a pacerd.conf
 //! into its edgefront form, and shows a TOML file in canonical form:
@@ -54,6 +70,7 @@ use std::process::ExitCode;
 use edgefront_limiter::LimiterConfig;
 use edgefront_limiter::config::{ListenerLines, SourceMap, read_pacerd_mapped};
 use edgefront_limiter::lint::{Class, lint};
+use edgefront_limiter::service::rls_config::{self, RlsLint, RlsSection};
 use toml::de::{DeTable, DeValue};
 
 const USAGE: &str =
@@ -170,6 +187,26 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
     };
+    if path.ends_with(".yaml") || path.ends_with(".yml") || std::path::Path::new(path).is_dir() {
+        return match rls_files(path) {
+            Ok(extra) => verdict(path, &[], &filter(extra, &allowed)),
+            Err(e) => {
+                eprintln!("edgefront: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    let rls = match rls_section(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("edgefront: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let extra = filter(
+        rls.as_ref().map_or_else(Vec::new, |r| r.0.clone()),
+        &allowed,
+    );
     let http = match http_section(path) {
         Ok(h) => h,
         Err(e) => {
@@ -191,8 +228,13 @@ pub fn run(args: &[String]) -> ExitCode {
                 .map(|(line, l)| (*line, l.to_string())),
         );
         if !h.listeners {
-            return verdict(path, &found);
+            return verdict(path, &found, &extra);
         }
+    }
+    if let Some((_, listeners)) = &rls
+        && !listeners
+    {
+        return verdict(path, &found, &extra);
     }
     let (cfg, map) = match load(path) {
         Ok(loaded) => loaded,
@@ -216,15 +258,19 @@ pub fn run(args: &[String]) -> ExitCode {
             .map(|l| (l.line, l.to_string())),
     );
     found.sort_by_key(|(line, _)| *line);
-    verdict(path, &found)
+    verdict(path, &found, &extra)
 }
 
-/// Prints the findings and the verdict line.
-fn verdict(path: &str, found: &[(usize, String)]) -> ExitCode {
+/// Prints the findings, in `path` by line and then `extra`'s, each with
+/// its own file, and the verdict line.
+fn verdict(path: &str, found: &[(usize, String)], extra: &[RlsLint]) -> ExitCode {
     for (line, l) in found {
         println!("{path}:{line}: {l}");
     }
-    match found.len() {
+    for l in extra {
+        println!("{}:{}: {l}", l.file, l.line);
+    }
+    match found.len() + extra.len() {
         0 => {
             println!("{path}: ok");
             ExitCode::SUCCESS
@@ -282,4 +328,87 @@ fn http_section(path: &str) -> Result<Option<HttpCheck>, String> {
         lints,
         listeners,
     }))
+}
+
+/// The findings whose class is not allowed.
+fn filter(lints: Vec<RlsLint>, allowed: &[Class]) -> Vec<RlsLint> {
+    lints
+        .into_iter()
+        .filter(|l| !allowed.contains(&l.class))
+        .collect()
+}
+
+/// Loads envoyproxy/ratelimit files, prints what loaded and returns the
+/// findings, each named by `name(file)`.
+fn rls_report(
+    files: &[rls_config::ConfigFile],
+    merge: bool,
+    name: impl Fn(&str) -> String,
+) -> Result<Vec<RlsLint>, String> {
+    let loaded = rls_config::load(files, merge).map_err(|e| {
+        // The service names a file by its path under the config directory;
+        // here the whole path is clearer.
+        match files
+            .iter()
+            .find(|f| e.starts_with(&format!("{}: ", f.name)))
+        {
+            Some(f) => format!("{}{}", name(&f.name), &e[f.name.len()..]),
+            None => e,
+        }
+    })?;
+    println!("rls: {}", loaded.stats);
+    Ok(loaded
+        .lints
+        .into_iter()
+        .map(|mut l| {
+            l.file = name(&l.file);
+            l
+        })
+        .collect())
+}
+
+/// A `.yaml` or `.yml` file alone, or a directory as the service's config
+/// directory.
+fn rls_files(path: &str) -> Result<Vec<RlsLint>, String> {
+    let p = std::path::Path::new(path);
+    if p.is_dir() {
+        let files = rls_config::read_tree(p, "", false)?;
+        return rls_report(&files, false, |n| p.join(n).display().to_string());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let files = [rls_config::ConfigFile {
+        name: path.to_owned(),
+        text,
+    }];
+    rls_report(&files, false, str::to_owned)
+}
+
+/// The `[rls]` section of the TOML file at `path`, loaded: its findings,
+/// and whether the file also has a limiter section. `None` for a
+/// pacerd.conf or a TOML file without the section.
+fn rls_section(path: &str) -> Result<Option<(Vec<RlsLint>, bool)>, String> {
+    if !path.ends_with(".toml") {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let section: RlsSection =
+        toml::from_str(&text).map_err(|e| format!("{path}: {}", e.to_string().trim_end()))?;
+    let Some(settings) = section.rls else {
+        return Ok(None);
+    };
+    let base = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let settings = settings.relative_to(base);
+    let files = settings
+        .read_files()
+        .map_err(|e| format!("{path}: rls: {e}"))?;
+    let dir = settings.base_dir();
+    let lints = rls_report(&files, settings.merge_domain_config, |n| {
+        dir.join(n).display().to_string()
+    })?;
+    let listeners = DeTable::parse(&text)
+        .map(|t| t.get_ref().contains_key("listeners"))
+        .unwrap_or(false);
+    Ok(Some((lints, listeners)))
 }

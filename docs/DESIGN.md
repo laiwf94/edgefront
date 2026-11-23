@@ -379,6 +379,21 @@ Each class is a fact about pacerd's data path, and the unit tests check the fact
 
 A config built in code has no source map; its findings carry line 0, and the two classes that depend on what was written out (`unused-table` and `ipv6-prefix-unused`) are skipped. pacer's `examples/pacerd.conf` lints clean, and every config pacer's tests and corpus accept lints without a finding outside the file.
 
+#### envoyproxy/ratelimit configs
+
+The decision service answers from config files written for envoyproxy/ratelimit, and `edgefront_limiter::service::rls_config` loads them as that service does, so nothing about the files changes. `RlsSettings` holds the service's own settings under its own names: `runtime_root`, `runtime_subdirectory`, `runtime_app_directory`, `runtime_ignore_dotfiles`, `merge_domain_config` and `shadow_mode`. They come from its environment variables, with booleans parsed as Go's `strconv.ParseBool` parses them, or from a TOML `[rls]` section, where a relative root is taken from the TOML file's directory. Every regular file under `<root>/<subdirectory>/<app directory>` is config, at any depth and whatever its extension. Files load in path order, so a duplicate domain always names the same file. Symbolic links are followed, since deployments swap `current` from one release to the next, and a directory more than 32 deep is refused as a loop. Global shadow mode belongs to the service, not the trees: `RateLimitService::with_global_shadow_mode` makes `overall_code` `OK` and leaves each status as counted, which is what the service's `SHADOW_MODE` does.
+
+`edgefront check` takes a `.yaml` or `.yml` file, a directory (as the config directory) or a TOML `[rls]` section. The service's refusals exit 2 with its messages. What loads is summarised on one line, then linted on the trees as parsed, each finding on its own file and line:
+
+| class | reported when | why it matters |
+|---|---|---|
+| `rls-zero-limit` | an enforcing limit has `requests_per_unit` 0 or none | the service counts the hit first, so the counter is past 0 at once and every request matched is `OVER_LIMIT` |
+| `rls-replaces-unknown` | a `replaces` name is no limit's name in the domain, across merged files | replacement drops matched limits by name, so the entry never drops anything, usually a typo |
+| `rls-shadow-no-limit` | `shadow_mode` is on a descriptor with no `rate_limit` or an unlimited one | nothing is counted there, so there is nothing to shadow |
+| `rls-wildcard-shadowed` | a wildcard value comes after one for the same key that matches every value it does, or a wildcard of only `*` sits beside a descriptor with the key alone | matching tries the exact value, then wildcards in order, then the key alone, so the later descriptor is never reached. An earlier pattern covers a later one exactly when it matches the later pattern's own text: its literal parts contain no `*`, so the later pattern's stars can only fall inside its stars |
+
+The service's own `basic_config.yaml` and `wildcard.yaml` lint clean.
+
 ### Rates, units and quotas
 
 pacerd took whole counts per second, minute or hour (`10/s`, `600/m`), so half a request a second or a daily quota could not be written. `edgefront_limiter::rate::RateSpec` reads `COUNT/PERIOD [burst N]`: a count with up to nine decimal places and pacer's `k`, `m` and `g` multipliers, and a period of an optional whole number of units, `s`, `min`, `h` or `day` (with the usual spellings and plurals, and pacer's `m` for minutes). `0.5/s`, `90/min`, `2.5/10s burst 5` and `10000/day` all parse. `parse_pacerd` is unchanged and still refuses `10/d`, so pacerd files read exactly as before; `RateSpec` is the syntax for new configs.

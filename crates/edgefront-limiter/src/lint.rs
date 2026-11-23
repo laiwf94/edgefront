@@ -28,8 +28,13 @@
 //! | `http-count-own-status` | an HTTP rule counts its own refusal status, which only upstream answers can have |
 //! | `http-delay-unused` | an HTTP rule sets `max_delay` without the delay action |
 //! | `http-shadow-shadowed` | a shadow HTTP rule follows an enforcing one at least as strict on the same requests and keys |
+//! | `rls-zero-limit` | an envoyproxy/ratelimit descriptor's enforcing limit allows 0 requests per unit, so everything it matches is over the limit |
+//! | `rls-replaces-unknown` | a descriptor's `replaces` names no limit in its domain |
+//! | `rls-shadow-no-limit` | `shadow_mode` on a descriptor with no limit, or an unlimited one |
+//! | `rls-wildcard-shadowed` | a descriptor is never reached because an earlier wildcard value takes every value it would match |
 //!
-//! The `http-*` classes come from `config::http_limits::lint`.
+//! The `http-*` classes come from `config::http_limits::lint`, the `rls-*`
+//! classes from `service::rls_config::lint`.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -74,11 +79,15 @@ pub enum Class {
     HttpCountOwnStatus,
     HttpDelayUnused,
     HttpShadowShadowed,
+    RlsZeroLimit,
+    RlsReplacesUnknown,
+    RlsShadowNoLimit,
+    RlsWildcardShadowed,
 }
 
 impl Class {
     /// Every class, in the order of the table in the module docs.
-    pub const ALL: [Class; 16] = [
+    pub const ALL: [Class; 20] = [
         Class::BurstBelowRead,
         Class::ListenOverlap,
         Class::TableBelowMaxConns,
@@ -95,6 +104,10 @@ impl Class {
         Class::HttpCountOwnStatus,
         Class::HttpDelayUnused,
         Class::HttpShadowShadowed,
+        Class::RlsZeroLimit,
+        Class::RlsReplacesUnknown,
+        Class::RlsShadowNoLimit,
+        Class::RlsWildcardShadowed,
     ];
 
     /// The class's name, as `edgefront check` prints it and `--allow`
@@ -117,6 +130,10 @@ impl Class {
             Class::HttpCountOwnStatus => "http-count-own-status",
             Class::HttpDelayUnused => "http-delay-unused",
             Class::HttpShadowShadowed => "http-shadow-shadowed",
+            Class::RlsZeroLimit => "rls-zero-limit",
+            Class::RlsReplacesUnknown => "rls-replaces-unknown",
+            Class::RlsShadowNoLimit => "rls-shadow-no-limit",
+            Class::RlsWildcardShadowed => "rls-wildcard-shadowed",
         }
     }
 

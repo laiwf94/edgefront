@@ -25,7 +25,9 @@
 //!   `duration_until_reset`, the time to the end of its window. It is
 //!   `OVER_LIMIT` once its counter passes the limit, except in shadow
 //!   mode, where it stays `OK`.
-//! - `overall_code` is `OVER_LIMIT` when any status is.
+//! - `overall_code` is `OVER_LIMIT` when any status is, unless the service
+//!   is in global shadow mode (the service's `SHADOW_MODE`), where it is
+//!   `OK` while the statuses still say which descriptors are over.
 //! - With [`ResponseHeaders`] set (the service's
 //!   `LIMIT_RESPONSE_HEADERS_ENABLED`), `response_headers_to_add` carries
 //!   `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` for
@@ -147,6 +149,7 @@ pub struct RateLimitService {
     limiter: Arc<DescriptorLimiter>,
     headers: Option<Arc<ResponseHeaders>>,
     clock: Arc<Clock>,
+    global_shadow: bool,
 }
 
 impl std::fmt::Debug for RateLimitService {
@@ -154,6 +157,7 @@ impl std::fmt::Debug for RateLimitService {
         f.debug_struct("RateLimitService")
             .field("limiter", &self.limiter)
             .field("headers", &self.headers)
+            .field("global_shadow", &self.global_shadow)
             .finish_non_exhaustive()
     }
 }
@@ -212,7 +216,18 @@ impl RateLimitService {
             limiter,
             headers: None,
             clock: Arc::new(unix_now),
+            global_shadow: false,
         }
+    }
+
+    /// Answers `OK` overall to every request, as the service's
+    /// `SHADOW_MODE` does: descriptors are still counted and their
+    /// statuses still say `OVER_LIMIT`, so the effect of the limits can be
+    /// watched before they are enforced.
+    #[must_use]
+    pub fn with_global_shadow_mode(mut self, on: bool) -> Self {
+        self.global_shadow = on;
+        self
     }
 
     /// Asks Envoy to add the RateLimit headers, under `headers`' names.
@@ -366,7 +381,7 @@ impl RateLimitService {
             }
         }
         RateLimitResponse {
-            overall_code: if decision.over_limit {
+            overall_code: if decision.over_limit && !self.global_shadow {
                 Code::OverLimit
             } else {
                 Code::Ok
