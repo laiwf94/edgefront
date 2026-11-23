@@ -229,10 +229,10 @@ jobs:
       - uses: helm/kind-action@v1.12.0
         with:
           cluster_name: edgefront
-      - name: Load the pods' image
-        run: |
-          docker pull busybox:1.37
-          kind load docker-image busybox:1.37 --name edgefront
+      # Pulled on the node itself: `kind load` of a multi-platform image
+      # fails on the runner's containerd image store.
+      - name: Pull the pods' image
+        run: docker exec edgefront-control-plane crictl pull busybox:1.37
       - name: Namespace, service account and credentials
         run: scripts/kind-discovery.sh "$RUNNER_TEMP/kind" >> "$GITHUB_ENV"
       - name: EndpointSlice changes reach the balancer within 2 s
