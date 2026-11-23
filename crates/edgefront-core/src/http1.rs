@@ -481,7 +481,17 @@ where
             None => format!("{authority}:443"),
         };
         // The connection is to the origin, so the request line is the
-        // origin form.
+        // origin form, and the authority goes in Host unless the caller
+        // set one, as the plain pool does: HTTP/1.1 requires it, and Go
+        // servers such as the Kubernetes API server answer 400 without it.
+        if !req.headers().contains_key(http::header::HOST) {
+            let value = req
+                .uri()
+                .authority()
+                .and_then(|a| http::HeaderValue::from_str(a.as_str()).ok())
+                .ok_or(ClientError::Protocol)?;
+            req.headers_mut().insert(http::header::HOST, value);
+        }
         let origin_form = req.uri().path_and_query().map_or_else(
             || http::Uri::from_static("/"),
             |p| http::Uri::from(p.clone()),

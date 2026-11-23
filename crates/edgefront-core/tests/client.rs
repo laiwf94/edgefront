@@ -258,3 +258,91 @@ async fn a_non_http_reply_is_a_protocol_error() {
         Err(ClientError::Protocol)
     );
 }
+
+/// An origin over TLS (the `exact` fixture, for api.example.com) that
+/// answers each request with its own head, lowercased.
+async fn echoing_tls_origin() -> SocketAddr {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls");
+    let certs = CertificateDer::pem_file_iter(format!("{dir}/exact.crt"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = PrivateKeyDer::from_pem_file(format!("{dir}/exact.key")).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&head).to_lowercase();
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = tls.write_all(reply.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Over TLS the request line is the origin form, so the Host the plain
+/// pool takes from the URI must be written out: an origin such as the
+/// Kubernetes API server (Go's net/http) refuses an HTTP/1.1 request
+/// without one. A Host the caller set is kept, and sent once.
+#[tokio::test]
+async fn tls_requests_carry_the_host_of_their_uri() {
+    let addr = echoing_tls_origin().await;
+    let tls = edgefront_core::http1::TlsTo::load(&edgefront_core::config::UpstreamTls {
+        ca_file: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/ca.crt").to_owned(),
+        server_name: Some("api.example.com".to_owned()),
+        cert_file: None,
+        key_file: None,
+    })
+    .unwrap();
+    let client = Client::with_tls(&limits(), tls);
+
+    let head = fetch(&client, &format!("http://{addr}/list?x=1"))
+        .await
+        .unwrap();
+    let head = String::from_utf8(head.to_vec()).unwrap();
+    assert!(head.starts_with("get /list?x=1 http/1.1\r\n"), "{head}");
+    assert_eq!(head.matches("\r\nhost: ").count(), 1, "{head}");
+    assert!(head.contains(&format!("\r\nhost: {addr}\r\n")), "{head}");
+
+    let req = Request::get(format!("http://{addr}/"))
+        .header(http::header::HOST, "api.example.com")
+        .body(Empty::new())
+        .unwrap();
+    let resp = client.send(req).await.unwrap();
+    let head = resp.into_body().collect().await.unwrap().to_bytes();
+    let head = String::from_utf8(head.to_vec()).unwrap();
+    assert_eq!(head.matches("\r\nhost: ").count(), 1, "{head}");
+    assert!(head.contains("\r\nhost: api.example.com\r\n"), "{head}");
+}
