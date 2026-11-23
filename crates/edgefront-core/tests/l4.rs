@@ -521,11 +521,15 @@ async fn a_client_sending_into_a_stalled_upstream_blocks() {
     let chunk = vec![0u8; 65536];
     let mut sent = 0u64;
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_millis(700) {
+    // Send until a write has waited 100 ms, which is the client blocked.
+    // It stops there, well inside the 1 s idle timeout: a write after the
+    // proxy has closed would get a reset, which a slow run (under
+    // ThreadSanitizer) used to reach.
+    loop {
         match tokio::time::timeout(Duration::from_millis(100), c.write(&chunk)).await {
             Ok(Ok(n)) => sent += n as u64,
-            Ok(Err(e)) => panic!("{e}"),
-            Err(_) => {}
+            Ok(Err(e)) => panic!("{e} after {sent} bytes in {:?}", t0.elapsed()),
+            Err(_) => break,
         }
     }
     // Kernel buffers on both sides plus one 16 KiB proxy buffer.
