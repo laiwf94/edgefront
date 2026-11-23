@@ -257,7 +257,25 @@ Two fixes got it there. Patching took a batch from tens of milliseconds to under
 - The steps of `discovery_k8s.rs` (scale up with a second slice, a readiness flip, a slice deleted, scale down and up again) as EndpointSlices the test writes with `kubectl apply`. Another Service's slice never shows.
 - A Deployment's real pods behind a Service, as the EndpointSlice controller publishes them: started, scaled from 2 to 5, one pod flipped not ready and back by its exec readiness probe, then scaled to 1 and to 2.
 
-Each change is timed from the API server publishing it to the balancer first holding the set it gave. Beside the proxy, `kubectl get endpointslices --watch` follows the same slices, independently of edgefront's client, and the moment it prints an event stands for the publication; a task polls the balancer every millisecond. Pods take seconds to start and stop, which is the kubelet's time, not discovery's, so the bound is held from the slice change, and the time from the action (`kubectl apply`, `scale` or `exec`) is printed beside it. Every change must reach the balancer within 2 s.
+Each change is timed from the API server publishing it to the balancer first holding the set it gave. Beside the proxy, `kubectl get endpointslices --watch` follows the same slices, independently of edgefront's client, and the moment it prints an event stands for the publication; a task polls the balancer every millisecond. Pods take seconds to start and stop, which is the kubelet's time, not discovery's, so the bound is held from the slice change, and the time from the action (`kubectl apply`, `scale` or `exec`) is printed beside it. Every change must reach the balancer within 2 s. The first green run, on a GitHub runner with kind's default node:
+
+| change | written slices: watch to balancer | from `kubectl apply` | Deployment pods: watch to balancer | from the action |
+|---|---|---|---|---|
+| first set (2) | 1.2 ms | 66 ms | -0.6 ms | 1,320 ms |
+| scale to 5 | -1.0 ms | 137 ms | -0.8 ms | 757 ms |
+| readiness flip | -0.5 ms | 288 ms | -0.1 ms | 924 ms |
+| ready again | | | 0.1 ms | 999 ms |
+| slice deleted | -0.1 ms | 199 ms | | |
+| scale to 1 | -0.4 ms | 397 ms | -0.8 ms | 65 ms |
+| scale to 2 | -0.4 ms | 376 ms | -0.3 ms | 1,930 ms |
+
+A negative time means the proxy's own watch delivered the change before kubectl printed it. The two watches get the same event from the API server, so the balancer takes about a millisecond at most. The rest of the time from an action is the API server writing the change and, for pods, the kubelet starting them and the readiness probe (every second) and the EndpointSlice controller noticing. Even measured from the action, every change was within 2 s.
+
+The real API server found two bugs the fake one missed:
+- **No Host over TLS.** `edgefront_core::http1`'s TLS pool rewrites each URI to its origin form and sent no `Host`. Go's net/http answers that with `400 missing required Host header`. The pool now writes `Host` from the URI unless the caller set one, as the plain pool does.
+- **Null fields.** Kubernetes serializes an empty slice's `endpoints` and `ports` as `null`, not as missing (neither field is `omitempty`), and the source refused it. It now reads null as empty.
+
+The fake server stays the fast, deterministic test of the protocol's edges (cut watches, 410, outages); the kind job is the check against the real thing.
 
 ### After steer: deletion, the frozen suite and the benchmark
 
