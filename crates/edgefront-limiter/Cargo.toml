@@ -43,6 +43,10 @@ tonic = { workspace = true, features = ["transport"] }
 name = "rls"
 required-features = ["http", "service"]
 
+[[test]]
+name = "rls_envoy"
+required-features = ["http", "service"]
+
 [[bench]]
 name = "decisions"
 harness = false
