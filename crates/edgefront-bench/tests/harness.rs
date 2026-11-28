@@ -129,14 +129,15 @@ async fn a_stalling_target_shows_its_stall_in_p99() {
     let origin = Origin::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let (target, stalled) = stalling_target().await;
     // 2 s at 500 requests per second over two connections, with one
-    // 100 ms stall a second into the measured phase: 50 requests are due
-    // during it, 5% of the measured 1,000, so every one of the slowest 1%
-    // waited out most of the stall.
+    // 200 ms stall a second into the measured phase: 100 requests are due
+    // during it, 10% of the measured 1,000. The slowest 1% are the first
+    // ten due, so each waited about 200 - 10 * 2 = 180 ms. (With a 100 ms
+    // stall the tenth waited about 80 ms, the floor itself: #267.)
     let scenario = scenario(500, 2, 2);
     let stall = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         stalled.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         stalled.store(false, Ordering::Relaxed);
     });
     let outcome = load_and_measure(&scenario, &options(target, origin.addr()))
@@ -147,7 +148,7 @@ async fn a_stalling_target_shows_its_stall_in_p99() {
     assert_eq!(m.completed, 1000, "{m:?}");
     assert_eq!(m.errors.connect + m.errors.timeout + m.errors.other, 0);
     assert!(
-        m.latency.p99_ms >= 80.0,
+        m.latency.p99_ms >= 150.0,
         "response-time p99 {} ms",
         m.latency.p99_ms
     );
