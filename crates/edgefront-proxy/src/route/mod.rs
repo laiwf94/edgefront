@@ -12,22 +12,27 @@
 //! turn. Here exact and wildcard hosts are hash lookups (one per label of the
 //! request host) and prefixes live in a radix trie, so a lookup does not slow
 //! down as routes are added.
+//!
+//! [`tree::RouteTree`] is the table for routes with the full set of
+//! [`matcher`] conditions (path exact, prefix or regex, method, headers and
+//! query): the same host choice, then the first route in config order whose
+//! conditions all hold, found through a path index instead of a scan.
 
 mod host;
 pub mod matcher;
 mod prefix;
+pub mod tree;
 
 use std::collections::HashMap;
 
 pub use host::normalize_host;
 use prefix::PrefixTree;
 
-/// An immutable routing table, safe to share between threads.
-///
-/// `T` is whatever a route resolves to: a cluster name, an index into the
-/// config, or a whole route.
+/// Picks a virtual host for a normalised request host: an exact name, else
+/// the longest `*.suffix` wildcard, else `*`. Shared by [`Router`] and
+/// [`tree::RouteTree`], so both choose hosts the same way.
 #[derive(Debug, Clone)]
-pub struct Router<T> {
+pub(crate) struct HostIndex {
     /// Virtual hosts by exact host name.
     exact: HashMap<Box<str>, usize>,
     /// Wildcard virtual hosts by suffix, dot included: `*.example.com` is
@@ -38,6 +43,77 @@ pub struct Router<T> {
     suffix_lens: (usize, usize),
     /// The `*` virtual host.
     any: Option<usize>,
+    /// The number of virtual hosts.
+    count: usize,
+}
+
+impl Default for HostIndex {
+    fn default() -> Self {
+        Self {
+            exact: HashMap::new(),
+            suffixes: HashMap::new(),
+            suffix_lens: (usize::MAX, 0),
+            any: None,
+            count: 0,
+        }
+    }
+}
+
+impl HostIndex {
+    /// The virtual host for `pattern` (`*`, `*.suffix` or an exact name),
+    /// and whether it is new. Virtual hosts are numbered from 0 in the
+    /// order their patterns first appear.
+    pub(crate) fn insert(&mut self, pattern: &str) -> (usize, bool) {
+        let next = self.count;
+        let slot = if pattern == "*" {
+            self.any.get_or_insert(next)
+        } else if let Some(suffix) = pattern.strip_prefix('*').filter(|s| s.starts_with('.')) {
+            let (min, max) = &mut self.suffix_lens;
+            (*min, *max) = ((*min).min(suffix.len()), (*max).max(suffix.len()));
+            self.suffixes.entry(suffix.into()).or_insert(next)
+        } else {
+            self.exact.entry(pattern.into()).or_insert(next)
+        };
+        let vhost = *slot;
+        if vhost == next {
+            self.count += 1;
+        }
+        (vhost, vhost == next)
+    }
+
+    /// The virtual host for a host already passed through
+    /// [`normalize_host`].
+    pub(crate) fn get(&self, host: &str) -> Option<usize> {
+        if let Some(&v) = self.exact.get(host) {
+            return Some(v);
+        }
+        // A suffix matches when the host ends with it and has at least one
+        // byte before it, so every candidate starts at a dot past the first
+        // byte. Leftmost dot first means longest suffix first.
+        let (min, max) = self.suffix_lens;
+        for (at, _) in host.match_indices('.').filter(|&(at, _)| at > 0) {
+            let len = host.len() - at;
+            if len < min {
+                break;
+            }
+            if len > max {
+                continue;
+            }
+            if let Some(&v) = self.suffixes.get(&host[at..]) {
+                return Some(v);
+            }
+        }
+        self.any
+    }
+}
+
+/// An immutable routing table, safe to share between threads.
+///
+/// `T` is whatever a route resolves to: a cluster name, an index into the
+/// config, or a whole route.
+#[derive(Debug, Clone)]
+pub struct Router<T> {
+    hosts: HostIndex,
     vhosts: Vec<PrefixTree<usize>>,
     routes: Vec<T>,
 }
@@ -56,27 +132,13 @@ impl<T> Router<T> {
         P: AsRef<str>,
     {
         let mut router = Self {
-            exact: HashMap::new(),
-            suffixes: HashMap::new(),
-            suffix_lens: (usize::MAX, 0),
-            any: None,
+            hosts: HostIndex::default(),
             vhosts: Vec::new(),
             routes: Vec::new(),
         };
         for (host, prefix, target) in routes {
-            let host = host.as_ref();
-            let next = router.vhosts.len();
-            let slot = if host == "*" {
-                router.any.get_or_insert(next)
-            } else if let Some(suffix) = host.strip_prefix('*').filter(|s| s.starts_with('.')) {
-                let (min, max) = &mut router.suffix_lens;
-                (*min, *max) = ((*min).min(suffix.len()), (*max).max(suffix.len()));
-                router.suffixes.entry(suffix.into()).or_insert(next)
-            } else {
-                router.exact.entry(host.into()).or_insert(next)
-            };
-            let vhost = *slot;
-            if vhost == next {
+            let (vhost, new) = router.hosts.insert(host.as_ref());
+            if new {
                 router.vhosts.push(PrefixTree::default());
             }
             router.vhosts[vhost].insert(prefix.as_ref().as_bytes(), router.routes.len());
@@ -98,32 +160,9 @@ impl<T> Router<T> {
     /// As [`Router::route`], for a host already passed through
     /// [`normalize_host`].
     pub fn route_normalized(&self, host: &str, path: impl AsRef<[u8]>) -> Option<&T> {
-        let vhost = self.vhost(host)?;
+        let vhost = self.hosts.get(host)?;
         let index = *self.vhosts[vhost].longest_prefix(path.as_ref())?;
         Some(&self.routes[index])
-    }
-
-    fn vhost(&self, host: &str) -> Option<usize> {
-        if let Some(&v) = self.exact.get(host) {
-            return Some(v);
-        }
-        // A suffix matches when the host ends with it and has at least one
-        // byte before it, so every candidate starts at a dot past the first
-        // byte. Leftmost dot first means longest suffix first.
-        let (min, max) = self.suffix_lens;
-        for (at, _) in host.match_indices('.').filter(|&(at, _)| at > 0) {
-            let len = host.len() - at;
-            if len < min {
-                break;
-            }
-            if len > max {
-                continue;
-            }
-            if let Some(&v) = self.suffixes.get(&host[at..]) {
-                return Some(v);
-            }
-        }
-        self.any
     }
 
     /// The number of routes, duplicates included.

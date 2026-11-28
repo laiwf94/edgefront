@@ -46,20 +46,25 @@ impl<V> PrefixTree<V> {
     /// wins, matching steer, where a stable sort kept the earlier of two
     /// routes with the same host and prefix in front.
     pub(crate) fn insert(&mut self, prefix: &[u8], value: V) {
+        let slot = self.slot(prefix);
+        if slot.is_none() {
+            *slot = Some(value);
+        }
+    }
+
+    /// The value slot for `prefix`, creating the node (empty) if needed.
+    pub(crate) fn slot(&mut self, prefix: &[u8]) -> &mut Option<V> {
         let mut node = &mut self.root;
         let mut rest = prefix;
         loop {
             let Some(&first) = rest.first() else {
-                if node.value.is_none() {
-                    node.value = Some(value);
-                }
-                return;
+                return &mut node.value;
             };
             let at = match node.firsts.binary_search(&first) {
                 Err(at) => {
                     node.firsts.insert(at, first);
-                    node.children.insert(at, Node::new(rest, Some(value)));
-                    return;
+                    node.children.insert(at, Node::new(rest, None));
+                    return &mut node.children[at].value;
                 }
                 Ok(at) => at,
             };
@@ -75,6 +80,30 @@ impl<V> PrefixTree<V> {
             }
             node = &mut node.children[at];
             rest = &rest[common..];
+        }
+    }
+
+    /// Calls `f` with the value under every stored prefix of `key`,
+    /// shortest first.
+    pub(crate) fn for_each_prefix<'a>(&'a self, key: &[u8], mut f: impl FnMut(&'a V)) {
+        let mut node = &self.root;
+        let mut rest = key;
+        if let Some(v) = &node.value {
+            f(v);
+        }
+        while let Some(&first) = rest.first() {
+            let Ok(at) = node.firsts.binary_search(&first) else {
+                return;
+            };
+            let child = &node.children[at];
+            let Some(after) = rest.strip_prefix(&*child.label) else {
+                return;
+            };
+            if let Some(v) = &child.value {
+                f(v);
+            }
+            node = child;
+            rest = after;
         }
     }
 
@@ -172,5 +201,38 @@ mod tests {
         assert_eq!(t.longest_prefix(&[0xc3]), None);
         assert_eq!(t.longest_prefix("éy".as_bytes()), Some(&1));
         assert_eq!(t.longest_prefix("éx".as_bytes()), Some(&2));
+    }
+
+    #[test]
+    fn visits_every_stored_prefix_shortest_first() {
+        let t = tree(&[
+            ("/abcdef", 1),
+            ("/abc", 2),
+            ("", 3),
+            ("/abx", 4),
+            ("/ab", 5),
+        ]);
+        let seen = |key: &[u8]| {
+            let mut v = Vec::new();
+            t.for_each_prefix(key, |&x| v.push(x));
+            v
+        };
+        assert_eq!(seen(b"/abcdefg"), [3, 5, 2, 1]);
+        assert_eq!(seen(b"/abcd"), [3, 5, 2]);
+        assert_eq!(seen(b"/abxx"), [3, 5, 4]);
+        assert_eq!(seen(b"/a"), [3]);
+        assert_eq!(seen(b""), [3]);
+        let empty: PrefixTree<u32> = PrefixTree::default();
+        empty.for_each_prefix(b"/x", |_| panic!("no values stored"));
+    }
+
+    #[test]
+    fn slot_is_shared_by_one_prefix() {
+        let mut t: PrefixTree<Vec<u32>> = PrefixTree::default();
+        t.slot(b"/ab").get_or_insert_with(Vec::new).push(1);
+        t.slot(b"/a").get_or_insert_with(Vec::new).push(2);
+        t.slot(b"/ab").get_or_insert_with(Vec::new).push(3);
+        assert_eq!(t.longest_prefix(b"/abc"), Some(&vec![1, 3]));
+        assert_eq!(t.longest_prefix(b"/ax"), Some(&vec![2]));
     }
 }

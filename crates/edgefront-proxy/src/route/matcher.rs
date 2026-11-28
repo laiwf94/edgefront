@@ -424,6 +424,9 @@ impl MethodMatcher {
 #[derive(Debug, Clone)]
 pub struct PathMatcher {
     test: StringMatcher,
+    kind: PathKind,
+    pattern: Box<str>,
+    ignore_case: bool,
 }
 
 /// How a [`PathMatcher`] compares.
@@ -441,14 +444,33 @@ impl PathMatcher {
     /// Builds a path matcher. Paths are case-sensitive unless
     /// `ignore_case`; fails only for a bad regex.
     pub fn new(kind: PathKind, pattern: &str, ignore_case: bool) -> Result<Self, MatchError> {
-        let kind = match kind {
+        let string_kind = match kind {
             PathKind::Exact => StringKind::Exact,
             PathKind::Prefix => StringKind::Prefix,
             PathKind::Regex => StringKind::Regex,
         };
         Ok(Self {
-            test: StringMatcher::new(kind, pattern, ignore_case)?,
+            test: StringMatcher::new(string_kind, pattern, ignore_case)?,
+            kind,
+            pattern: pattern.into(),
+            ignore_case,
         })
+    }
+
+    /// How the path is compared.
+    pub fn kind(&self) -> PathKind {
+        self.kind
+    }
+
+    /// The pattern as configured: the literal, or the regex before it was
+    /// anchored.
+    pub fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    /// Whether ASCII case is ignored.
+    pub fn ignore_case(&self) -> bool {
+        self.ignore_case
     }
 
     /// Whether `path` passes.
@@ -485,6 +507,11 @@ impl<'a> RequestView<'a> {
             headers,
             query: OnceCell::new(),
         }
+    }
+
+    /// The request path, as given to [`RequestView::new`].
+    pub fn path(&self) -> &'a [u8] {
+        self.path
     }
 
     /// The parsed query string, empty when there is none.
