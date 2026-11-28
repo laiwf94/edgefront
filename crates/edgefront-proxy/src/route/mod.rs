@@ -14,6 +14,7 @@
 //! down as routes are added.
 
 mod host;
+pub mod matcher;
 mod prefix;
 
 use std::collections::HashMap;
