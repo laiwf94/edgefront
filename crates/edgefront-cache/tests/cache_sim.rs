@@ -53,7 +53,7 @@ fn replays_an_oracle_general_file() {
         .skip(1)
         .map(|l| l.split(',').collect())
         .collect();
-    assert_eq!(rows.len(), 9);
+    assert_eq!(rows.len(), 12);
     let hits = |row: &[&str]| row[4].parse::<u64>().unwrap();
     for row in &rows {
         assert_eq!(row[3], "60000");
@@ -65,12 +65,19 @@ fn replays_an_oracle_general_file() {
     assert_eq!(hits(&rows[2]), 19_900, "s3fifo at 4 MiB");
     assert_eq!(hits(&rows[5]), 19_900, "lru at 4 MiB");
     assert_eq!(hits(&rows[8]), 19_900, "sieve at 4 MiB");
+    assert_eq!(hits(&rows[11]), 19_900, "wtinylfu at 4 MiB");
     // At 256 KiB the scan pushes the hot set out of LRU, while S3-FIFO's
     // small queue keeps the one-hit objects away from it. SIEVE, like LRU,
     // inserts at one end: the hot set (about 250 KiB) does not fit beside
     // the scan objects still waiting for the hand, but at 1 MiB it does.
     assert!(hits(&rows[0]) > 2 * hits(&rows[3]), "{rows:?}");
     assert_eq!(hits(&rows[7]), 19_900, "sieve at 1 MiB");
+    // W-TinyLFU turns the one-hit scan objects away at its door, so even
+    // at 256 KiB it keeps nearly all of the hot set, and writes under 40%
+    // of what LRU writes.
+    assert!(hits(&rows[9]) > 19_500, "{:?}", rows[9]);
+    let writes = |row: &[&str]| row[9].parse::<u64>().unwrap();
+    assert!(writes(&rows[9]) * 5 < writes(&rows[3]) * 2, "{rows:?}");
 }
 
 #[test]

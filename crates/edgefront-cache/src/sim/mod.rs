@@ -6,7 +6,8 @@
 //! trace replays in minutes. [`s3fifo`] is a model of the memory tier's
 //! S3-FIFO (`store/memory.rs`) that makes the same decisions as one of its
 //! shards, which a test holds it to; [`lru`] is the usual baseline; `sieve`
-//! is the store's own SIEVE ([`crate::store::evict::sieve`]) over ids.
+//! and `wtinylfu` are the store's own SIEVE ([`crate::store::evict::sieve`])
+//! and W-TinyLFU ([`crate::store::evict::tinylfu`]) over ids.
 //!
 //! [`trace`] reads traces as a stream, one record at a time: libCacheSim's
 //! binary oracleGeneral format and CSV with configurable columns, either one
@@ -29,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::store::evict::sieve::{Inserted, Sieve};
+use crate::store::evict::sieve::{self, Sieve};
+use crate::store::evict::tinylfu::{self, TinyLfu};
 
 /// One request of a trace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,10 +65,13 @@ pub trait Policy: Send {
 }
 
 /// The policies the simulator knows, by name.
-pub const POLICIES: &[&str] = &[s3fifo::NAME, lru::NAME, SIEVE];
+pub const POLICIES: &[&str] = &[s3fifo::NAME, lru::NAME, SIEVE, W_TINYLFU];
 
 /// SIEVE's name: the store's implementation, simulated as it is.
 pub const SIEVE: &str = "sieve";
+
+/// W-TinyLFU's name: the store's implementation, simulated as it is.
+pub const W_TINYLFU: &str = "wtinylfu";
 
 /// Builds the policy called `name` with a budget of `capacity` bytes.
 pub fn policy(name: &str, capacity: u64) -> Option<Box<dyn Policy>> {
@@ -74,6 +79,10 @@ pub fn policy(name: &str, capacity: u64) -> Option<Box<dyn Policy>> {
         s3fifo::NAME => Some(Box::new(s3fifo::S3Fifo::new(capacity))),
         lru::NAME => Some(Box::new(lru::Lru::new(capacity))),
         SIEVE => Some(Box::new(Sieve::<u64, IdHasher>::with_hasher(
+            capacity,
+            IdHasher::default(),
+        ))),
+        W_TINYLFU => Some(Box::new(TinyLfu::<u64, IdHasher>::with_hasher(
             capacity,
             IdHasher::default(),
         ))),
@@ -92,7 +101,7 @@ impl Policy for Sieve<u64, IdHasher> {
 
     fn insert(&mut self, id: u64, size: u64) -> bool {
         // A trace's miss is never for a held id, so this stores or refuses.
-        Sieve::insert(self, id, size, |_, _| ()) == Inserted::Stored
+        Sieve::insert(self, id, size, |_, _| ()) == sieve::Inserted::Stored
     }
 
     fn bytes(&self) -> u64 {
@@ -101,6 +110,30 @@ impl Policy for Sieve<u64, IdHasher> {
 
     fn len(&self) -> usize {
         Sieve::len(self)
+    }
+}
+
+impl Policy for TinyLfu<u64, IdHasher> {
+    fn name(&self) -> &'static str {
+        W_TINYLFU
+    }
+
+    fn get(&mut self, id: u64) -> bool {
+        TinyLfu::get(self, &id)
+    }
+
+    fn insert(&mut self, id: u64, size: u64) -> bool {
+        // An object that lost its admission duel at once was never kept,
+        // so it is not counted as a write.
+        TinyLfu::insert(self, id, size, |_, _| ()) == tinylfu::Inserted::Stored
+    }
+
+    fn bytes(&self) -> u64 {
+        TinyLfu::bytes(self)
+    }
+
+    fn len(&self) -> usize {
+        TinyLfu::len(self)
     }
 }
 
@@ -347,6 +380,21 @@ mod tests {
         assert!(p.insert(3, 6));
         assert!(p.get(1) && !p.get(2) && p.get(3));
         assert_eq!((p.bytes(), p.len()), (10, 2));
+    }
+
+    #[test]
+    fn wtinylfu_is_the_stores_own() {
+        let mut p = policy(W_TINYLFU, 1_000).unwrap();
+        assert!(!p.get(1));
+        assert!(p.insert(1, 400));
+        assert!(!p.insert(2, 1_001), "larger than the cache");
+        assert!(p.get(1) && p.get(1));
+        assert!(p.insert(2, 400));
+        // 3 leaves the window and duels 2, which it ties: 3 is not kept
+        // and is not a write.
+        assert!(!p.insert(3, 400));
+        assert!(p.get(1) && p.get(2) && !p.get(3));
+        assert_eq!((p.bytes(), p.len()), (800, 2));
     }
 
     #[test]

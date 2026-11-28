@@ -20,7 +20,8 @@ cache size, and prints hit ratio, byte hit ratio and writes per pair.
                         unit (KiB, MiB, GiB, TiB, KB, MB, GB, TB), or a share
                         of the trace's footprint (0.1%, 10%), which reads the
                         trace once more first; required
-  -p, --policies LIST   policies to run (default: all of s3fifo, lru, sieve)
+  -p, --policies LIST   policies to run (default: all of s3fifo, lru, sieve,
+                        wtinylfu)
       --format F        oracleGeneral or csv (default: csv when the name
                         contains .csv, else oracleGeneral)
       --columns SPEC    CSV columns, 1-based (default time=1,id=2,size=3;
@@ -620,7 +621,7 @@ mod tests {
             (&["t", "-s", "1", "--bogus"], "unknown option `--bogus`"),
             (
                 &["t", "-s", "1", "-p", "clock"],
-                "unknown policy `clock` (known: s3fifo, lru, sieve)",
+                "unknown policy `clock` (known: s3fifo, lru, sieve, wtinylfu)",
             ),
             (&["t", "-s", "1", "-p", ","], "no policies given"),
             (
@@ -715,9 +716,9 @@ mod tests {
         let footprint_bytes = v["footprint"]["bytes"].as_u64().unwrap();
         assert_eq!(v["footprint"]["objects"], 2_520);
         let results = v["results"].as_array().unwrap();
-        assert_eq!(results.len(), 9);
+        assert_eq!(results.len(), 12);
         for (r, (policy, size)) in results.iter().zip(
-            ["s3fifo", "lru", "sieve"]
+            ["s3fifo", "lru", "sieve", "wtinylfu"]
                 .iter()
                 .flat_map(|p| ["64KiB", "1%", "50%"].map(|s| (*p, s))),
         ) {
@@ -727,8 +728,14 @@ mod tests {
             let hits = r["hits"].as_u64().unwrap();
             let ratio = r["hit_ratio"].as_f64().unwrap();
             assert!((ratio - hits as f64 / 20_000.0).abs() < 1e-12);
-            // Every miss fits, so every miss is written.
-            assert_eq!(r["writes"].as_u64().unwrap(), 20_000 - hits);
+            // Every miss fits, so every miss is written, except those
+            // W-TinyLFU's admission turns away.
+            let writes = r["writes"].as_u64().unwrap();
+            if policy == "wtinylfu" {
+                assert!(writes <= 20_000 - hits, "{r}");
+            } else {
+                assert_eq!(writes, 20_000 - hits);
+            }
         }
         assert_eq!(
             results[1]["cache_bytes"].as_u64().unwrap(),
@@ -742,7 +749,7 @@ mod tests {
         assert!(results[2]["hit_ratio"].as_f64().unwrap() > 0.45);
         let bigger =
             |a: usize, b: usize| results[a]["hits"].as_u64() <= results[b]["hits"].as_u64();
-        assert!(bigger(1, 2) && bigger(4, 5) && bigger(7, 8));
+        assert!(bigger(1, 2) && bigger(4, 5) && bigger(7, 8) && bigger(10, 11));
 
         let (code, out, _) = run_str(&args(&["-s", "1MiB", p, "--output", "csv", "-p", "lru"]));
         assert_eq!(code, ExitCode::SUCCESS);
@@ -765,7 +772,7 @@ mod tests {
         ]));
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(
-            out.contains(": 1000 requests replayed through 6 simulations in "),
+            out.contains(": 1000 requests replayed through 8 simulations in "),
             "{out}"
         );
         assert!(
@@ -775,18 +782,24 @@ mod tests {
         let table: Vec<&str> = out.lines().skip(2).collect();
         assert_eq!(
             table[0],
-            "policy  size    cache  hit ratio  byte hit ratio  writes  written"
+            "policy    size    cache  hit ratio  byte hit ratio  writes  written"
         );
-        assert_eq!(table.len(), 7);
+        assert_eq!(table.len(), 9);
         assert!(
-            table[1].starts_with("s3fifo  1MiB  1.0 MiB "),
+            table[1].starts_with("s3fifo    1MiB  1.0 MiB "),
             "{}",
             table[1]
         );
         assert!(
-            table[2].starts_with("s3fifo  10%      52 B "),
+            table[2].starts_with("s3fifo    10%      52 B "),
             "{}",
             table[2]
+        );
+        // At 52 B every policy hits the same 48%, but W-TinyLFU writes
+        // only the objects it admits.
+        assert_eq!(
+            table[8],
+            "wtinylfu  10%      52 B     0.4800          0.4800      84     84 B"
         );
     }
 

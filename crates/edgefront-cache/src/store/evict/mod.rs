@@ -8,5 +8,11 @@
 //! - [`sieve`]: SIEVE (Zhang et al., NSDI 2024), a FIFO queue with one
 //!   visited bit per object and a hand that sweeps from the oldest object
 //!   to the newest. A hit sets a bit and moves nothing.
+//! - [`tinylfu`]: W-TinyLFU (Einziger et al., ACM ToS 2017), a small LRU
+//!   window in front of a segmented LRU whose entry is guarded by a
+//!   count-min sketch of recent accesses: an object leaving the window
+//!   gets in only if it is estimated more popular than the object it
+//!   would displace.
 
 pub mod sieve;
+pub mod tinylfu;
